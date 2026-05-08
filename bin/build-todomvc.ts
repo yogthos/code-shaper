@@ -260,7 +260,28 @@ async function main(): Promise<number> {
   // 3. Phase 6 — incremental materialize is built into the
   //    orchestrator now; demo/ updates after each leaf lands.
   log("phase 6 — implementor (per-leaf TDD)");
+  const leafStartedAt = new Map<string, number>();
   const build = await buildImplementations(client, rpg, {
+    onLeafProgress: (e) => {
+      if (e.phase === "start") {
+        leafStartedAt.set(e.leafCapabilityId, Date.now());
+        log(`  [${e.index}/${e.total}] ${e.leafName} — start`);
+      } else {
+        const ms = Date.now() - (leafStartedAt.get(e.leafCapabilityId) ?? Date.now());
+        const secs = (ms / 1000).toFixed(1);
+        const mark = e.ok ? "✓" : "✗";
+        const meta = `${e.attempts ?? "?"} attempts${
+          e.testRewrites && e.testRewrites > 0 ? `, ${e.testRewrites} test rewrites` : ""
+        }`;
+        if (e.ok) {
+          log(`  [${e.index}/${e.total}] ${e.leafName} ${mark} (${meta}, ${secs}s)`);
+        } else {
+          log(
+            `  [${e.index}/${e.total}] ${e.leafName} ${mark} (${meta}, ${secs}s) — ${e.failureSummary ?? "failed"}`,
+          );
+        }
+      }
+    },
     // Matches §5.3 of the RPG paper: "each function allows up to 8
     // debugging iterations." Was 3.
     maxAttemptsPerLeaf: 8,

@@ -91,6 +91,32 @@ export interface BuildInput {
   enableEnvFix?: boolean;
   /** Per-leaf env-fix budget. Forwarded to implementLeaf. */
   maxEnvPatches?: number;
+  /** Optional per-leaf progress callback. Fires when a leaf is
+   *  about to be attempted (`phase: "start"`) and again with the
+   *  outcome (`phase: "done"`). Production drivers wire a logger
+   *  here so phase 6's silent stretch (the implementor loop made
+   *  many LLM calls but emitted no stdout milestones) becomes
+   *  observable. */
+  onLeafProgress?: (event: LeafProgressEvent) => void;
+}
+
+export interface LeafProgressEvent {
+  phase: "start" | "done";
+  leafCapabilityId: string;
+  leafName: string;
+  /** 1-based index in the planned leaves order — useful for
+   *  rendering "[3/19] foo" lines. */
+  index: number;
+  total: number;
+  /** Set on phase: "done". True when the leaf landed green. */
+  ok?: boolean;
+  /** Set on phase: "done". Per-leaf attempt count (1 = passed
+   *  on the first body author call). */
+  attempts?: number;
+  /** Set on phase: "done". Number of test rewrites used. */
+  testRewrites?: number;
+  /** Set on phase: "done". One-line failure summary when ok=false. */
+  failureSummary?: string;
 }
 
 export interface BuildResult {
@@ -172,9 +198,33 @@ export async function buildImplementations(
      *  architect keeps proposing fresh approaches that don't help. */
     const decomposeRoundsByLeaf = new Map<string, number>();
 
+    // Snapshot of the planned leaves, used purely for progress
+    // reporting. The queue can grow (decompose recovery prepends
+    // sub-leaves) and shrink during iteration; we report relative
+    // to the ORIGINAL plan so the user sees a stable [N/total].
+    const initialLeafIds = leaves.map((l) => l.leaf.leafCapabilityId);
+    const seenLeafIds = new Set<string>();
+
     while (queue.length > 0) {
       const entry = queue.shift()!;
       const { leaf, hostFile, approachHint } = entry;
+
+      if (input.onLeafProgress) {
+        seenLeafIds.add(leaf.leafCapabilityId);
+        const initialIdx = initialLeafIds.indexOf(leaf.leafCapabilityId);
+        // For decompose-spawned sub-leaves not in the initial
+        // plan, report seen-count vs. the initial total + the
+        // running count of decompose sub-leaves we've encountered.
+        const index =
+          initialIdx >= 0 ? initialIdx + 1 : initialLeafIds.length + seenLeafIds.size - initialLeafIds.length;
+        input.onLeafProgress({
+          phase: "start",
+          leafCapabilityId: leaf.leafCapabilityId,
+          leafName: leaf.name,
+          index,
+          total: initialLeafIds.length,
+        });
+      }
 
       const result = await implementLeaf(client, {
         leaf,
@@ -212,6 +262,32 @@ export async function buildImplementations(
           : {}),
       });
       leafResults.push(result);
+
+      if (input.onLeafProgress) {
+        const initialIdx = initialLeafIds.indexOf(leaf.leafCapabilityId);
+        const index =
+          initialIdx >= 0 ? initialIdx + 1 : initialLeafIds.length + seenLeafIds.size - initialLeafIds.length;
+        // One-line failure summary — first 200 chars of the
+        // failure message + the leaf-level error if present.
+        let failureSummary: string | undefined;
+        if (!result.ok) {
+          const fm = result.lastFailure?.failureMessage ?? "(no failure detail)";
+          failureSummary = fm.split("\n")[0]?.slice(0, 200) ?? fm.slice(0, 200);
+        }
+        input.onLeafProgress({
+          phase: "done",
+          leafCapabilityId: leaf.leafCapabilityId,
+          leafName: leaf.name,
+          index,
+          total: initialLeafIds.length,
+          ok: result.ok,
+          attempts: result.attempts,
+          ...(result.testRewrites !== undefined
+            ? { testRewrites: result.testRewrites }
+            : {}),
+          ...(failureSummary !== undefined ? { failureSummary } : {}),
+        });
+      }
 
       // After every leaf attempt — successful or not — re-render the
       // affected file and persist to disk if the caller is watching

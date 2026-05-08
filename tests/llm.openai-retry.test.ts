@@ -127,6 +127,58 @@ describe("openai-provider retry on AbortError", () => {
     },
   );
 
+  // Body-read stall: GLM (and other providers occasionally) sends
+  // headers + connection-keepalive but never finishes streaming
+  // the JSON body. The original fetchWithRetry cleared its
+  // AbortController timer once `fetch` resolved with the headers,
+  // leaving `await response.json()` unguarded — the call hung
+  // forever. The fix: keep an abort guard alive until the body is
+  // read.
+  it(
+    "aborts and retries when the response body stalls mid-stream",
+    { timeout: 5_000 },
+    async () => {
+      let calls = 0;
+      globalThis.fetch = (async (
+        _url: string | URL | Request,
+        init?: RequestInit,
+      ) => {
+        calls++;
+        if (calls === 1) {
+          // Headers come through, but the body stream never
+          // resolves. Wire it through the AbortSignal so a proper
+          // abort kills the read.
+          const sig = init?.signal;
+          const stream = new ReadableStream({
+            start(controller) {
+              if (!sig) return;
+              sig.addEventListener(
+                "abort",
+                () => {
+                  controller.error(makeAbortError());
+                },
+                { once: true },
+              );
+            },
+          });
+          return new Response(stream, {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return jsonResponse({
+          choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+        });
+      }) as typeof globalThis.fetch;
+
+      const client = createOpenAIProvider(baseConfig);
+      const r = await client.chat([{ role: "user", content: "ping" }]);
+      expect(r.content).toBe("hi");
+      // First call stalled, second returned immediately.
+      expect(calls).toBe(2);
+    },
+  );
+
   it(
     "gives up after MAX_RETRIES timeouts and surfaces a meaningful error",
     { timeout: 10_000 },

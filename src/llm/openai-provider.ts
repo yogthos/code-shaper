@@ -57,13 +57,34 @@ interface OpenAIResponse {
  * timeout-aborts both retry with backoff. After MAX_RETRIES, the last
  * error is rethrown.
  */
+/** Outcome of a single non-streaming HTTP attempt. The body has
+ *  already been read (or read-attempt aborted) under the same
+ *  AbortController as the headers fetch — preventing the
+ *  body-read-stall failure mode where a server sends headers,
+ *  keeps the socket alive, but never finishes streaming the JSON.
+ *  Pre-fix that hung the chat() call indefinitely; the timer was
+ *  cleared once headers landed and `await response.json()` was
+ *  unguarded.
+ *
+ *  The caller deals with `data` (2xx) or `errorBody` (4xx) rather
+ *  than touching the Response. */
+export interface FetchOutcome {
+  status: number;
+  statusText: string;
+  ok: boolean;
+  /** Set when status was 2xx and JSON parse succeeded. */
+  data?: unknown;
+  /** Set when status was 4xx — short tail of the error body. */
+  errorBody?: string;
+}
+
 async function fetchWithRetry(
   url: string,
   baseInit: Omit<RequestInit, "signal">,
   timeoutMs: number,
   callerSignal: AbortSignal | undefined,
   maxRetries = MAX_RETRIES,
-): Promise<Response> {
+): Promise<FetchOutcome> {
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (callerSignal?.aborted) {
@@ -83,11 +104,40 @@ async function fetchWithRetry(
         ...baseInit,
         signal: controller.signal,
       });
-      // 2xx → success; 4xx → caller's problem (auth, bad request, etc.) and
-      // retrying won't change the answer, so return the response as-is and
-      // let `chat()` parse the error body. 5xx falls through to retry.
-      if (response.ok || (response.status >= 400 && response.status < 500)) {
-        return response;
+      // Read the body INSIDE the timer scope. If the server sent
+      // headers but stops streaming, the timer aborts the body
+      // read just like it would have aborted the headers fetch.
+      // 2xx: parse JSON; 4xx: caller's problem (auth, bad request,
+      // bad model name) — retry won't help, surface it; 5xx: retry.
+      if (response.ok) {
+        const data = (await response.json()) as unknown;
+        return {
+          status: response.status,
+          statusText: response.statusText,
+          ok: true,
+          data,
+        };
+      }
+      if (response.status >= 400 && response.status < 500) {
+        let errorBody = "";
+        try {
+          errorBody = await response.text();
+        } catch {
+          /* body read failed — leave empty */
+        }
+        return {
+          status: response.status,
+          statusText: response.statusText,
+          ok: false,
+          errorBody,
+        };
+      }
+      // 5xx — fall through to retry. Drain the body to free the
+      // socket; failures here are non-fatal.
+      try {
+        await response.text();
+      } catch {
+        /* ignore */
       }
       lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
     } catch (e) {
@@ -96,9 +146,8 @@ async function fetchWithRetry(
       if (lastError.name === "AbortError" && callerSignal?.aborted) {
         throw lastError;
       }
-      // Internal timeout abort: fall through to retry with a fresh
-      // controller. This is the GLM-stalled-out failure mode that
-      // previously crashed the whole pipeline.
+      // Internal timeout abort (headers stall OR body read stall):
+      // fall through to retry with a fresh controller.
     } finally {
       clearTimeout(timer);
       if (onCallerAbort && callerSignal) {
@@ -411,7 +460,7 @@ export function createOpenAIProvider(config: LLMConfig): LLMClient {
     ): Promise<LLMResponse> {
       try {
         const body = buildBody(config, messages, opts, false);
-        const response = await fetchWithRetry(
+        const outcome = await fetchWithRetry(
           `${baseUrl}/chat/completions`,
           {
             method: "POST",
@@ -422,21 +471,15 @@ export function createOpenAIProvider(config: LLMConfig): LLMClient {
           opts?.signal,
         );
 
-        if (!response.ok) {
-          let errorBody = "";
-          try {
-            errorBody = await response.text();
-          } catch {
-            /* ignore */
-          }
+        if (!outcome.ok) {
           throw new Error(
-            `${config.providerHint ?? "openai"} API error: ${response.status} ${response.statusText}${
-              errorBody ? ` - ${errorBody.slice(0, 500)}` : ""
+            `${config.providerHint ?? "openai"} API error: ${outcome.status} ${outcome.statusText}${
+              outcome.errorBody ? ` - ${outcome.errorBody.slice(0, 500)}` : ""
             }`,
           );
         }
 
-        const data = (await response.json()) as OpenAIResponse;
+        const data = outcome.data as OpenAIResponse;
         if (data.error) {
           throw new Error(
             `${config.providerHint ?? "openai"} API error: ${data.error.message ?? JSON.stringify(data.error)}`,

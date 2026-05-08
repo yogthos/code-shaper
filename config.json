@@ -5,7 +5,7 @@
       "url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
       "apiKey": "${ZHIPU_API_KEY}",
       "model": "glm-5.1",
-      "options": { "temperature": 0.2, "timeout_ms": 1200000 }
+      "options": { "temperature": 0.2, "timeout_ms": 300000 }
     }
   }
 }
