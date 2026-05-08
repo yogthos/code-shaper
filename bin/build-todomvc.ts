@@ -169,7 +169,12 @@ async function main(): Promise<number> {
     // 5-round MV diagnostic + auto test-rewrite (§5.3, Algorithm 4).
     // Each leaf failure is classified; brittle tests are auto-fixed
     // without consuming body-debug budget.
-    diagnosis: { enabled: true, rounds: 5, afterFailures: 0 },
+    // afterFailures: 1 — skip the diagnostic on the very first
+    // body-author miss. Most first failures are real implementation
+    // bugs the body author can fix on its own retry; running the
+    // 5-round MV judge on every miss roughly doubles diagnostic
+    // calls for limited additional value.
+    diagnosis: { enabled: true, rounds: 5, afterFailures: 1 },
     maxTestRewrites: 20,
   });
   const failedLeaves = build.leafResults.filter((r) => !r.ok);

@@ -151,10 +151,22 @@ const TSCONFIG = JSON.stringify(
   2,
 );
 
+// Pin vitest to a single-fork pool. By default vitest spawns N=cpu-cores
+// worker threads per run; for our flow each leaf retry triggers its own
+// `vitest run` invocation, and a 12-leaf project on an 8-core box would
+// fan out to 96 worker threads in flight at peaks. Single-fork keeps it
+// to one fork per invocation: less overhead, less memory churn,
+// predictable lifecycle when the harness SIGTERMs the process group on
+// timeout. The leaf suites are tiny (one file per spawn), so we lose
+// nothing by not parallelizing inside vitest.
 const VITEST_CONFIG = `import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
+    pool: "forks",
+    poolOptions: {
+      forks: { singleFork: true },
+    },
   },
 });
 `;
