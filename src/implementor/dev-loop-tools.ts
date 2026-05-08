@@ -22,6 +22,10 @@
  * reading from the in-memory render keeps the loop honest.
  */
 
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import nodePath from "node:path";
+
 import { isFile } from "../rpg/types.js";
 import type { FileNode, PlannedInterface, RPG } from "../rpg/types.js";
 import { renderTypeScriptFile } from "./render.js";
@@ -380,4 +384,115 @@ function extractBodyForLeaf(source: string, leaf: PlannedInterface): string | nu
     return extractMethodBody(source, leaf.ownerClassName, leaf.name);
   }
   return extractFunctionBody(source, leaf.name);
+}
+
+// ── typecheckTool ────────────────────────────────────────────────────
+//
+// Adapted from rlm-sandbox/src/rlm/test-runner.ts (`runTscCheck`).
+// The shape and the candidate-scoping rationale are theirs; ours
+// differs in:
+//   - We're called by the dev-loop agent, not a dispatcher, so the
+//     active file path is supplied directly rather than derived
+//     from a CandidateBody.
+//   - `ran: false` returns `ok: true` to keep the loop unblocked
+//     when the project happens to have no tsconfig (e.g., the
+//     architect hasn't materialized one yet).
+
+export interface TypecheckInput {
+  outDir: string;
+  /** Repo-relative path of the file currently being edited.
+   *  Diagnostics that don't reference this file are filtered out
+   *  — sibling stubs in a multi-leaf build have unresolved
+   *  symbols until their leaves implement, and surfacing those
+   *  would mislead the model into "fixing" code outside its
+   *  scope. */
+  activeFilePath: string;
+  /** Wall-clock cap for the tsc spawn. Default 60s. */
+  timeoutMs?: number;
+}
+
+export interface TypecheckResult {
+  /** Whether tsc actually ran. False when the project has no
+   *  tsconfig.json (non-TS or pre-materialize). */
+  ran: boolean;
+  /** From the active file's perspective. True when ran=false. */
+  ok: boolean;
+  /** Diagnostics filtered to the active file. Empty on ok=true. */
+  diagnostics: string[];
+}
+
+const DEFAULT_TYPECHECK_TIMEOUT_MS = 60_000;
+
+export async function typecheckTool(
+  input: TypecheckInput,
+): Promise<TypecheckResult> {
+  const tsconfigPath = nodePath.join(input.outDir, "tsconfig.json");
+  if (!existsSync(tsconfigPath)) {
+    return { ran: false, ok: true, diagnostics: [] };
+  }
+  const timeoutMs = input.timeoutMs ?? DEFAULT_TYPECHECK_TIMEOUT_MS;
+  return new Promise<TypecheckResult>((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const child = spawn("npx", ["tsc", "--noEmit", "-p", input.outDir], {
+      cwd: input.outDir,
+      env: process.env,
+    });
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      resolve({
+        ran: false,
+        ok: false,
+        diagnostics: [`tsc spawn failed: ${e.message}`],
+      });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        resolve({
+          ran: true,
+          ok: false,
+          diagnostics: [`tsc timed out after ${timeoutMs}ms`],
+        });
+        return;
+      }
+      const combined = `${stdout}\n${stderr}`.trim();
+      if (code === 0) {
+        resolve({ ran: true, ok: true, diagnostics: [] });
+        return;
+      }
+      // Filter to lines referencing the active file. tsc emits
+      // diagnostics in the form `path/to/file.ts(line,col): error TS…`
+      // — match the path as a substring (anchored on word boundary
+      // so `foo.ts` doesn't accidentally match `foo.ts.bak`).
+      const ownLines: string[] = [];
+      for (const line of combined.split("\n")) {
+        if (lineReferencesPath(line, input.activeFilePath)) {
+          ownLines.push(line);
+        }
+      }
+      if (ownLines.length === 0) {
+        // From the active file's perspective: clean. Sibling
+        // diagnostics are not this leaf's problem.
+        resolve({ ran: true, ok: true, diagnostics: [] });
+        return;
+      }
+      resolve({ ran: true, ok: false, diagnostics: ownLines });
+    });
+  });
+}
+
+function lineReferencesPath(line: string, repoRelative: string): boolean {
+  // Repo-relative path may appear with or without a leading
+  // `./`; tsc usually emits `src/foo.ts(…)`. Match the bare
+  // repo-relative path as a literal substring; that's what tsc
+  // produces when invoked with `-p outDir`.
+  return line.includes(repoRelative);
 }
