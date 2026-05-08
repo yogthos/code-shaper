@@ -56,6 +56,12 @@ export interface ChatOptions {
    *  provider's `LLMConfig.temperature` when omitted. */
   temperature?: number;
   signal?: AbortSignal;
+  /** When using `chatStream`, abort the request if no chunk arrives
+   *  for this many ms. Used to detect API stalls separately from
+   *  the overall request timeout (a slow upstream that's still
+   *  trickling tokens stays alive; one that's gone silent gets
+   *  killed early so the retry kicks in). */
+  stallTimeoutMs?: number;
 }
 
 export interface LLMResponse {

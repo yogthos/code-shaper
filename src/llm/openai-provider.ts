@@ -15,6 +15,7 @@ import type {
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_STALL_TIMEOUT_MS = 60_000;
 const MAX_RETRIES = 3;
 const INITIAL_RETRY_DELAY_MS = 1000;
 
@@ -112,6 +113,251 @@ async function fetchWithRetry(
     }
   }
   throw lastError ?? new Error("fetch failed after retries");
+}
+
+/**
+ * Streaming impl with retry-on-stall + retry-on-network-error.
+ *
+ * Two timers per attempt:
+ *   - Total timeout: hard ceiling on the whole request
+ *   - Stall timeout: reset on every chunk; if no chunk arrives for
+ *     `stallTimeoutMs`, abort + retry. Catches the case where the
+ *     API sent headers but stopped emitting tokens — the original
+ *     plain-fetch path can't tell that apart from "still working."
+ *
+ * Retries follow the same policy as fetchWithRetry: caller-aborts
+ * propagate; everything else gets up to MAX_RETRIES with backoff.
+ *
+ * Accumulates `delta.content` from each `data: {…}` SSE event into
+ * the returned `content`. Tool-call deltas are accumulated into the
+ * returned `toolCalls`. `[DONE]` ends the stream.
+ */
+async function chatStreamingImpl(
+  baseUrl: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>,
+  totalTimeoutMs: number,
+  stallTimeoutMs: number,
+  callerSignal: AbortSignal | undefined,
+  onChunk: (token: string) => void,
+  providerHint: string | undefined,
+  model: string,
+): Promise<LLMResponse> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (callerSignal?.aborted) {
+      const e = new Error("operation aborted by caller");
+      e.name = "AbortError";
+      throw e;
+    }
+    const controller = new AbortController();
+    let resolved = false;
+    const totalTimer = setTimeout(() => {
+      if (!resolved) controller.abort();
+    }, totalTimeoutMs);
+    let stallTimer: NodeJS.Timeout | null = null;
+    const resetStall = (): void => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        if (!resolved) controller.abort();
+      }, stallTimeoutMs);
+    };
+    let onCallerAbort: (() => void) | undefined;
+    if (callerSignal) {
+      onCallerAbort = () => controller.abort();
+      callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+    try {
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (response.status >= 400 && response.status < 500) {
+        // 4xx is the caller's problem; don't retry.
+        let errorBody = "";
+        try {
+          errorBody = await response.text();
+        } catch {
+          /* ignore */
+        }
+        throw new Error(
+          `${providerHint ?? "openai"} API error: ${response.status} ${response.statusText}${
+            errorBody ? ` - ${errorBody.slice(0, 500)}` : ""
+          }`,
+        );
+      }
+      if (!response.ok) {
+        lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
+        // Fall through to retry.
+      } else if (response.body === null) {
+        lastError = new Error("response body missing");
+      } else {
+        resetStall();
+        const result = await consumeSSE(response.body, onChunk, resetStall);
+        resolved = true;
+        return {
+          content: result.content,
+          finishReason: result.finishReason ?? "stop",
+          toolCalls:
+            result.toolCalls && result.toolCalls.length > 0
+              ? result.toolCalls
+              : undefined,
+          ...(result.usage !== null ? { usage: result.usage } : {}),
+        };
+      }
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (lastError.name === "AbortError" && callerSignal?.aborted) {
+        throw lastError;
+      }
+      // Internal abort (total timeout OR stall) and network errors
+      // both fall through to retry. providerHint surfaces in the
+      // final error message via the caller's wrapper.
+    } finally {
+      clearTimeout(totalTimer);
+      if (stallTimer) clearTimeout(stallTimer);
+      if (onCallerAbort && callerSignal) {
+        callerSignal.removeEventListener("abort", onCallerAbort);
+      }
+    }
+    if (attempt < MAX_RETRIES) {
+      const delay =
+        INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt) +
+        Math.random() * INITIAL_RETRY_DELAY_MS;
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw (
+    lastError ??
+    new Error(`${providerHint ?? "openai"}/${model}: stream failed after retries`)
+  );
+}
+
+interface SSEResult {
+  content: string;
+  finishReason: string | null;
+  toolCalls: LLMResponse["toolCalls"];
+  usage: LLMResponse["usage"] | null;
+}
+
+/** Read SSE chunks from the response body, parse `data: {...}`
+ *  events, accumulate content + tool deltas, surface progress to
+ *  `onChunk`, and reset the stall timer on every chunk we see. */
+async function consumeSSE(
+  body: ReadableStream<Uint8Array>,
+  onChunk: (token: string) => void,
+  resetStall: () => void,
+): Promise<SSEResult> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let content = "";
+  let finishReason: string | null = null;
+  const toolCallAccum = new Map<
+    number,
+    { id: string; name: string; argsBuffer: string }
+  >();
+  let usage: LLMResponse["usage"] | null = null;
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    resetStall();
+    buffer += decoder.decode(value, { stream: true });
+    // SSE messages are separated by blank lines.
+    let nl: number;
+    while ((nl = buffer.indexOf("\n\n")) !== -1) {
+      const eventBlock = buffer.slice(0, nl);
+      buffer = buffer.slice(nl + 2);
+      // Each block has one or more `data: ...` lines.
+      for (const rawLine of eventBlock.split("\n")) {
+        const line = rawLine.trim();
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") {
+          return {
+            content,
+            finishReason,
+            toolCalls: Array.from(toolCallAccum.entries())
+              .sort(([a], [b]) => a - b)
+              .map(([, t]) => ({
+                id: t.id,
+                type: "function" as const,
+                function: { name: t.name, arguments: t.argsBuffer },
+              })),
+            usage,
+          };
+        }
+        try {
+          const json = JSON.parse(payload) as {
+            choices?: Array<{
+              delta?: {
+                content?: string | null;
+                tool_calls?: Array<{
+                  index: number;
+                  id?: string;
+                  function?: { name?: string; arguments?: string };
+                }>;
+              };
+              finish_reason?: string | null;
+            }>;
+            usage?: {
+              prompt_tokens?: number;
+              completion_tokens?: number;
+              total_tokens?: number;
+            };
+          };
+          const choice = json.choices?.[0];
+          const delta = choice?.delta;
+          if (delta?.content) {
+            content += delta.content;
+            onChunk(delta.content);
+          }
+          if (delta?.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const slot = toolCallAccum.get(tc.index) ?? {
+                id: "",
+                name: "",
+                argsBuffer: "",
+              };
+              if (tc.id) slot.id = tc.id;
+              if (tc.function?.name) slot.name = tc.function.name;
+              if (tc.function?.arguments)
+                slot.argsBuffer += tc.function.arguments;
+              toolCallAccum.set(tc.index, slot);
+            }
+          }
+          if (choice?.finish_reason) finishReason = choice.finish_reason;
+          if (json.usage) {
+            usage = {
+              promptTokens: json.usage.prompt_tokens ?? 0,
+              completionTokens: json.usage.completion_tokens ?? 0,
+              totalTokens: json.usage.total_tokens ?? 0,
+            };
+          }
+        } catch {
+          // Malformed JSON in a stream chunk — skip rather than fail
+          // the whole call. Real providers occasionally emit keep-
+          // alive comments or incomplete events; the next chunk
+          // usually carries on cleanly.
+        }
+      }
+    }
+  }
+  return {
+    content,
+    finishReason,
+    toolCalls: Array.from(toolCallAccum.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([, t]) => ({
+        id: t.id,
+        type: "function" as const,
+        function: { name: t.name, arguments: t.argsBuffer },
+      })),
+    usage,
+  };
 }
 
 function buildBody(
@@ -216,6 +462,31 @@ export function createOpenAIProvider(config: LLMConfig): LLMClient {
         // Re-throw with provider context so failures upstream are
         // attributable to a specific provider rather than a bare
         // AbortError or fetch error.
+        if (e instanceof Error && !e.message.includes(config.model)) {
+          e.message = `[${config.providerHint ?? "openai"}/${config.model}] ${e.message}`;
+        }
+        throw e;
+      }
+    },
+
+    async chatStream(
+      messages: ChatMessage[],
+      onChunk: (token: string) => void,
+      opts?: ChatOptions,
+    ): Promise<LLMResponse> {
+      try {
+        return await chatStreamingImpl(
+          baseUrl,
+          buildHeaders(apiKey),
+          buildBody(config, messages, opts, true),
+          timeoutMs,
+          opts?.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS,
+          opts?.signal,
+          onChunk,
+          config.providerHint,
+          config.model,
+        );
+      } catch (e) {
         if (e instanceof Error && !e.message.includes(config.model)) {
           e.message = `[${config.providerHint ?? "openai"}/${config.model}] ${e.message}`;
         }
