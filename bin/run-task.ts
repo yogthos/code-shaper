@@ -32,6 +32,7 @@ import {
   emptyRPG,
   isCapability,
   isFile,
+  loadRepo,
   materializeRPG,
 } from "../src/rpg/index.js";
 import {
@@ -152,11 +153,36 @@ async function run(args: ParsedArgs): Promise<number> {
   }
 
   // Greenfield: clear the dir if it exists. Extend/fix/feature: leave it.
-  const rpg = emptyRPG();
   const outDir = path.resolve(args.projectDir);
   if (mode === "greenfield") {
     await rm(outDir, { recursive: true, force: true });
     await mkdir(outDir, { recursive: true });
+  }
+
+  // For non-greenfield modes, ANALYZE the existing folder before
+  // telling the model anything. loadRepo walks every supported
+  // source file with tree-sitter, populating an RPG with files,
+  // classes, functions, methods, imports, exports, and inheritance
+  // edges. The model then sees the existing code structure in
+  // every architect prompt, so its proposals integrate with what's
+  // there rather than reinvent it.
+  let rpg = emptyRPG();
+  if (mode !== "greenfield") {
+    log("phase=analyze");
+    rpg = await loadRepo(outDir);
+    let fileCount = 0;
+    let symbolCount = 0;
+    for (const node of Object.values(rpg.nodes)) {
+      if (isFile(node)) fileCount++;
+      if (
+        node.kind === "function" ||
+        node.kind === "class" ||
+        node.kind === "method"
+      ) {
+        symbolCount++;
+      }
+    }
+    log(`  ${fileCount} files, ${symbolCount} symbols loaded`);
   }
 
   const persist = async (): Promise<void> => {

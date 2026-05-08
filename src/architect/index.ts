@@ -18,6 +18,19 @@ export {
 } from "./stack-prompts.js";
 export type { StackPromptInput } from "./stack-prompts.js";
 
+// Stage B — npm-mutation primitives the model can call mid-pipeline
+// when it realizes it needs another dep (or a different version).
+export {
+  addDependency,
+  removeDependency,
+  setScript,
+  npmRun,
+} from "./npm-tools.js";
+export type {
+  NpmOpInput,
+  NpmOpResult,
+} from "./npm-tools.js";
+
 // Phase 3 — proposal-level construction.
 export {
   proposeFunctionalityGraph,
