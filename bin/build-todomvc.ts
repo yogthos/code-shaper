@@ -224,5 +224,22 @@ async function main(): Promise<number> {
   return 0;
 }
 
-const code = await main();
-process.exit(code);
+/**
+ * Top-level catch: any thrown error (most commonly an LLM AbortError
+ * after MAX_RETRIES, or a JSON-parse failure on a malformed response)
+ * lands here. We surface it with a clear header, persist whatever
+ * partial RPG we have so demo/ reflects the last good state, and
+ * exit non-zero — but never let a bare stack trace look like the
+ * pipeline crashed catastrophically when it didn't.
+ */
+try {
+  const code = await main();
+  process.exit(code);
+} catch (err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`\n[fatal] uncaught: ${msg}`);
+  if (err instanceof Error && err.stack) {
+    console.error(err.stack.split("\n").slice(1, 6).join("\n"));
+  }
+  process.exit(99);
+}

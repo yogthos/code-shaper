@@ -42,15 +42,46 @@ interface OpenAIResponse {
   error?: { message?: string; code?: string };
 }
 
+/**
+ * Per-attempt fetch with a fresh AbortController each try.
+ *
+ * Two abort sources are distinguished:
+ *   - Internal timeout (`timeoutMs` → controller.abort): retried with
+ *     a fresh controller. This is the recoverable case — a slow
+ *     upstream API hang shouldn't take down the whole pipeline.
+ *   - Caller-supplied `callerSignal`: propagated immediately. The
+ *     caller asked us to stop; honor it without retries.
+ *
+ * 4xx responses bypass retry entirely (caller's problem); 5xx and
+ * timeout-aborts both retry with backoff. After MAX_RETRIES, the last
+ * error is rethrown.
+ */
 async function fetchWithRetry(
   url: string,
-  init: RequestInit,
+  baseInit: Omit<RequestInit, "signal">,
+  timeoutMs: number,
+  callerSignal: AbortSignal | undefined,
   maxRetries = MAX_RETRIES,
 ): Promise<Response> {
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (callerSignal?.aborted) {
+      const e = new Error("operation aborted by caller");
+      e.name = "AbortError";
+      throw e;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let onCallerAbort: (() => void) | undefined;
+    if (callerSignal) {
+      onCallerAbort = () => controller.abort();
+      callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+    }
     try {
-      const response = await fetch(url, init);
+      const response = await fetch(url, {
+        ...baseInit,
+        signal: controller.signal,
+      });
       // 2xx → success; 4xx → caller's problem (auth, bad request, etc.) and
       // retrying won't change the answer, so return the response as-is and
       // let `chat()` parse the error body. 5xx falls through to retry.
@@ -60,7 +91,18 @@ async function fetchWithRetry(
       lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
     } catch (e) {
       lastError = e instanceof Error ? e : new Error(String(e));
-      if (lastError.name === "AbortError") throw lastError;
+      // Caller-initiated abort: bubble up immediately, no retry.
+      if (lastError.name === "AbortError" && callerSignal?.aborted) {
+        throw lastError;
+      }
+      // Internal timeout abort: fall through to retry with a fresh
+      // controller. This is the GLM-stalled-out failure mode that
+      // previously crashed the whole pipeline.
+    } finally {
+      clearTimeout(timer);
+      if (onCallerAbort && callerSignal) {
+        callerSignal.removeEventListener("abort", onCallerAbort);
+      }
     }
     if (attempt < maxRetries) {
       const delay =
@@ -121,24 +163,18 @@ export function createOpenAIProvider(config: LLMConfig): LLMClient {
       messages: ChatMessage[],
       opts?: ChatOptions,
     ): Promise<LLMResponse> {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      if (opts?.signal) {
-        if (opts.signal.aborted) controller.abort();
-        else
-          opts.signal.addEventListener("abort", () => controller.abort(), {
-            once: true,
-          });
-      }
-
       try {
         const body = buildBody(config, messages, opts, false);
-        const response = await fetchWithRetry(`${baseUrl}/chat/completions`, {
-          method: "POST",
-          headers: buildHeaders(apiKey),
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
+        const response = await fetchWithRetry(
+          `${baseUrl}/chat/completions`,
+          {
+            method: "POST",
+            headers: buildHeaders(apiKey),
+            body: JSON.stringify(body),
+          },
+          timeoutMs,
+          opts?.signal,
+        );
 
         if (!response.ok) {
           let errorBody = "";
@@ -176,8 +212,14 @@ export function createOpenAIProvider(config: LLMConfig): LLMClient {
               }
             : undefined,
         };
-      } finally {
-        clearTimeout(timer);
+      } catch (e) {
+        // Re-throw with provider context so failures upstream are
+        // attributable to a specific provider rather than a bare
+        // AbortError or fetch error.
+        if (e instanceof Error && !e.message.includes(config.model)) {
+          e.message = `[${config.providerHint ?? "openai"}/${config.model}] ${e.message}`;
+        }
+        throw e;
       }
     },
 
