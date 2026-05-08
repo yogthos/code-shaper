@@ -421,14 +421,13 @@ describe("Math Pair", () => {
         testsByLeafId,
         workDir,
         maxAttemptsPerLeaf: 1,
+        // Cap rounds short of MAX_INTEGRATION_ROUNDS=20 so the
+        // permanently-failing mock doesn't spin the full budget.
+        // Both terminal paths (apply-error + round-exhaustion) reach
+        // the same `r.ok = false` outcome we assert below.
+        maxIntegrationRounds: 3,
       });
       expect(r.ok).toBe(false);
-      // One of two terminal paths is acceptable:
-      //   - We hit an apply error (the culprit body never satisfies its
-      //     unit tests after fresh_approach).
-      //   - We exhaust MAX_INTEGRATION_ROUNDS with the branch still
-      //     failing.
-      // Both are valid "integration didn't recover" outcomes.
       expect(r.error).toBeDefined();
     },
   );

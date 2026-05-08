@@ -46,7 +46,17 @@ import {
   type DiscoveredBranch,
 } from "./integration-prompts.js";
 
-export const MAX_INTEGRATION_ROUNDS = 5;
+/**
+ * Default integration-recovery budget. Matches §5.3 of the RPG paper,
+ * which specifies "20 remediation attempts for test or environment
+ * errors" per failing branch. Was 5; bumped 2026-05-08 to match the
+ * paper after observing premature integration failures on TodoMVC.
+ *
+ * The `IntegrationInput.maxIntegrationRounds` override exists so tests
+ * with deterministic permanent-failure mocks (which would otherwise
+ * spin all 20 rounds) can cap themselves at a smaller number.
+ */
+export const MAX_INTEGRATION_ROUNDS = 20;
 const TEST_FILE_DIR = "tests/integration";
 
 export interface IntegrationInput {
@@ -64,6 +74,10 @@ export interface IntegrationInput {
   perLeafTimeoutMs?: number;
   branchRunTimeoutMs?: number;
   temperature?: number;
+  /** Override the recovery-round budget (default
+   *  MAX_INTEGRATION_ROUNDS = 20). Used by tests that drive
+   *  permanently-failing recovery and don't want to spin 20 rounds. */
+  maxIntegrationRounds?: number;
 }
 
 export interface IntegrationResult {
@@ -159,7 +173,8 @@ export async function runIntegrationTests(
   const branchStatus = new Map<string, "failing" | "passing">();
   for (const b of branches) branchStatus.set(b.branch.id, "failing");
 
-  for (let round = 0; round < MAX_INTEGRATION_ROUNDS; round++) {
+  const maxRounds = input.maxIntegrationRounds ?? MAX_INTEGRATION_ROUNDS;
+  for (let round = 0; round < maxRounds; round++) {
     rounds = round + 1;
     const failingBranchIds = [...branchStatus.entries()]
       .filter(([, status]) => status === "failing")
@@ -311,7 +326,7 @@ export async function runIntegrationTests(
     recoveries,
     failingBranchIds: finalFailing,
     rounds,
-    error: `exhausted ${MAX_INTEGRATION_ROUNDS} integration rounds; ${finalFailing.length} branch(es) still failing`,
+    error: `exhausted ${maxRounds} integration rounds; ${finalFailing.length} branch(es) still failing`,
   };
 }
 

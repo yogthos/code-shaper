@@ -250,7 +250,9 @@ async function run(args: ParsedArgs): Promise<number> {
   // Phase 5: implementation
   log("phase=implementation");
   const build = await buildImplementations(client, rpg, {
-    maxAttemptsPerLeaf: 3,
+    // Matches §5.3 of the RPG paper: "each function allows up to 8
+    // debugging iterations." Was 3.
+    maxAttemptsPerLeaf: 8,
     outDir,
     preserveHarness: true,
   });
@@ -301,7 +303,9 @@ async function run(args: ParsedArgs): Promise<number> {
         bodyByLeafId,
         testsByLeafId,
         workDir: build.workDir,
-        maxAttemptsPerLeaf: 3,
+        // Matches §5.3 of the RPG paper: "each function allows up to 8
+    // debugging iterations." Was 3.
+    maxAttemptsPerLeaf: 8,
       });
       log(
         `  rounds=${integration.rounds}; recoveries=${integration.recoveries.length}; ok=${integration.ok}`,
