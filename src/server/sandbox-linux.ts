@@ -38,16 +38,23 @@ export function renderBwrapArgv(
 
   // Filesystem mount order matters in bwrap — later mounts override
   // earlier ones at the same path. Sequence:
-  //   1. ro-bind / over the whole tree (read-only baseline)
-  //   2. /proc, /dev, /tmp shadowed with the standard tmpfs/proc
-  //      mounts node needs to start up
-  //   3. writable roots LAST so they override anything above (in
-  //      particular `/tmp/tsx-<uid>`, which would otherwise be
-  //      hidden under the empty `--tmpfs /tmp` from step 2)
+  //   1. ro-bind / over the whole tree — read-only by default,
+  //      reads pass through to the host (matches our policy: reads
+  //      are unrestricted; only destructive operations are blocked).
+  //   2. Real /proc + /dev mounts node needs to start up.
+  //   3. Writable roots LAST so they override the read-only ro-bind
+  //      for the specific paths the task needs to write.
+  //
+  // Notably absent: `--tmpfs /tmp`. We had it earlier but it shadows
+  // the entire /tmp tree, which on macOS-style temp paths (the
+  // harness's mkdtemp work dirs all land under /tmp on Linux) hides
+  // the very files the child is trying to read — its own entry
+  // script, the test source, etc. The ro-bind already exposes /tmp
+  // read-only; the writable-root binds carve out the specific
+  // subpaths the child writes to.
   argv.push("--ro-bind", "/", "/");
   argv.push("--proc", "/proc");
   argv.push("--dev", "/dev");
-  argv.push("--tmpfs", "/tmp");
   for (const root of opts.writableRoots) {
     argv.push("--bind", root, root);
   }
