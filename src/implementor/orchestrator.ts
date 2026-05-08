@@ -85,6 +85,14 @@ export interface BuildInput {
    *  author. Forwarded to implementLeaf. Default false; production
    *  drivers (build-todomvc.ts, run-task.ts) opt in. */
   useEditTools?: boolean;
+  /** Switch the per-leaf body author to the multi-turn dev loop
+   *  (`runLeafDevLoop`): list_files / read_file / edit_file /
+   *  typecheck / run_test plus the §D.2 surgical edits and
+   *  Terminate. Subsumes `useEditTools`. Default false; production
+   *  drivers (build-todomvc.ts) opt in. */
+  useDevLoop?: boolean;
+  /** Per-dev-loop iteration budget. Forwarded to implementLeaf. */
+  devLoopMaxIterations?: number;
   /** Enable env-fix on `environment` diagnostic verdicts. Forwarded
    *  to implementLeaf as `enableEnvFix`. Requires `outDir` (which
    *  the orchestrator passes through as `projectDir` to leaf). */
@@ -247,6 +255,12 @@ export async function buildImplementations(
           : {}),
         ...(input.maxTestRewrites !== undefined
           ? { maxTestRewrites: input.maxTestRewrites }
+          : {}),
+        ...(input.useDevLoop !== undefined
+          ? { useDevLoop: input.useDevLoop }
+          : {}),
+        ...(input.devLoopMaxIterations !== undefined
+          ? { devLoopMaxIterations: input.devLoopMaxIterations }
           : {}),
         ...(input.useEditTools !== undefined
           ? { useEditTools: input.useEditTools }

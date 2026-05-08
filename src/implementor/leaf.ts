@@ -27,6 +27,7 @@ import {
   type FailureDiagnosisResult,
 } from "../architect/diagnose-failure.js";
 import { editLeafViaTools, type ToolName } from "./edit-author.js";
+import { runLeafDevLoop } from "./dev-loop.js";
 import {
   extractFunctionBody,
   extractMethodBody,
@@ -163,6 +164,17 @@ export interface LeafImplementInput {
    *  renderer continues to drive subsequent leaves on the same
    *  file consistently. Default false; production drivers opt in. */
   useEditTools?: boolean;
+  /** When true, replace the body-author + §D.2 path with the
+   *  full multi-turn dev loop (`runLeafDevLoop`): the model gets
+   *  read tools (list_files, read_file), edit tools (edit_file
+   *  string-replace + the §D.2 surgical tools), probes
+   *  (typecheck, run_test), and Terminate. Within ONE chat
+   *  session it can explore the project, edit, run tests, and
+   *  decide it's done. Subsumes `useEditTools`. Default false;
+   *  production drivers opt in. */
+  useDevLoop?: boolean;
+  /** Per-dev-loop iteration budget. Default 15. */
+  devLoopMaxIterations?: number;
 }
 
 export interface LeafImplementResult {
@@ -353,7 +365,58 @@ export async function implementLeaf(
         };
       }
     }
-    if (input.useEditTools) {
+    if (input.useDevLoop) {
+      // Dev-loop author: multi-turn agent with read/edit/probe
+      // tools. The model can call list_files / read_file to
+      // explore the project, edit the active file (string-
+      // replace via edit_file or §D.2 surgical tools), run
+      // typecheck + run_test mid-session, and call Terminate
+      // when it believes the leaf is done. We then run the test
+      // ONCE more below to verify; ok=true here just means the
+      // model committed.
+      const r = await runLeafDevLoop(client, {
+        leaf: input.leaf,
+        hostFile: input.hostFile,
+        rpg: input.rpg,
+        bodyByLeafId: input.bodyByLeafId,
+        testsByLeafId: input.testsByLeafId,
+        workDir: input.workDir,
+        ...(input.projectDir !== undefined ? { outDir: input.projectDir } : {}),
+        ...(retryFeedback?.failureMessage !== undefined
+          ? { failureMessage: retryFeedback.failureMessage }
+          : {}),
+        ...(input.devLoopMaxIterations !== undefined
+          ? { maxIterations: input.devLoopMaxIterations }
+          : {}),
+        ...(input.testTimeoutMs !== undefined
+          ? { testTimeoutMs: input.testTimeoutMs }
+          : {}),
+        ...(input.temperature !== undefined
+          ? { temperature: input.temperature }
+          : {}),
+      });
+      if (!r.ok || !r.body) {
+        // Treat as if the body was empty so the loop's standard
+        // empty-body retry path kicks in. The trail's tail is
+        // surfaced as lastFatal so the next attempt's prompt
+        // shows what the agent did before giving up.
+        const tail = r.trail
+          .slice(-3)
+          .map(
+            (t) =>
+              `${t.tool}(${JSON.stringify(t.args)})${t.error ? " → " + t.error.slice(0, 200) : t.summary ? " → " + t.summary : ""}`,
+          )
+          .join(" | ");
+        lastFatal = `dev loop failed: ${r.error ?? "no body produced"}${tail ? ` [trail: ${tail}]` : ""}`;
+        priorBodyEmpty = true;
+        continue;
+      }
+      body = r.body;
+      priorBodyEmpty = false;
+      lastFatal = undefined;
+      // bodyByLeafId is already updated by the dev loop's edit
+      // tools; nothing more to do here.
+    } else if (input.useEditTools) {
       // §D.2 tool-using author: the LLM picks an edit tool scoped
       // to this leaf's kind, emits structured args, the harness
       // applies the tool to the rendered file, and we extract the

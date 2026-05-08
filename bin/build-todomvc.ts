@@ -301,7 +301,14 @@ async function main(): Promise<number> {
     // author. The LLM picks a scope (edit_function_in_file or
     // edit_method_of_class_in_file) and emits structured args; the
     // harness applies the tool with AST-aware splicing.
-    useEditTools: true,
+    // Dev-loop author: full multi-turn agent (read/edit/probe +
+    // §D.2 surgical edits + Terminate). Subsumes useEditTools.
+    // The model can now `list_files` / `read_file` to discover
+    // siblings before referencing them — fixes the cross-file
+    // failure mode (e.g. `TodoValidationError is not defined`)
+    // that wedged previous runs.
+    useDevLoop: true,
+    devLoopMaxIterations: 15,
     // Stage C: when the diagnostic says environment, the model can
     // call add_dependency / remove_dependency / set_script /
     // npm_run via a structured tool call. The harness applies the
