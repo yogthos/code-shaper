@@ -494,7 +494,13 @@ function spawnCollect(
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(cmd, args, { cwd, env: process.env });
+      // detached: true puts the child into its own process group so
+      // we can signal the entire group on timeout. Without this on
+      // Linux, SIGTERM lands on `npx` (the shell wrapper) but doesn't
+      // reach `node` (the vitest worker), and the child appears to
+      // hang. macOS happens to forward signals through npm wrappers
+      // most of the time, masking this bug locally.
+      child = spawn(cmd, args, { cwd, env: process.env, detached: true });
     } catch (e) {
       reject(e);
       return;
@@ -502,26 +508,36 @@ function spawnCollect(
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let killedFinal = false;
+    const killGroup = (signal: NodeJS.Signals): void => {
+      // -pid signals the whole process group (the leader's pid is
+      // also the group's pid because we passed detached: true).
+      if (typeof child.pid === "number") {
+        try {
+          process.kill(-child.pid, signal);
+        } catch {
+          // The group may already be gone (race with normal exit).
+          // Fall back to signaling the leader directly.
+          try {
+            child.kill(signal);
+          } catch {
+            /* swallow */
+          }
+        }
+      }
+    };
     const timer =
       timeoutMs !== null
         ? setTimeout(() => {
             timedOut = true;
-            // SIGTERM first; if the child ignores it, SIGKILL after a
-            // short grace period.
-            try {
-              child.kill("SIGTERM");
-              setTimeout(() => {
-                if (!child.killed) {
-                  try {
-                    child.kill("SIGKILL");
-                  } catch {
-                    /* swallow */
-                  }
-                }
-              }, KILL_GRACE_MS).unref();
-            } catch {
-              /* swallow */
-            }
+            killGroup("SIGTERM");
+            // Always force-kill after grace: child.killed only
+            // reports "did I signal it", not "is it dead", so it
+            // can't be used to gate SIGKILL — vitest workers that
+            // ignore SIGTERM would otherwise hang the parent forever.
+            setTimeout(() => {
+              if (!killedFinal) killGroup("SIGKILL");
+            }, KILL_GRACE_MS).unref();
           }, timeoutMs)
         : null;
     if (timer) timer.unref();
@@ -536,6 +552,7 @@ function spawnCollect(
       reject(err);
     });
     child.on("close", (code) => {
+      killedFinal = true;
       if (timer) clearTimeout(timer);
       resolve({ stdout, stderr, exitCode: code, timedOut, timeoutMs });
     });
