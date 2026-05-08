@@ -339,18 +339,26 @@ async function run(args: ParsedArgs): Promise<number> {
   return integrationOk === false ? 1 : 0;
 }
 
+// Parse args ONCE at the top so the catch handler can use them
+// without risking a second throw. If parseArgs itself fails, no
+// result file can be written (we don't know its path) — exit 2 is
+// the documented "invalid args" code.
+let args: ParsedArgs;
 try {
-  const args = parseArgs(process.argv.slice(2));
+  args = parseArgs(process.argv.slice(2));
+} catch (err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`[fatal] arg parse: ${msg}`);
+  process.exit(2);
+}
+
+try {
   const code = await run(args);
   process.exit(code);
 } catch (err) {
   const msg = err instanceof Error ? err.message : String(err);
   console.error(`[fatal] uncaught: ${msg}`);
-  // Best-effort write of a failure result so the parent's task_result
-  // has something to read; if --result-path wasn't parsed we silently
-  // exit 3.
   try {
-    const args = parseArgs(process.argv.slice(2));
     await writeResult(args.resultPath, {
       ok: false,
       summary: "uncaught error in child",

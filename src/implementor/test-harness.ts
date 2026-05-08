@@ -485,6 +485,44 @@ interface ProcOutput {
   timeoutMs: number | null;
 }
 
+/**
+ * Allowlist of environment variables forwarded into vitest. Anything
+ * else is dropped before reaching the test process, including all
+ * `*_API_KEY`, `*_TOKEN`, `*_SECRET`, ssh-agent paths, etc. — model-
+ * authored test source running inside vitest can't exfiltrate them.
+ */
+const TEST_RUNNER_ENV_ALLOW = new Set<string>([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "LC_ALL",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+  "NODE_PATH",
+  "NODE_OPTIONS",
+  "npm_config_cache",
+  "npm_config_prefix",
+  "npm_config_userconfig",
+  "TERM",
+]);
+
+function filterEnvForTestRunner(
+  env: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const filtered: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) continue;
+    if (TEST_RUNNER_ENV_ALLOW.has(k)) {
+      filtered[k] = v;
+    }
+  }
+  return filtered;
+}
+
 function spawnCollect(
   cmd: string,
   args: string[],
@@ -500,7 +538,19 @@ function spawnCollect(
       // reach `node` (the vitest worker), and the child appears to
       // hang. macOS happens to forward signals through npm wrappers
       // most of the time, masking this bug locally.
-      child = spawn(cmd, args, { cwd, env: process.env, detached: true });
+      //
+      // Env is FILTERED before reaching vitest. The model's tests
+      // execute inside this process; passing the raw process.env
+      // (containing AWS creds, GitHub tokens, ssh agent socket
+      // paths, LD_PRELOAD, every LLM provider key, etc.) gives a
+      // malicious test source unrestricted exfil. We forward only
+      // PATH/HOME/USER/SHELL/NODE_PATH plus npm/npx variables that
+      // the harness needs to resolve binaries. No API keys.
+      child = spawn(cmd, args, {
+        cwd,
+        env: filterEnvForTestRunner(process.env),
+        detached: true,
+      });
     } catch (e) {
       reject(e);
       return;

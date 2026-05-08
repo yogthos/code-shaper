@@ -62,7 +62,23 @@ export async function handleSubmitTask(
   // still running, we wait until it releases. Importantly: we don't
   // await acquisition here — submit_task returns immediately with
   // the taskId, and the child starts whenever the mutex frees.
-  void acquireAndRun(ctx, record);
+  //
+  // Top-level catch ensures any unanticipated rejection (e.g. mutex
+  // acquisition itself rejecting; runTask synchronously throwing on
+  // a missing sandbox tool) is recorded on the task record rather
+  // than surfacing as an UnhandledPromiseRejection that would crash
+  // the server process on newer node versions.
+  acquireAndRun(ctx, record).catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    void ctx.table
+      .update(record.taskId, {
+        phase: "failed",
+        doneAt: Date.now(),
+        pid: null,
+        error: `acquireAndRun rejected: ${msg}`,
+      })
+      .catch(() => {});
+  });
 
   return { taskId: record.taskId };
 }
@@ -241,9 +257,11 @@ function validateSubmission(input: TaskSubmission): void {
   if (!path.isAbsolute(input.projectDir)) {
     throw new Error("projectDir must be an absolute path");
   }
-  // Reject system paths the user shouldn't be touching from a
-  // generic agent. The sandbox would block writes too, but failing
-  // early gives a clear error message.
+  // Reject system + sensitive paths. Even though the sandbox blocks
+  // writes outside projectDir, a missing-sandbox host (no
+  // sandbox-exec / no bwrap) would otherwise let a task scribble
+  // anywhere. Failing early gives a clean error and works as
+  // defense-in-depth.
   const resolved = (() => {
     try {
       return realpathSync(input.projectDir);
@@ -251,11 +269,37 @@ function validateSubmission(input: TaskSubmission): void {
       return input.projectDir;
     }
   })();
-  for (const banned of ["/etc", "/usr", "/bin", "/sbin", "/System", "/Library", "/private/etc"]) {
+  const home = process.env.HOME ?? "";
+  const bannedAbsolute = [
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/Library",
+    "/private/etc",
+    "/private/var/db",
+    "/private/var/root",
+    "/Applications",
+    "/boot",
+    "/root",
+  ];
+  const bannedHomeRel = [".ssh", ".aws", ".gnupg", ".config", "Library/Keychains"];
+  for (const banned of bannedAbsolute) {
     if (resolved === banned || resolved.startsWith(banned + "/")) {
       throw new Error(
         `projectDir cannot be inside system path "${banned}"; got "${resolved}"`,
       );
+    }
+  }
+  if (home) {
+    for (const rel of bannedHomeRel) {
+      const banned = path.join(home, rel);
+      if (resolved === banned || resolved.startsWith(banned + "/")) {
+        throw new Error(
+          `projectDir cannot be inside sensitive path "${banned}"; got "${resolved}"`,
+        );
+      }
     }
   }
   if (!input.task || typeof input.task !== "string") {

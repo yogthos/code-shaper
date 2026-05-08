@@ -146,6 +146,22 @@ export function runTask(opts: RunTaskOptions): RunTaskHandle {
     tsxBin,
     innerArgs,
   );
+  // Defense-in-depth: refuse to run unsandboxed unless the operator
+  // has explicitly opted in. Without this, a host that's missing
+  // `sandbox-exec` (macOS without the system app) or `bwrap` (Linux
+  // without bubblewrap installed) would silently execute model-
+  // authored code with full host privileges. Explicit opt-in is via
+  // the env var so it's a visible operator decision rather than a
+  // submission-time toggle a misconfigured client could enable.
+  if (
+    spawned.backend === "none" &&
+    process.env.CODE_SHAPER_ALLOW_UNSANDBOXED !== "1"
+  ) {
+    throw new Error(
+      `refusing to run task ${opts.taskId}: no sandbox available on this host (sandbox-exec / bwrap not found). ` +
+        `Install one, or set CODE_SHAPER_ALLOW_UNSANDBOXED=1 to override.`,
+    );
+  }
 
   const handle: { child: ChildProcess | null } = { child: null };
   let cancelled = false;
@@ -232,15 +248,26 @@ export function runTask(opts: RunTaskOptions): RunTaskHandle {
     handleStream(child.stdout!);
     handleStream(child.stderr!);
 
-    // Wait for exit.
+    // Wait for exit. Capture the spawn-error object too — without
+    // this, an ENOENT (sandbox-exec / bwrap missing, tsx broken)
+    // surfaces only as "child exited without writing result
+    // (code=null, signal=none)" with no clue what actually failed.
+    let spawnError: Error | null = null;
     const exitInfo = await new Promise<{
       code: number | null;
       signal: NodeJS.Signals | null;
     }>((resolve) => {
-      child.on("close", (code, signal) => resolve({ code, signal }));
-      child.on("error", () =>
-        resolve({ code: null, signal: null }),
-      );
+      let resolved = false;
+      const settle = (v: { code: number | null; signal: NodeJS.Signals | null }): void => {
+        if (resolved) return;
+        resolved = true;
+        resolve(v);
+      };
+      child.on("close", (code, signal) => settle({ code, signal }));
+      child.on("error", (err) => {
+        spawnError = err instanceof Error ? err : new Error(String(err));
+        settle({ code: null, signal: null });
+      });
     });
     quota.stop();
     // Drain pending log writes BEFORE attempting to read the result
@@ -255,15 +282,18 @@ export function runTask(opts: RunTaskOptions): RunTaskHandle {
       const raw = await readFile(opts.resultPath, "utf-8");
       result = JSON.parse(raw) as TaskResult;
     } catch (e) {
+      const err: Error = spawnError ?? (e instanceof Error ? e : new Error(String(e)));
       result = {
         ok: false,
         summary: cancelled
           ? "cancelled by caller"
-          : `child exited without writing result (code=${exitInfo.code}, signal=${exitInfo.signal ?? "none"})`,
+          : spawnError !== null
+            ? `child failed to spawn: ${err.message}`
+            : `child exited without writing result (code=${exitInfo.code}, signal=${exitInfo.signal ?? "none"})`,
         materializedTo: opts.projectDir,
         leafResults: [],
         integrationOk: null,
-        error: e instanceof Error ? e.message : String(e),
+        error: err.message,
       };
     }
     return result;

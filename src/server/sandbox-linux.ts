@@ -36,18 +36,21 @@ export function renderBwrapArgv(
   const allowNetwork = opts.allowNetwork ?? true;
   const argv: string[] = ["bwrap"];
 
-  // Filesystem: read-only everywhere by default…
+  // Filesystem mount order matters in bwrap — later mounts override
+  // earlier ones at the same path. Sequence:
+  //   1. ro-bind / over the whole tree (read-only baseline)
+  //   2. /proc, /dev, /tmp shadowed with the standard tmpfs/proc
+  //      mounts node needs to start up
+  //   3. writable roots LAST so they override anything above (in
+  //      particular `/tmp/tsx-<uid>`, which would otherwise be
+  //      hidden under the empty `--tmpfs /tmp` from step 2)
   argv.push("--ro-bind", "/", "/");
-  // …then read-write holes for the writable roots. Order matters in
-  // bwrap: each `--bind` overrides any earlier mount at the same path.
-  for (const root of opts.writableRoots) {
-    argv.push("--bind", root, root);
-  }
-  // /tmp + /dev + /proc + /sys: standard tmpfs/proc setup so node can
-  // open random files, /dev/null, /dev/urandom, etc.
   argv.push("--proc", "/proc");
   argv.push("--dev", "/dev");
   argv.push("--tmpfs", "/tmp");
+  for (const root of opts.writableRoots) {
+    argv.push("--bind", root, root);
+  }
 
   // Namespace isolation. We DO want a separate PID namespace so the
   // sandboxed process can't signal others on the host, and a fresh

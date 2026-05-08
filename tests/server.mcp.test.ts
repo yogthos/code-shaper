@@ -35,6 +35,11 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // Always unset the entry-override env var, even on test throw —
+  // setting it in `try` and unsetting in `finally` per-test would
+  // leak into the next test on a thrown assertion or on vitest's
+  // `--bail` interrupt, and into adjacent test files via the pool.
+  delete process.env.CODE_SHAPER_RUN_TASK_ENTRY;
   if (stateDir) await rm(stateDir, { recursive: true, force: true });
   if (workDir) await rm(workDir, { recursive: true, force: true });
 });

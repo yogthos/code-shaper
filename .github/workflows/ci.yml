@@ -26,6 +26,13 @@ jobs:
 
       - run: npm ci
 
+      - name: Install bubblewrap (Linux sandbox)
+        # The server runner refuses to spawn tasks unsandboxed; on
+        # ubuntu-latest bwrap isn't pre-installed. Without this,
+        # tests/server.runner.test.ts and tests/server.mcp.test.ts
+        # all fail at submit_task. Adds <2s to the run.
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
       - name: Type-check
         run: npx tsc --noEmit
 

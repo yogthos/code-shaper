@@ -78,11 +78,15 @@ export function renderMacosSandboxProfile(
   // (a model running `fs.rmSync("/private/var/folders/...")` would
   // succeed if that path were allowlisted).
   //
-  // The only platform exception is /dev — node opens /dev/null and
-  // /dev/urandom freely at startup; without this, even `node
-  // --version` fails. /dev writes are write-restricted to the
-  // device files (you can't create new files in /dev as a
-  // non-root user), so this isn't an escape hatch.
+  // /dev: we previously allowed (subpath "/dev") wholesale because
+  // node opens /dev/null + /dev/urandom freely. But that also lets
+  // a model open and write to /dev/disk*, /dev/console, /dev/tty*,
+  // and any user-writable device nodes. Both of those node startup
+  // files are READS, already covered by `(allow file-read*)`. The
+  // only writes node actually needs are to /dev/null (a sink, no
+  // observable side effects) and /dev/dtracehelper (probe target).
+  // Restrict to those literals so the sandbox blocks writes to
+  // every other device node.
   lines.push("(deny file-write*)");
   for (const root of opts.writableRoots) {
     // `subpath` includes the root itself + everything beneath it.
@@ -91,7 +95,8 @@ export function renderMacosSandboxProfile(
     // values if they want symlink-following semantics.
     lines.push(`(allow file-write* (subpath ${schemeQuote(root)}))`);
   }
-  lines.push('(allow file-write* (subpath "/dev"))');
+  lines.push('(allow file-write-data (literal "/dev/null"))');
+  lines.push('(allow file-write-data (literal "/dev/dtracehelper"))');
 
   return lines.join("\n");
 }

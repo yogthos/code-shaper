@@ -52,7 +52,12 @@ export function startDiskQuotaWatch(
 
   const probe = (): Promise<number> => {
     return new Promise<number>((resolve) => {
-      const child = spawn("du", ["-s", "-k", opts.path], {
+      // -P: don't follow symlinks (a symlink pointing at a huge
+      // host tree would otherwise inflate the count and trigger a
+      // spurious breach). -x: stay on the same filesystem (don't
+      // descend into mounted volumes that happen to live under
+      // projectDir). -s: summary, -k: kilobytes.
+      const child = spawn("du", ["-sxP", "-k", opts.path], {
         stdio: ["ignore", "pipe", "ignore"],
       });
       let stdout = "";
@@ -74,16 +79,33 @@ export function startDiskQuotaWatch(
     });
   };
 
+  // breachFired: `onBreach` must fire exactly once. Using `stopped`
+  // alone wasn't sufficient because two ticks can race past the
+  // `if (stopped) return` guard before either reaches the breach
+  // branch (slow `du`, fast interval). Separate flag locks
+  // onBreach to a single invocation.
+  let breachFired = false;
+  let inFlight = false;
+
   const tick = async (): Promise<void> => {
-    if (stopped) return;
-    const bytes = await probe();
-    if (stopped) return;
-    if (opts.onSample) opts.onSample(bytes);
-    if (bytes > opts.maxBytes) {
-      stopped = true;
-      if (timer) clearInterval(timer);
-      opts.onBreach(bytes);
-      return;
+    // Gate against overlap. If a prior `du` is still running (slow
+    // disk, large tree), skip this tick rather than stack another
+    // process on top — overlap can hide breaches behind queued
+    // probes and waste CPU.
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const bytes = await probe();
+      if (stopped) return;
+      if (opts.onSample) opts.onSample(bytes);
+      if (bytes > opts.maxBytes && !breachFired) {
+        breachFired = true;
+        stopped = true;
+        if (timer) clearInterval(timer);
+        opts.onBreach(bytes);
+      }
+    } finally {
+      inFlight = false;
     }
   };
 
