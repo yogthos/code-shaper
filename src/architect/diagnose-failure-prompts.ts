@@ -55,6 +55,31 @@ export interface FailureDiagnosisPromptInput {
    *  caller wants to influence later rounds with earlier output.
    *  Not currently used (rounds are independent), but reserved. */
   priorResponses?: string[];
+  /** Audit gap #5: prior diagnostic verdicts + their resulting
+   *  remediations on this leaf, in chronological order. Without
+   *  this, every diagnostic round starts fresh — when round 1 said
+   *  "environment" and the harness applied add_dependency('foo')
+   *  which install-failed, round 2 has no memory and votes
+   *  "environment" again, picking the same remediation. The judge
+   *  needs to see "we already tried this and it didn't work" so
+   *  it can either pick a different category or surface a more
+   *  specific hint. */
+  priorAttempts?: Array<{
+    /** Which category the previous round resolved to. */
+    category: "implementation" | "test_brittleness" | "environment";
+    /** What the harness did in response (one-line summary;
+     *  e.g., "add_dependency zod ^3.22 → install ok",
+     *  "add_dependency better-sqlite3 → install failed: V8 API
+     *  change",
+     *  "rewrote test to use toEqual",
+     *  "no remediation — body retry only"). */
+    remediation: string;
+    /** Whether the remediation actually resolved the failure
+     *  (true), made no progress (false), or partially helped
+     *  (partial). Most callers will pass false here since by the
+     *  time we re-diagnose, the failure is still present. */
+    outcome: "resolved" | "no_progress" | "partial";
+  }>;
 }
 
 export function buildFailureDiagnosisUserPrompt(
@@ -77,6 +102,21 @@ export function buildFailureDiagnosisUserPrompt(
   lines.push(input.bodySource);
   lines.push("```");
   lines.push("");
+  if (input.priorAttempts && input.priorAttempts.length > 0) {
+    lines.push("# Prior diagnostic attempts on this leaf");
+    lines.push("");
+    lines.push(
+      "Each prior round and what the harness did. The same failure is still present — these remediations did NOT resolve it. Use this to AVOID picking a category whose remediation has already failed; if 'environment' was tried twice and didn't help, the right answer is probably 'implementation' or 'test_brittleness' instead.",
+    );
+    lines.push("");
+    for (let i = 0; i < input.priorAttempts.length; i++) {
+      const a = input.priorAttempts[i]!;
+      lines.push(
+        `${i + 1}. category=${a.category}, remediation=${a.remediation}, outcome=${a.outcome}`,
+      );
+    }
+    lines.push("");
+  }
   lines.push("# Failure output");
   lines.push("");
   lines.push("```");

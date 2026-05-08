@@ -399,7 +399,7 @@ async function persistAndInstall(
     ...(install.ok
       ? {}
       : {
-          error: `npm install exited with code ${install.exitCode ?? "null"}; stderr:\n${install.stderr.slice(0, 4000)}`,
+          error: `npm install exited with code ${install.exitCode ?? "null"}; stderr:\n${tailTruncate(install.stderr, 4000)}`,
         }),
   };
 }
@@ -492,4 +492,12 @@ async function runNpmCommand(opts: NpmCommandOpts): Promise<NpmCommandResult> {
       });
     });
   });
+}
+
+/** Tail-truncate. See identical helper in stack.ts; npm puts the
+ *  actionable error at the END of stderr, so head-slicing hides
+ *  the cause behind warning preamble. Audit gap #2. */
+function tailTruncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return "...[truncated head]\n" + s.slice(s.length - max);
 }

@@ -305,6 +305,13 @@ export async function implementLeaf(
   let envPatches = 0;
   let failuresSeen = 0;
   const diagnoses: NonNullable<LeafImplementResult["diagnoses"]> = [];
+  // Audit gap #5: per-leaf trail of prior diagnostic verdicts +
+  // remediations. Threaded into each subsequent diagnostic call so
+  // the judge sees what was already tried and can pick a different
+  // category when the prior remediation didn't resolve the failure.
+  const priorAttempts: NonNullable<
+    Parameters<typeof diagnoseFailure>[1]["priorAttempts"]
+  > = [];
 
   for (let i = 0; i < maxAttempts; i++) {
     attempts = i + 1;
@@ -537,12 +544,35 @@ export async function implementLeaf(
         testSource,
         bodySource: body,
         rounds: diagnosisRounds,
+        ...(priorAttempts.length > 0 ? { priorAttempts } : {}),
       });
       diagnoses.push({
         attempt: attempts,
         category: diag.category,
         votes: diag.votes,
       });
+      // Default remediation summary; overwritten when the verdict
+      // routes to a specific tool below.
+      let remediation =
+        diag.category === "implementation"
+          ? "no remediation — body retry only"
+          : "(none)";
+      // We record this AFTER the verdict-routing block sets a
+      // specific remediation summary. See pushPriorAttempt() calls
+      // below.
+      const recordPriorAttempt = (final: string): void => {
+        priorAttempts.push({
+          category: diag.category,
+          remediation: final,
+          // The leaf-retry contract: if we're back here on the next
+          // iteration, the prior remediation didn't resolve the
+          // failure. Mark `no_progress`. (When env-fix's rerun
+          // succeeds we early-return; the diagnostic only sees
+          // priorAttempts when we kept iterating.)
+          outcome: "no_progress",
+        });
+      };
+      void remediation;
 
       if (
         diag.category === "test_brittleness" &&
@@ -623,6 +653,9 @@ export async function implementLeaf(
         // If the rewrite failed to produce a parseable test, fall
         // through to normal body retry — the body author still has
         // budget and may bridge the gap.
+        recordPriorAttempt(
+          `rewrote test (rewrite ${testRewrites > 0 ? "applied" : "skipped"}); rerun still failing`,
+        );
       }
       // category === "environment" (Stage C of feature #5): when
       // env-fix is enabled, the model picks one of the four npm-
@@ -705,8 +738,26 @@ export async function implementLeaf(
           }
         }
         // env-fix failed or test still red — fall through to body
-        // retry. The next iteration's prompt sees the same failure
-        // (with the env condition fixed if we got that far).
+        // retry. Audit gaps #3 / #21 (stderr propagation): blend the
+        // env-fix outcome into lastFailure so the NEXT retry's
+        // prompt sees what env-fix actually did and what failed.
+        // Without this, the body author keeps retrying as if nothing
+        // changed and never learns that the dep it's trying to use
+        // doesn't compile (e.g., better-sqlite3 vs node 26's V8 API).
+        const envFixSummary = summarizeEnvFix(envFix);
+        if (envFixSummary && lastFailure) {
+          lastFailure = {
+            ...lastFailure,
+            failureMessage: `${lastFailure.failureMessage}\n\n[env-fix attempt]\n${envFixSummary}`,
+          };
+        }
+        recordPriorAttempt(
+          envFix.tool
+            ? `${envFix.tool}(${JSON.stringify(envFix.args ?? {})}) → ${envFix.ok ? "ok but rerun still failing" : "failed: " + (envFix.error ?? "(no error)").slice(0, 200)}`
+            : "env-fix tool call refused",
+        );
+      } else if (diag.category === "implementation") {
+        recordPriorAttempt("body retry (no test/env intervention)");
       }
       // category === "implementation": fall through normally.
     }
@@ -723,6 +774,64 @@ export async function implementLeaf(
     testRewrites,
     ...(diagnoses.length > 0 ? { diagnoses } : {}),
   };
+}
+
+/**
+ * Summarize an env-fix attempt for the next retry's prompt. The
+ * goal is the body author seeing exactly what the harness tried,
+ * what failed, and what the install-time error actually was — so
+ * a busted dependency choice (better-sqlite3 vs current node V8,
+ * version not on the registry, etc.) reaches the model the next
+ * time it composes a body or picks a different env-fix tool.
+ *
+ * Format:
+ *
+ *   tool=add_dependency args={"name":"foo","version":"^1","which":"runtime"}
+ *   ok=false  installRan=true  exitCode=1
+ *   error: <error string the npm-tool returned>
+ *   stderr (last 2000 chars):
+ *   <tail of npm install stderr — npm puts the actionable error LAST>
+ */
+function summarizeEnvFix(
+  envFix: import("./env-fix.js").EnvFixResult,
+): string | null {
+  if (!envFix.tool) return null;
+  const lines: string[] = [];
+  lines.push(`tool=${envFix.tool} args=${JSON.stringify(envFix.args ?? {})}`);
+  const npm = envFix.npmResult;
+  if (npm) {
+    const exitCode =
+      "exitCode" in npm ? (npm as { exitCode?: unknown }).exitCode : "n/a";
+    lines.push(
+      `ok=${envFix.ok}  installRan=${npm.installRan}  installOk=${npm.installOk}  exitCode=${exitCode}`,
+    );
+  } else {
+    lines.push(`ok=${envFix.ok}  (no npmResult — agent-side failure)`);
+  }
+  if (envFix.error) {
+    lines.push(`error: ${envFix.error}`);
+  }
+  // npm always writes the actionable diagnostic at the END of
+  // stderr; tail-truncate so the model sees the cause, not the
+  // peer-dep warning preamble. Cap at 2000 chars to keep the
+  // retry prompt under control.
+  if (npm?.installStderr) {
+    const tail =
+      npm.installStderr.length > 2000
+        ? "...[truncated head]\n" +
+          npm.installStderr.slice(npm.installStderr.length - 2000)
+        : npm.installStderr;
+    lines.push(`stderr:\n${tail}`);
+  }
+  if (npm?.installStdout) {
+    const tail =
+      npm.installStdout.length > 1000
+        ? "...[truncated head]\n" +
+          npm.installStdout.slice(npm.installStdout.length - 1000)
+        : npm.installStdout;
+    lines.push(`stdout (tail):\n${tail}`);
+  }
+  return lines.join("\n");
 }
 
 /**

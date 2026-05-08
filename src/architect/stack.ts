@@ -182,7 +182,7 @@ export async function proposeStack(
     ...(install.ok
       ? {}
       : {
-          error: `npm install exited with code ${install.exitCode ?? "null"}; stderr:\n${install.stderr.slice(0, 4000)}`,
+          error: `npm install exited with code ${install.exitCode ?? "null"}; stderr:\n${tailTruncate(install.stderr, 4000)}`,
         }),
   };
 }
@@ -430,6 +430,20 @@ function stripFences(s: string): string {
 
 function isObject(x: unknown): x is Record<string, unknown> {
   return x !== null && typeof x === "object" && !Array.isArray(x);
+}
+
+/**
+ * Tail-truncate. npm and most build tools put the actionable error
+ * at the END of stderr — peer-dep warnings, gyp init noise, etc.
+ * dominate the head. A head-truncated slice (the previous behavior)
+ * routinely showed the model a wall of warnings and hid the cause.
+ *
+ * Audit gap #2: replace `s.slice(0, n)` with this for any error
+ * stderr the model needs to read.
+ */
+function tailTruncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return "...[truncated head]\n" + s.slice(s.length - max);
 }
 
 function allStringValues(obj: Record<string, unknown>): boolean {

@@ -49,6 +49,86 @@ const sampleInput = {
   bodySource: "function f(x) { return x * 2; }",
 };
 
+describe("diagnoseFailure — prior-attempts memory (audit gap #5)", () => {
+  it("threads priorAttempts into the user prompt", async () => {
+    let observedPrompt: string | undefined;
+    const client: LLMClient = {
+      async chat(messages): Promise<LLMResponse> {
+        observedPrompt = messages[1]!.content;
+        return {
+          content: json({ category: "implementation", reasoning: "x" }),
+          finishReason: "stop",
+        };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    await diagnoseFailure(client, {
+      ...sampleInput,
+      rounds: 1,
+      priorAttempts: [
+        {
+          category: "environment",
+          remediation: "add_dependency better-sqlite3 → install failed: V8 API change",
+          outcome: "no_progress",
+        },
+      ],
+    });
+    expect(observedPrompt).toContain("Prior diagnostic attempts on this leaf");
+    expect(observedPrompt).toContain("better-sqlite3");
+    expect(observedPrompt).toContain("install failed");
+  });
+});
+
+describe("diagnoseFailure — round error surfacing (audit gap #19)", () => {
+  it("populates roundErrors when rounds throw or fail to parse", async () => {
+    let i = 0;
+    const client: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        i++;
+        if (i === 1) {
+          throw new Error("rate limit");
+        }
+        if (i === 2) {
+          return { content: "not json", finishReason: "stop" };
+        }
+        return {
+          content: json({ category: "implementation", reasoning: "ok" }),
+          finishReason: "stop",
+        };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    const r = await diagnoseFailure(client, { ...sampleInput, rounds: 3 });
+    expect(r.fulfilledRounds).toBe(1);
+    expect(r.roundErrors.length).toBe(2);
+    expect(r.roundErrors.some((e) => e.includes("rate limit"))).toBe(true);
+    expect(r.roundErrors.some((e) => e.includes("unparseable"))).toBe(true);
+  });
+
+  it("returns category=implementation but with full roundErrors when ALL rounds fail", async () => {
+    const client: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        throw new Error("provider down");
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    const r = await diagnoseFailure(client, { ...sampleInput, rounds: 3 });
+    expect(r.category).toBe("implementation");
+    expect(r.fulfilledRounds).toBe(0);
+    expect(r.roundErrors.length).toBe(3);
+    // Caller can now distinguish "diagnostic confidently said
+    // implementation" (fulfilledRounds=3, roundErrors=0) from
+    // "all rounds errored, defaulted" (fulfilledRounds=0,
+    // roundErrors=3).
+  });
+});
+
 describe("diagnoseFailure — vote tallying", () => {
   it("returns the majority category over 5 rounds", async () => {
     const responses = [

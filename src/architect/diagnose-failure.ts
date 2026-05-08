@@ -55,6 +55,15 @@ export interface FailureDiagnosisResult {
    *  emitted malformed JSON; the diagnosis still resolves on votes
    *  cast by the rounds that did parse. */
   fulfilledRounds: number;
+  /** Audit gap #19: per-round error messages from rounds that
+   *  threw or failed to parse. Distinguishes "5 rounds all errored
+   *  out" from "5 rounds confidently voted implementation" — both
+   *  previously surfaced as `category: "implementation"` because
+   *  the runOneRound catch-all swallowed the error. Callers
+   *  should inspect roundErrors when fulfilledRounds < rounds and
+   *  surface the actual cause to whoever is consuming the
+   *  category (operator log, retry feedback, etc.). */
+  roundErrors: string[];
 }
 
 interface ParsedRound {
@@ -62,6 +71,14 @@ interface ParsedRound {
   reasoning: string;
   testRewriteHint?: string;
   envPatchHint?: string;
+}
+
+/** Wrapper from runOneRound: either the parsed verdict, or an
+ *  error message describing why the round failed (LLM client
+ *  threw, response empty, JSON malformed, schema mismatch). */
+interface RoundOutcome {
+  parsed: ParsedRound | null;
+  error: string | null;
 }
 
 const DEFAULT_ROUNDS = 5;
@@ -82,7 +99,7 @@ export async function diagnoseFailure(
   const temperature = input.temperature ?? 0.7;
   const userPrompt = buildFailureDiagnosisUserPrompt(input);
 
-  const tasks: Array<Promise<ParsedRound | null>> = [];
+  const tasks: Array<Promise<RoundOutcome>> = [];
   for (let i = 0; i < rounds; i++) {
     tasks.push(runOneRound(client, userPrompt, temperature));
   }
@@ -94,15 +111,18 @@ export async function diagnoseFailure(
   const reasoning: string[] = [];
   const testRewriteHints: string[] = [];
   const envPatchHints: string[] = [];
+  const roundErrors: string[] = [];
   for (const r of results) {
-    if (!r) continue;
-    votes[r.category]++;
-    reasoning.push(r.reasoning);
-    if (r.category === "test_brittleness" && r.testRewriteHint) {
-      testRewriteHints.push(r.testRewriteHint);
+    if (r.error) roundErrors.push(r.error);
+    if (!r.parsed) continue;
+    const p = r.parsed;
+    votes[p.category]++;
+    reasoning.push(p.reasoning);
+    if (p.category === "test_brittleness" && p.testRewriteHint) {
+      testRewriteHints.push(p.testRewriteHint);
     }
-    if (r.category === "environment" && r.envPatchHint) {
-      envPatchHints.push(r.envPatchHint);
+    if (p.category === "environment" && p.envPatchHint) {
+      envPatchHints.push(p.envPatchHint);
     }
   }
   const fulfilled = reasoning.length;
@@ -137,6 +157,7 @@ export async function diagnoseFailure(
     votes,
     reasoning,
     fulfilledRounds: fulfilled,
+    roundErrors,
   };
   if (result.category === "test_brittleness" && testRewriteHints.length > 0) {
     result.testRewriteHint = testRewriteHints[0];
@@ -151,7 +172,7 @@ async function runOneRound(
   client: LLMClient,
   userPrompt: string,
   temperature: number,
-): Promise<ParsedRound | null> {
+): Promise<RoundOutcome> {
   try {
     const response = await client.chat(
       [
@@ -163,11 +184,23 @@ async function runOneRound(
         temperature,
       },
     );
-    return parseRound(response.content);
-  } catch {
+    const parsed = parseRound(response.content);
+    if (parsed) return { parsed, error: null };
+    // Response landed but didn't parse as the expected shape —
+    // surface that, rather than silently dropping the round.
+    return {
+      parsed: null,
+      error: `round response unparseable: ${response.content.slice(0, 200)}`,
+    };
+  } catch (e) {
     // A single round error doesn't sink the diagnosis — other rounds
-    // can still vote.
-    return null;
+    // can still vote — but audit gap #19: surface the error so
+    // callers can detect "all rounds errored" vs. "all rounds voted
+    // implementation."
+    return {
+      parsed: null,
+      error: e instanceof Error ? e.message : String(e),
+    };
   }
 }
 
