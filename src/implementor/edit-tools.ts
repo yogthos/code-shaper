@@ -111,6 +111,24 @@ export function editFunctionInFile(
       error: `new source must declare a function named "${name}"`,
     };
   }
+  // Review fix #1 — export-keyword mismatch. If the original target
+  // is wrapped in `export_statement` but the new source is bare
+  // `function foo()`, splicing the bare declaration over the export
+  // wrapper drops the `export` keyword silently — every importer
+  // breaks. Reject the mismatch and let the LLM retry; we don't
+  // auto-wrap because preserving structure beats inferring intent.
+  const origExported = target.type === "export_statement";
+  const newExported = newDecl.type === "export_statement";
+  if (origExported !== newExported) {
+    return {
+      ok: false,
+      error: `export keyword mismatch: original ${
+        origExported ? "is exported" : "is not exported"
+      } but new source ${
+        newExported ? "exports" : "does not export"
+      } the function — preserve the export modifier`,
+    };
+  }
   return spliceRange(source, target.startIndex, target.endIndex, newDecl.text);
 }
 
@@ -138,6 +156,19 @@ export function editWholeClassInFile(
     return {
       ok: false,
       error: `new source must declare a class named "${name}"`,
+    };
+  }
+  // Review fix #1 — same export-keyword guard as for functions.
+  const origExported = target.type === "export_statement";
+  const newExported = newDecl.type === "export_statement";
+  if (origExported !== newExported) {
+    return {
+      ok: false,
+      error: `export keyword mismatch: original ${
+        origExported ? "is exported" : "is not exported"
+      } but new source ${
+        newExported ? "exports" : "does not export"
+      } the class — preserve the export modifier`,
     };
   }
   return spliceRange(source, target.startIndex, target.endIndex, newDecl.text);
@@ -203,6 +234,24 @@ export function editMethodOfClassInFile(
     return {
       ok: false,
       error: `new class block must contain ONLY the target method; got extras: ${otherMethods.join(", ")}`,
+    };
+  }
+  // Review fix #2 — non-method declarations in the class block
+  // (fields, constructor, static blocks, getters/setters) parse
+  // cleanly and pass the "only one method named X" check, but the
+  // splice only replaces the method's byte range — anything else
+  // the LLM put in the block is silently discarded. The model
+  // thinks it added `value = 0` or a constructor; the file never
+  // gets it. Reject any non-method named child up front so the
+  // model retries with a class block containing ONLY the method
+  // (per §D.2) and either uses edit_whole_class_in_file or asks
+  // the architect to update the plan when fields/constructors
+  // need to change.
+  const stowaways = collectNonMethodMemberKinds(newClassNode);
+  if (stowaways.length > 0) {
+    return {
+      ok: false,
+      error: `new class block must contain ONLY the target method (no fields, constructors, static blocks, getters/setters, etc.); got: ${stowaways.join(", ")}. Use edit_whole_class_in_file if the rest of the class needs changes.`,
     };
   }
   return spliceRange(
@@ -453,8 +502,51 @@ function collectMethodNames(classNode: TreeSitterNode): string[] {
   return names;
 }
 
+/**
+ * Tag any class-body member that ISN'T a method_definition so
+ * `editMethodOfClassInFile` can refuse class blocks the LLM packed
+ * with side declarations. Returned strings are short identifiers
+ * for the error message ("public_field_definition: value", etc.).
+ */
+function collectNonMethodMemberKinds(classNode: TreeSitterNode): string[] {
+  let target = classNode;
+  if (target.type === "export_statement") {
+    const decl = target.childForFieldName("declaration");
+    if (decl && decl.type === "class_declaration") target = decl;
+  }
+  const body = target.childForFieldName("body");
+  if (!body) return [];
+  const stowaways: string[] = [];
+  for (const child of body.namedChildren) {
+    if (child.type === "method_definition") continue;
+    if (child.type === "comment") continue;
+    // tree-sitter-typescript exposes class members as
+    // method_definition (incl. getters/setters and constructors —
+    // tests confirm; constructor is a method_definition with name
+    // "constructor"), public_field_definition, abstract_method_-
+    // signature, class_static_block, abstract_class_signature, etc.
+    // Every non-method member is a stowaway here; surface its kind
+    // + name (when there is one) so the error message tells the
+    // model exactly what to drop.
+    const nameNode = child.childForFieldName("name");
+    stowaways.push(nameNode ? `${child.type}: ${nameNode.text}` : child.type);
+  }
+  return stowaways;
+}
+
 /** Permitted top-level node types for the "imports + assignments"
- *  scope. tree-sitter-typescript names: */
+ *  scope. tree-sitter-typescript names.
+ *
+ *  Review fix #5: `ambient_declaration` is intentionally NOT in the
+ *  allowlist. It wraps `declare const`, `declare class`, `declare
+ *  function`, and `declare module` — the latter three are exactly
+ *  what the §D.2 imports tool is supposed to refuse. We accept
+ *  `declare const` indirectly by accepting `lexical_declaration`
+ *  inside an export_statement; pure `declare const` outside an
+ *  export wrapper is rare in our generated code and falls through
+ *  to the "not allowed" branch. If a real consumer needs it, the
+ *  fix is to walk into ambient_declaration and accept ONLY
+ *  variable_declaration / lexical_declaration children. */
 function isImportOrAssignmentNode(node: TreeSitterNode): boolean {
   switch (node.type) {
     case "import_statement":
@@ -463,7 +555,6 @@ function isImportOrAssignmentNode(node: TreeSitterNode): boolean {
     case "variable_declaration": // var
     case "expression_statement": // bare assignments at module scope
     case "comment":
-    case "ambient_declaration":
       return true;
     default:
       return false;

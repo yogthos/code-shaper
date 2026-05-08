@@ -317,6 +317,124 @@ describe("extractFunctionBody / extractMethodBody", () => {
   });
 });
 
+describe("edit-tools — review-fix #1: export-keyword mismatch", () => {
+  it("editFunctionInFile rejects bare new source against an exported original", () => {
+    const before = `export function add(a: number, b: number): number {
+  return 0;
+}`;
+    // LLM emits bare `function` — would silently strip `export` and
+    // break every importer.
+    const newFn = `function add(a: number, b: number): number {
+  return a + b;
+}`;
+    const r = editFunctionInFile(before, "add", newFn);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/export keyword mismatch/i);
+  });
+
+  it("editFunctionInFile rejects exported new source against a non-exported original", () => {
+    const before = `function add(a: number, b: number): number {
+  return 0;
+}`;
+    const newFn = `export function add(a: number, b: number): number {
+  return a + b;
+}`;
+    const r = editFunctionInFile(before, "add", newFn);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/export keyword mismatch/i);
+  });
+
+  it("editWholeClassInFile rejects export-modifier mismatch", () => {
+    const before = `export class Foo { bar(): number { return 1; } }`;
+    const r = editWholeClassInFile(
+      before,
+      "Foo",
+      `class Foo { bar(): number { return 2; } }`,
+    );
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/export keyword mismatch/i);
+  });
+});
+
+describe("edit-tools — review-fix #2: stowaway declarations in method blocks", () => {
+  it("rejects fields embedded in the new class block", () => {
+    const before = `class Counter {
+  inc(): number {
+    return this.value;
+  }
+}`;
+    // LLM emits a class block with a field declaration alongside
+    // the target method. Pre-fix, the field passed parse + the
+    // "only one method named X" check, then was silently discarded.
+    const newBlock = `class Counter {
+  value = 0;
+  inc(): number {
+    this.value += 1;
+    return this.value;
+  }
+}`;
+    const r = editMethodOfClassInFile(before, "Counter", "inc", newBlock);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/ONLY the target method/);
+    expect(r.error).toMatch(/public_field_definition/);
+  });
+
+  it("rejects a constructor stowaway", () => {
+    const before = `class C {
+  go(): void {}
+}`;
+    const newBlock = `class C {
+  constructor() {}
+  go(): void {}
+}`;
+    const r = editMethodOfClassInFile(before, "C", "go", newBlock);
+    expect(r.ok).toBe(false);
+    // Constructor in tree-sitter-typescript is a method_definition
+    // with name "constructor" — caught by the "extras" check, not
+    // the new stowaway check, but rejected either way.
+    expect(r.error).toMatch(/constructor|target method/);
+  });
+
+  it("rejects a static block", () => {
+    const before = `class C {
+  go(): void {}
+}`;
+    const newBlock = `class C {
+  static {}
+  go(): void {}
+}`;
+    const r = editMethodOfClassInFile(before, "C", "go", newBlock);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/class_static_block|target method/);
+  });
+});
+
+describe("edit-tools — review-fix #5: imports tool refuses ambient declarations", () => {
+  it("rejects a `declare class` in the new imports source", () => {
+    const before = `import x from "./y";
+function f(): void {}
+`;
+    const newImports = `import x from "./y";
+declare class Stowaway {
+  hide(): void;
+}`;
+    const r = editImportsAndAssignmentsInFile(before, newImports);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/non-import.*non-assignment/);
+  });
+
+  it("rejects a `declare function` in the new imports source", () => {
+    const before = `import x from "./y";
+function f(): void {}
+`;
+    const newImports = `import x from "./y";
+declare function leak(): void;`;
+    const r = editImportsAndAssignmentsInFile(before, newImports);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/non-import.*non-assignment/);
+  });
+});
+
 describe("edit-tools — post-splice validation", () => {
   it("rejects edits that produce a non-parseable result", () => {
     // New function source is valid in isolation but the splice
