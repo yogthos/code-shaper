@@ -127,6 +127,20 @@ export interface IntegrationBlameInput {
     currentBody: string;
     decompositionDepth: number;
   }>;
+  /** Optional ranked list from a §D.1 localization run. When the
+   *  integration's `useLocalization` flag is on, the harness
+   *  navigates the RPG via the four §D.1 data tools before this
+   *  blame call and threads the resulting candidates here as
+   *  EXTRA context — the architect still has full discretion to
+   *  pick a culprit, but tends to do so more accurately when the
+   *  failure mentions a function name that localization could
+   *  resolve to a specific leaf. */
+  localizationHint?: Array<{
+    filePath: string;
+    /** Format from §D.1 Terminate(): "function: foo" / "class: Bar"
+     *  / "method: Bar.baz". */
+    interface: string;
+  }>;
 }
 
 export function buildIntegrationBlameUserPrompt(
@@ -149,6 +163,19 @@ export function buildIntegrationBlameUserPrompt(
   lines.push(input.failureMessage);
   lines.push("```");
   lines.push("");
+
+  if (input.localizationHint && input.localizationHint.length > 0) {
+    lines.push("# Localization hint (§D.1 ranked candidates)");
+    lines.push("");
+    lines.push(
+      "A graph-guided localization pass over the failure produced these candidates, most-likely-relevant first. They are HINTS, not bindings — pick the leaf you actually believe is the culprit. The list may include interfaces outside this branch that you cannot act on; ignore those.",
+    );
+    lines.push("");
+    for (const h of input.localizationHint) {
+      lines.push(`- ${h.filePath} → ${h.interface}`);
+    }
+    lines.push("");
+  }
 
   lines.push("# Leaves in this branch (each currently passing its OWN unit tests)");
   lines.push("");

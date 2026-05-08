@@ -31,6 +31,7 @@ import {
 } from "./decompose.js";
 import { implementLeaf } from "./leaf.js";
 import { stripCodeFences } from "./prompts.js";
+import { localize } from "../architect/localization.js";
 import {
   outcomeForBranch,
   runTests,
@@ -78,6 +79,14 @@ export interface IntegrationInput {
    *  MAX_INTEGRATION_ROUNDS = 20). Used by tests that drive
    *  permanently-failing recovery and don't want to spin 20 rounds. */
   maxIntegrationRounds?: number;
+  /** §D.1 tool-using localization run before each blame
+   *  attribution. The localization output is fed into the blame
+   *  prompt as EXTRA context (a ranked candidate list); the blame
+   *  call still picks the culprit. Default off so existing tests
+   *  see the legacy single-shot blame. Production drivers opt in.
+   *  `maxIterations` defaults to 20 per RPG paper §5.3. */
+  useLocalization?: boolean;
+  localizationMaxIterations?: number;
 }
 
 export interface IntegrationResult {
@@ -235,6 +244,36 @@ export async function runIntegrationTests(
       branchOutcome?.failureMessage ?? lastRun.fatal ?? "(no failure detail)";
     const branchTestSource = testsByBranchId.get(targetBranchId) ?? "";
 
+    // §D.1 localization pre-pass (opt-in). Navigates the RPG via
+    // the four data tools to produce a ranked candidate list; the
+    // result feeds the blame prompt as EXTRA context. The blame
+    // call still picks the culprit — localization just biases the
+    // model toward interfaces the failure mentioned.
+    let localizationHint:
+      | Array<{ filePath: string; interface: string }>
+      | undefined;
+    if (input.useLocalization) {
+      const loc = await localize(client, {
+        rpg,
+        task: `Integration test for branch "${branch.branch.name}" failed. Find the leaf or set of leaves most likely to be the culprit. Failure:\n${failureMessage.slice(0, 1500)}`,
+        ...(input.temperature !== undefined
+          ? { temperature: input.temperature }
+          : {}),
+        ...(input.localizationMaxIterations !== undefined
+          ? { maxIterations: input.localizationMaxIterations }
+          : {}),
+      });
+      if (loc.ok && loc.result.length > 0) {
+        localizationHint = loc.result.map((r) => ({
+          filePath: r.filePath,
+          interface: r.interface,
+        }));
+      }
+      // Localization failure is non-fatal — fall through to blame
+      // without the hint. The legacy single-shot blame still has
+      // the full branch context to work from.
+    }
+
     const blame = await runBlameAttribution(client, rpg, {
       branch: branch.branch,
       leaves: branch.leaves.map((l) => ({
@@ -248,6 +287,7 @@ export async function runIntegrationTests(
       branchTestSource,
       failureMessage,
       temperature: input.temperature,
+      ...(localizationHint ? { localizationHint } : {}),
     });
     if (!blame.ok || !blame.decision) {
       return {
@@ -398,6 +438,9 @@ interface BlameInput {
   branchTestSource: string;
   failureMessage: string;
   temperature?: number;
+  /** Optional localization hint passed verbatim to the prompt
+   *  builder. Already-validated `{filePath, interface}` shape. */
+  localizationHint?: Array<{ filePath: string; interface: string }>;
 }
 
 async function runBlameAttribution(
@@ -411,6 +454,9 @@ async function runBlameAttribution(
     branchTestSource: input.branchTestSource,
     failureMessage: input.failureMessage,
     leaves: input.leaves,
+    ...(input.localizationHint
+      ? { localizationHint: input.localizationHint }
+      : {}),
   });
   const response = await client.chat(
     [

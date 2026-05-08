@@ -306,9 +306,10 @@ async function run(args: ParsedArgs): Promise<number> {
         bodyByLeafId,
         testsByLeafId,
         workDir: build.workDir,
-        // Matches §5.3 of the RPG paper: "each function allows up to 8
-    // debugging iterations." Was 3.
-    maxAttemptsPerLeaf: 8,
+        // Matches §5.3 of the RPG paper: "each function allows up
+        // to 8 debugging iterations." Was 3.
+        maxAttemptsPerLeaf: 8,
+        useLocalization: true,
       });
       log(
         `  rounds=${integration.rounds}; recoveries=${integration.recoveries.length}; ok=${integration.ok}`,

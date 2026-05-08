@@ -219,8 +219,12 @@ async function main(): Promise<number> {
         testsByLeafId,
         workDir: build.workDir,
         // Matches §5.3 of the RPG paper: "each function allows up to 8
-    // debugging iterations." Was 3.
-    maxAttemptsPerLeaf: 8,
+        // debugging iterations." Was 3.
+        maxAttemptsPerLeaf: 8,
+        // §D.1 graph-guided localization runs before each blame
+        // attribution; the ranked hits seed the blame prompt as
+        // extra context. Default budget = 20 (§5.3).
+        useLocalization: true,
       });
       log(
         `  rounds=${integration.rounds}; recoveries=${integration.recoveries.length}; ok=${integration.ok}`,
