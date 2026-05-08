@@ -52,6 +52,15 @@ export {
 } from "./decompose-prompts.js";
 export type { DecomposePromptInput } from "./decompose-prompts.js";
 
+// §D.2 surgical edit tools — scope-bounded source mutations.
+export {
+  editFunctionInFile,
+  editWholeClassInFile,
+  editMethodOfClassInFile,
+  editImportsAndAssignmentsInFile,
+} from "./edit-tools.js";
+export type { EditResult } from "./edit-tools.js";
+
 export { runIntegrationTests, MAX_INTEGRATION_ROUNDS } from "./integration.js";
 export type { IntegrationInput, IntegrationResult } from "./integration.js";
 

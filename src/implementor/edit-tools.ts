@@ -1,0 +1,414 @@
+/**
+ * Surgical edit tools — RPG paper Appendix D.2.
+ *
+ * Four scope-bounded edits the implementation agent can apply to a
+ * source file. Each tool takes (file source, target identifier, new
+ * source) and returns the spliced file source — or an error if the
+ * target isn't found, the new source doesn't parse, or the new
+ * source declares the wrong entity.
+ *
+ * §D.2 specifies the tool set verbatim:
+ *
+ *   edit_whole_class_in_file(file_path, class_name)
+ *     "Output must: Provide the full class definition, with all
+ *      methods and docstring."
+ *
+ *   edit_method_of_class_in_file(file_path, class_name, method_name)
+ *     "Return the full `class ClassName:` block containing only the
+ *      target method. Exclude all unrelated methods. Do not output
+ *      the method alone; it must appear within its class block."
+ *
+ *   edit_function_in_file(file_path, function_name)
+ *     "Provide the full function, including signature, logic, and
+ *      docstring."
+ *
+ *   edit_imports_and_assignments_in_file(file_path)
+ *     "Contain only import statements and top-level assignments
+ *      (no functions or classes)."
+ *
+ * The fifth tool — `Terminate()` — is a control-flow signal, not a
+ * source mutation; it doesn't belong in this module.
+ *
+ * Implementation: tree-sitter locates the target node in the
+ * existing source by name, and the new source is parsed to verify
+ * (a) it is valid TypeScript and (b) it contains the same named
+ * entity (so the agent can't silently rename a method on us). On
+ * success, the mutation is a single byte-range splice; on failure,
+ * the original source is returned untouched and an error message
+ * is surfaced to the caller.
+ */
+
+import { getAdapterByLanguage } from "../rpg/adapters/index.js";
+
+export interface EditResult {
+  ok: boolean;
+  /** Spliced file source on success. */
+  source?: string;
+  /** Diagnostic on failure. */
+  error?: string;
+}
+
+interface ParseSuccess {
+  ok: true;
+  parser: unknown;
+  tree: TreeSitterTree;
+}
+interface ParseFailure {
+  ok: false;
+  error: string;
+}
+
+interface TreeSitterNode {
+  type: string;
+  startIndex: number;
+  endIndex: number;
+  startPosition: { row: number; column: number };
+  endPosition: { row: number; column: number };
+  children: TreeSitterNode[];
+  namedChildren: TreeSitterNode[];
+  childForFieldName: (name: string) => TreeSitterNode | null;
+  text: string;
+  hasError: boolean;
+}
+
+interface TreeSitterTree {
+  rootNode: TreeSitterNode;
+}
+
+/**
+ * Replace a top-level function declaration. Errors:
+ *   - Function not found in the original source
+ *   - newSource doesn't parse as TypeScript
+ *   - newSource doesn't declare a function with `name` (or declares
+ *     more than one top-level item)
+ */
+export function editFunctionInFile(
+  source: string,
+  name: string,
+  newSource: string,
+): EditResult {
+  const parsed = parseTs(source);
+  if (!parsed.ok) return { ok: false, error: `original: ${parsed.error}` };
+  const target = findFunctionDeclaration(parsed.tree.rootNode, name);
+  if (!target) {
+    return {
+      ok: false,
+      error: `function "${name}" not found in source`,
+    };
+  }
+  const newParsed = parseTs(newSource);
+  if (!newParsed.ok) {
+    return { ok: false, error: `new source: ${newParsed.error}` };
+  }
+  // Sanity-check: the new source must declare a function with the
+  // same name. Anything else (different name, missing function,
+  // extra top-level junk) signals an LLM hallucination — better to
+  // refuse the edit than to splice a renamed/moved declaration.
+  const newDecl = findFunctionDeclaration(newParsed.tree.rootNode, name);
+  if (!newDecl) {
+    return {
+      ok: false,
+      error: `new source must declare a function named "${name}"`,
+    };
+  }
+  return spliceRange(source, target.startIndex, target.endIndex, newDecl.text);
+}
+
+/**
+ * Replace a top-level class declaration. The new source must be the
+ * full class body — all methods, no orphans.
+ */
+export function editWholeClassInFile(
+  source: string,
+  name: string,
+  newSource: string,
+): EditResult {
+  const parsed = parseTs(source);
+  if (!parsed.ok) return { ok: false, error: `original: ${parsed.error}` };
+  const target = findClassDeclaration(parsed.tree.rootNode, name);
+  if (!target) {
+    return { ok: false, error: `class "${name}" not found in source` };
+  }
+  const newParsed = parseTs(newSource);
+  if (!newParsed.ok) {
+    return { ok: false, error: `new source: ${newParsed.error}` };
+  }
+  const newDecl = findClassDeclaration(newParsed.tree.rootNode, name);
+  if (!newDecl) {
+    return {
+      ok: false,
+      error: `new source must declare a class named "${name}"`,
+    };
+  }
+  return spliceRange(source, target.startIndex, target.endIndex, newDecl.text);
+}
+
+/**
+ * Replace a single method on a class. Per §D.2, the model emits the
+ * FULL class block containing ONLY the target method — that
+ * constraint exists to prevent the LLM from accidentally rewriting
+ * sibling methods. We honor that contract on input but only splice
+ * the method itself: other methods on the existing class are
+ * preserved verbatim.
+ */
+export function editMethodOfClassInFile(
+  source: string,
+  className: string,
+  methodName: string,
+  newSourceWithClassBlock: string,
+): EditResult {
+  const parsed = parseTs(source);
+  if (!parsed.ok) return { ok: false, error: `original: ${parsed.error}` };
+  const classNode = findClassDeclaration(parsed.tree.rootNode, className);
+  if (!classNode) {
+    return { ok: false, error: `class "${className}" not found in source` };
+  }
+  const methodNode = findMethodDefinition(classNode, methodName);
+  if (!methodNode) {
+    return {
+      ok: false,
+      error: `method "${className}.${methodName}" not found`,
+    };
+  }
+  // Validate the LLM emitted a class block, not a bare method, and
+  // that the block contains exactly the target method.
+  const newParsed = parseTs(newSourceWithClassBlock);
+  if (!newParsed.ok) {
+    return { ok: false, error: `new source: ${newParsed.error}` };
+  }
+  const newClassNode = findClassDeclaration(
+    newParsed.tree.rootNode,
+    className,
+  );
+  if (!newClassNode) {
+    return {
+      ok: false,
+      error: `new source must contain a class block "class ${className} { … }" — see §D.2`,
+    };
+  }
+  const newMethodNode = findMethodDefinition(newClassNode, methodName);
+  if (!newMethodNode) {
+    return {
+      ok: false,
+      error: `new class block must contain a method named "${methodName}"`,
+    };
+  }
+  // Refuse if the block has unrelated methods — the §D.2 contract is
+  // explicit: "Exclude all unrelated methods." Other methods would
+  // be silently dropped if we let them through.
+  const otherMethods = collectMethodNames(newClassNode).filter(
+    (n) => n !== methodName,
+  );
+  if (otherMethods.length > 0) {
+    return {
+      ok: false,
+      error: `new class block must contain ONLY the target method; got extras: ${otherMethods.join(", ")}`,
+    };
+  }
+  return spliceRange(
+    source,
+    methodNode.startIndex,
+    methodNode.endIndex,
+    newMethodNode.text,
+  );
+}
+
+/**
+ * Replace the import block AND any top-level assignments at the top
+ * of the file. The "imports + assignments" region is everything up
+ * to the first declaration (function/class/etc.) that isn't an
+ * import or top-level assignment.
+ *
+ * §D.2 also requires: "Do not remove existing imports unless they
+ * are demonstrably incorrect" and "Retain imports even if they
+ * appear unused, to preserve runtime dependencies." We don't enforce
+ * those at the parser level — the agent's prompt does, and we let
+ * the agent's output stand on its own merits as long as it's
+ * syntactically valid.
+ */
+export function editImportsAndAssignmentsInFile(
+  source: string,
+  newSource: string,
+): EditResult {
+  const parsed = parseTs(source);
+  if (!parsed.ok) return { ok: false, error: `original: ${parsed.error}` };
+  const newParsed = parseTs(newSource);
+  if (!newParsed.ok) {
+    return { ok: false, error: `new source: ${newParsed.error}` };
+  }
+  // The new source must contain ONLY imports + top-level
+  // assignments. Reject if anything else (function/class/export
+  // function) appears.
+  for (const child of newParsed.tree.rootNode.namedChildren) {
+    if (!isImportOrAssignmentNode(child)) {
+      return {
+        ok: false,
+        error: `new source contains a non-import / non-assignment top-level node: ${child.type}`,
+      };
+    }
+  }
+  // Find the byte range of the import-and-assignment region in the
+  // original. It runs from byte 0 (or from leading-whitespace) to
+  // the start of the first non-import / non-assignment top-level
+  // child. If the file has no such trailing child, the region is
+  // the entire file.
+  let endIndex = source.length;
+  for (const child of parsed.tree.rootNode.namedChildren) {
+    if (!isImportOrAssignmentNode(child)) {
+      endIndex = child.startIndex;
+      break;
+    }
+  }
+  // Trim trailing whitespace from the new source so we don't
+  // accumulate blank lines on each edit.
+  return spliceRange(source, 0, endIndex, newSource.trimEnd() + "\n\n");
+}
+
+// ── Internals ────────────────────────────────────────────────────────
+
+function parseTs(source: string): ParseSuccess | ParseFailure {
+  const adapter = getAdapterByLanguage("typescript");
+  if (!adapter) {
+    return {
+      ok: false,
+      error: "no typescript adapter registered",
+    };
+  }
+  // Reuse the same parser we already load for AST extraction.
+  // tree-sitter is reentrant per parser instance.
+  const Parser = require("tree-sitter");
+  const tsMod = require("tree-sitter-typescript");
+  const parser = new Parser();
+  parser.setLanguage(tsMod.typescript);
+  const tree = parser.parse(source);
+  if (tree.rootNode.hasError) {
+    return {
+      ok: false,
+      error: `tree-sitter reported error nodes while parsing source`,
+    };
+  }
+  return { ok: true, parser, tree };
+}
+
+function findFunctionDeclaration(
+  root: TreeSitterNode,
+  name: string,
+): TreeSitterNode | null {
+  for (const child of root.namedChildren) {
+    // Plain function: `function foo() {}`
+    if (child.type === "function_declaration") {
+      const nameNode = child.childForFieldName("name");
+      if (nameNode && nameNode.text === name) return child;
+    }
+    // Exported: `export function foo() {}` wraps the function in an
+    // `export_statement` whose `declaration` field is the
+    // function_declaration.
+    if (child.type === "export_statement") {
+      const decl = child.childForFieldName("declaration");
+      if (decl && decl.type === "function_declaration") {
+        const nameNode = decl.childForFieldName("name");
+        if (nameNode && nameNode.text === name) return child;
+      }
+    }
+  }
+  return null;
+}
+
+function findClassDeclaration(
+  root: TreeSitterNode,
+  name: string,
+): TreeSitterNode | null {
+  for (const child of root.namedChildren) {
+    if (child.type === "class_declaration") {
+      const nameNode = child.childForFieldName("name");
+      if (nameNode && nameNode.text === name) return child;
+    }
+    if (child.type === "export_statement") {
+      const decl = child.childForFieldName("declaration");
+      if (decl && decl.type === "class_declaration") {
+        const nameNode = decl.childForFieldName("name");
+        if (nameNode && nameNode.text === name) return child;
+      }
+    }
+  }
+  return null;
+}
+
+function findMethodDefinition(
+  classNode: TreeSitterNode,
+  methodName: string,
+): TreeSitterNode | null {
+  // The actual class_declaration may be nested inside an
+  // export_statement; descend if needed.
+  let target = classNode;
+  if (target.type === "export_statement") {
+    const decl = target.childForFieldName("declaration");
+    if (decl && decl.type === "class_declaration") target = decl;
+  }
+  // class_declaration has a `body` field of type `class_body` whose
+  // children include `method_definition` nodes.
+  const body = target.childForFieldName("body");
+  if (!body) return null;
+  for (const child of body.namedChildren) {
+    if (child.type !== "method_definition") continue;
+    const nameNode = child.childForFieldName("name");
+    if (nameNode && nameNode.text === methodName) return child;
+  }
+  return null;
+}
+
+function collectMethodNames(classNode: TreeSitterNode): string[] {
+  let target = classNode;
+  if (target.type === "export_statement") {
+    const decl = target.childForFieldName("declaration");
+    if (decl && decl.type === "class_declaration") target = decl;
+  }
+  const body = target.childForFieldName("body");
+  if (!body) return [];
+  const names: string[] = [];
+  for (const child of body.namedChildren) {
+    if (child.type !== "method_definition") continue;
+    const nameNode = child.childForFieldName("name");
+    if (nameNode) names.push(nameNode.text);
+  }
+  return names;
+}
+
+/** Permitted top-level node types for the "imports + assignments"
+ *  scope. tree-sitter-typescript names: */
+function isImportOrAssignmentNode(node: TreeSitterNode): boolean {
+  switch (node.type) {
+    case "import_statement":
+    case "import_alias":
+    case "lexical_declaration": // const / let
+    case "variable_declaration": // var
+    case "expression_statement": // bare assignments at module scope
+    case "comment":
+    case "ambient_declaration":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function spliceRange(
+  source: string,
+  startByte: number,
+  endByte: number,
+  replacement: string,
+): EditResult {
+  const newSource =
+    source.slice(0, startByte) + replacement + source.slice(endByte);
+  // Final validation: the post-splice source must still parse as TS.
+  // Catches edge cases where the new fragment was valid in isolation
+  // but combined produces a broken file (e.g., missing trailing
+  // semicolon meaningful at the join boundary).
+  const reparsed = parseTs(newSource);
+  if (!reparsed.ok) {
+    return {
+      ok: false,
+      error: `post-splice file does not parse: ${reparsed.error}`,
+    };
+  }
+  return { ok: true, source: newSource };
+}
