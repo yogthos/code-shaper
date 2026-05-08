@@ -61,6 +61,16 @@ export {
 } from "./edit-tools.js";
 export type { EditResult } from "./edit-tools.js";
 
+// Tool-using edit author — wraps the §D.2 tools as OpenAI function
+// tools so the LLM can pick a scope and emit args structured rather
+// than streaming prose.
+export { editLeafViaTools } from "./edit-author.js";
+export type {
+  EditAuthorInput,
+  EditAuthorResult,
+  ToolName,
+} from "./edit-author.js";
+
 export { runIntegrationTests, MAX_INTEGRATION_ROUNDS } from "./integration.js";
 export type { IntegrationInput, IntegrationResult } from "./integration.js";
 
