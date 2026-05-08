@@ -123,6 +123,55 @@ if (build.ok && build.workDir) {
 
 The architect supports an `extend` mode for working against an existing repo loaded via `loadRepo(rootDir)` — capabilities the architect proposes are integrated into existing structure rather than rebuilt from scratch.
 
+## Run as a server (MCP)
+
+The harness exposes a stdio MCP server (`bin/serve.ts`) so any MCP-speaking client — Claude Code, Claude Desktop, custom agents — can submit tasks, poll status, and read results without re-implementing the pipeline.
+
+Five tools are exposed:
+
+| Tool | Input | Returns |
+| --- | --- | --- |
+| `submit_task` | `{ projectDir, task, mode?, diskQuotaMb? }` | `{ taskId }` immediately; child runs in the background |
+| `task_status` | `{ taskId }` | `{ phase, pid, error, … }` (queued → starting → proposal → … → done\|failed\|cancelled) |
+| `task_log_tail` | `{ taskId, since? }` | `{ events[], nextSince }` — pass `nextSince` back for incremental tailing |
+| `task_result` | `{ taskId }` | Full `TaskResult` once terminal (otherwise a stub) |
+| `cancel_task` | `{ taskId }` | SIGTERMs the child; phase → `failed` |
+
+Each `submit_task` spawns one child process per task under the platform sandbox (`sandbox-exec` on macOS, `bwrap` on Linux). The sandbox restricts writes to `projectDir` + the harness work dir; reads are unrestricted; network is allowed (the body author calls the LLM API). A disk-quota watchdog (default 1 GB, configurable) SIGTERMs runaways. Per-`projectDir` mutex serializes concurrent submissions on the same folder.
+
+State (task table + log files + result files) lives at `~/.code-shaper/server-state` by default; override with `CODE_SHAPER_STATE_DIR`.
+
+### Wire it up to Claude Code
+
+Add to your `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "code-shaper": {
+      "command": "npx",
+      "args": ["tsx", "/absolute/path/to/code-graph-agent/bin/serve.ts"],
+      "env": {
+        "ZHIPU_API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+Then in Claude Code:
+
+```
+> Use code-shaper to build a TodoMVC core library under ~/projects/todos.
+```
+
+Claude Code calls `submit_task`, periodically polls `task_status` + `task_log_tail`, and reports the final `task_result` summary.
+
+### Notes
+
+- The runner refuses to spawn unsandboxed by default. On Linux without `bubblewrap` installed (`apt install bubblewrap`), or in restricted containers, set `CODE_SHAPER_ALLOW_UNSANDBOXED=1` to override (use only on hosts you trust to run model-authored test code without filesystem confinement).
+- `mode: "auto"` (the default) picks `greenfield` for an empty `projectDir`, `extend` for a non-empty one. Other modes: `fix`, `feature`.
+
 ## Operation vocabulary
 
 Architect mutations all flow through a shared vocabulary in `src/architect/operations.ts`:
