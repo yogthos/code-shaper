@@ -25,9 +25,19 @@ let workDir: string;
 
 beforeEach(async () => {
   workDir = await mkdtemp(path.join(tmpdir(), "runner-"));
+  // The runner tests exercise orchestration (log capture, phase
+  // callbacks, cancel), not sandbox enforcement. On hosts where
+  // the sandbox tool isn't usable (Ubuntu 24.04 GHA runners with
+  // AppArmor blocking unprivileged user-namespace clone, etc.),
+  // the runner's default refusal would mask the orchestration
+  // tests as failures. Opt out here. The dedicated sandbox-
+  // enforcement test (tests/server.sandbox.test.ts) still skips
+  // gracefully when no sandbox is available.
+  process.env.CODE_SHAPER_ALLOW_UNSANDBOXED = "1";
 });
 
 afterEach(async () => {
+  delete process.env.CODE_SHAPER_ALLOW_UNSANDBOXED;
   if (workDir) await rm(workDir, { recursive: true, force: true });
 });
 

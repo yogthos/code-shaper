@@ -31,7 +31,17 @@ jobs:
         # ubuntu-latest bwrap isn't pre-installed. Without this,
         # tests/server.runner.test.ts and tests/server.mcp.test.ts
         # all fail at submit_task. Adds <2s to the run.
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        #
+        # Ubuntu 24.04+ (which ubuntu-latest now points at) ships an
+        # AppArmor profile that denies unprivileged user-namespace
+        # creation by default — bwrap exits with "setting up uid
+        # map: Permission denied". The sysctl below opts the runner
+        # back into the pre-24.04 behavior so bwrap can sandbox.
+        # See: https://discourse.ubuntu.com/t/ubuntu-24-04-lts-noble-numbat-release-notes/39890
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - name: Type-check
         run: npx tsc --noEmit

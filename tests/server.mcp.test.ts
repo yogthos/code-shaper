@@ -32,14 +32,15 @@ let workDir: string;
 beforeEach(async () => {
   stateDir = await mkdtemp(path.join(tmpdir(), "mcp-state-"));
   workDir = await mkdtemp(path.join(tmpdir(), "mcp-work-"));
+  // See note in tests/server.runner.test.ts — orchestration tests,
+  // not sandbox enforcement; opt out so refusal doesn't mask real
+  // failures on hosts without working sandbox tools.
+  process.env.CODE_SHAPER_ALLOW_UNSANDBOXED = "1";
 });
 
 afterEach(async () => {
-  // Always unset the entry-override env var, even on test throw —
-  // setting it in `try` and unsetting in `finally` per-test would
-  // leak into the next test on a thrown assertion or on vitest's
-  // `--bail` interrupt, and into adjacent test files via the pool.
   delete process.env.CODE_SHAPER_RUN_TASK_ENTRY;
+  delete process.env.CODE_SHAPER_ALLOW_UNSANDBOXED;
   if (stateDir) await rm(stateDir, { recursive: true, force: true });
   if (workDir) await rm(workDir, { recursive: true, force: true });
 });
