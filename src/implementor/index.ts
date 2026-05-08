@@ -1,0 +1,75 @@
+// Phase 6 implementor public surface.
+
+export { renderTypeScriptFile } from "./render.js";
+export type { RenderInput } from "./render.js";
+
+export {
+  createHarnessDir,
+  extractJsonObject,
+  leafToTestFilename,
+  linkHostNodeModules,
+  outcomeForLeaf,
+  runTests,
+} from "./test-harness.js";
+export type {
+  TestRunOptions,
+  TestRunResult,
+  LeafTestOutcome,
+} from "./test-harness.js";
+
+export {
+  TEST_AUTHOR_SYSTEM_PROMPT,
+  BODY_AUTHOR_SYSTEM_PROMPT,
+  buildTestAuthorUserPrompt,
+  buildBodyAuthorUserPrompt,
+  stripCodeFences,
+} from "./prompts.js";
+export type {
+  TestAuthorPromptInput,
+  BodyAuthorPromptInput,
+} from "./prompts.js";
+
+export { implementLeaf } from "./leaf.js";
+export type { LeafImplementInput, LeafImplementResult } from "./leaf.js";
+
+export { buildImplementations } from "./orchestrator.js";
+export type { BuildInput, BuildResult } from "./orchestrator.js";
+
+export {
+  decomposeStuckLeaf,
+  MAX_DECOMPOSE_DEPTH,
+} from "./decompose.js";
+export type {
+  DecomposeRequest,
+  DecomposeDecision,
+  DecomposeResult,
+  SubLeafSpec,
+} from "./decompose.js";
+
+export {
+  DECOMPOSE_SYSTEM_PROMPT,
+  buildDecomposeUserPrompt,
+} from "./decompose-prompts.js";
+export type { DecomposePromptInput } from "./decompose-prompts.js";
+
+export { runIntegrationTests, MAX_INTEGRATION_ROUNDS } from "./integration.js";
+export type { IntegrationInput, IntegrationResult } from "./integration.js";
+
+export {
+  INTEGRATION_TEST_AUTHOR_SYSTEM_PROMPT,
+  INTEGRATION_BLAME_SYSTEM_PROMPT,
+  buildIntegrationTestAuthorUserPrompt,
+  buildIntegrationBlameUserPrompt,
+  discoverBranches,
+  renderBranchDataFlow,
+} from "./integration-prompts.js";
+export type {
+  IntegrationTestAuthorInput,
+  IntegrationBlameInput,
+  DiscoveredBranch,
+} from "./integration-prompts.js";
+
+export {
+  branchToTestFilename,
+  outcomeForBranch,
+} from "./test-harness.js";

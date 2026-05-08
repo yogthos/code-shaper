@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_llm_integration:
+        description: "Run LLM-driven integration tests (requires ZHIPU_API_KEY secret)"
+        type: boolean
+        default: false
+
+jobs:
+  unit:
+    name: typecheck + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Unit tests (LLM integration excluded)
+        run: npm test -- --exclude '**/*.integration.test.ts'
+
+  llm-integration:
+    name: LLM-driven integration tests
+    # Manual trigger only — costly + non-deterministic. Set the
+    # `run_llm_integration` input to `true` when dispatching.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_llm_integration == 'true'
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: LLM integration tests
+        env:
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+        run: npm test -- '**/*.integration.test.ts'
