@@ -207,6 +207,26 @@ describe("editLeafViaTools — agent error paths", () => {
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/must declare a function named "add"/);
   });
+
+  // Audit issue #1: localize / applyEnvFixViaTools both wrap their
+  // chat() call in try/catch. editLeafViaTools previously did not —
+  // a transient API error fataled the entire leaf loop and
+  // orchestrator. Here we assert the exception is captured into the
+  // result so the caller can fall through to retry.
+  it("captures client.chat exceptions into the result instead of fataling", async () => {
+    const client: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        throw new Error("upstream 503: request timed out");
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    const r = await editLeafViaTools(client, baseInput);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/edit chat failed/);
+    expect(r.error).toMatch(/upstream 503/);
+  });
 });
 
 describe("editLeafViaTools — request shape", () => {

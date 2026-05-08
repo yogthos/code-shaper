@@ -73,7 +73,27 @@ function unrelated(): string {
     const before = `function foo() { return 1; }`;
     const r = editFunctionInFile(before, "foo", "function foo() { return ;");
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/error nodes/i);
+    expect(r.error).toMatch(/parse error/i);
+  });
+
+  // Audit issue #3: tree-sitter parse errors should be
+  // ACTIONABLE — give the model line/column and a snippet so it
+  // can locate the typo in the source it just produced. Opaque
+  // errors ("error nodes") cause the model to repeat the same
+  // syntax mistake on retry.
+  it("parse-error message includes line:column and offending token snippet", () => {
+    const before = `function foo() { return 1; }`;
+    // Deliberate typo: extra `}` on line 3 closes the function early
+    // and leaves prose dangling.
+    const broken =
+      "function foo() {\n  const x = 1;\n  }\n  return x + bogus syntax;\n}\n";
+    const r = editFunctionInFile(before, "foo", broken);
+    expect(r.ok).toBe(false);
+    // Position prefix (row:col) somewhere in the message.
+    expect(r.error).toMatch(/\b\d+:\d+\b/);
+    // Either an explicit ERROR/MISSING marker or a "near" snippet
+    // pointing at offending text.
+    expect(r.error).toMatch(/near\s+"|missing|unexpected/i);
   });
 });
 

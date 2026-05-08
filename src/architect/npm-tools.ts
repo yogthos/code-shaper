@@ -140,6 +140,29 @@ function validateScriptName(name: string): { ok: true } | { ok: false; error: st
   return { ok: true };
 }
 
+/** Audit issue #2: relaxed validator for `npm run <name>`. The
+ *  lifecycle-hook ban exists to stop the model from CREATING
+ *  postinstall/prepare/etc. via setScript. Running an EXISTING
+ *  script with a lifecycle-hook name is harmless — the
+ *  package.json declared it, and `npm run` doesn't write disk
+ *  state. Only the syntactic regex applies. The
+ *  not-in-package.json check (in npmRun itself) handles the
+ *  "doesn't exist yet" case. */
+function validateScriptNameForRun(
+  name: string,
+): { ok: true } | { ok: false; error: string } {
+  if (typeof name !== "string" || name.length === 0) {
+    return { ok: false, error: "script name must be a non-empty string" };
+  }
+  if (!SCRIPT_NAME_RE.test(name)) {
+    return {
+      ok: false,
+      error: `script name must match /^[a-z][a-z0-9:_-]*$/ (got ${JSON.stringify(name)})`,
+    };
+  }
+  return { ok: true };
+}
+
 /**
  * Add a dependency. `which: "runtime"` lands in `dependencies`,
  * `which: "dev"` in `devDependencies`. Re-runs npm install on
@@ -278,7 +301,7 @@ export async function setScript(
 export async function npmRun(
   input: NpmOpInput & { script: string; timeoutMs?: number },
 ): Promise<NpmOpResult & { exitCode: number | null }> {
-  const nameCheck = validateScriptName(input.script);
+  const nameCheck = validateScriptNameForRun(input.script);
   if (!nameCheck.ok) {
     return {
       ok: false,

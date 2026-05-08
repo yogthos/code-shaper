@@ -76,6 +76,7 @@ interface TreeSitterNode {
   childForFieldName: (name: string) => TreeSitterNode | null;
   text: string;
   hasError: boolean;
+  isMissing?: boolean;
 }
 
 interface TreeSitterTree {
@@ -419,10 +420,73 @@ function parseTs(source: string): ParseSuccess | ParseFailure {
   if (tree.rootNode.hasError) {
     return {
       ok: false,
-      error: `tree-sitter reported error nodes while parsing source`,
+      error: describeParseError(tree.rootNode, source),
     };
   }
   return { ok: true, parser, tree };
+}
+
+/** Audit issue #3: walk the tree to find the first ERROR or
+ *  MISSING node and emit `${row+1}:${col}: <kind> near "<snippet>"`
+ *  so the model can correlate the failure with the source it just
+ *  emitted. Without this, the previous opaque "tree-sitter
+ *  reported error nodes" message gave the model nothing to grip
+ *  on, and it tended to repeat the same typo on retry. */
+function describeParseError(root: TreeSitterNode, source: string): string {
+  const offender = findFirstParseProblem(root);
+  if (!offender) {
+    // Shouldn't happen — root.hasError implied at least one ERROR
+    // or MISSING somewhere. Fall back to the legacy message.
+    return "parse error: tree-sitter reported error nodes (no specific location)";
+  }
+  const { row, column } = offender.startPosition;
+  const lineText = source.split(/\r?\n/)[row] ?? "";
+  // Snippet: the line itself, trimmed and bounded so the model
+  // sees the actual source it emitted and can find the typo.
+  const snippet =
+    lineText.length > 80 ? lineText.slice(0, 80) + "…" : lineText;
+  if (offender.isMissing) {
+    return `parse error at ${row + 1}:${column + 1}: missing ${offender.type || "(node)"} near "${snippet.trim()}"`;
+  }
+  // Use the (typically short) offending text for context. Cap to
+  // keep the message tight.
+  const offText = offender.text ?? "";
+  const offSnippet =
+    offText.length > 40 ? offText.slice(0, 40).replace(/\s+/g, " ") + "…" : offText.replace(/\s+/g, " ");
+  return `parse error at ${row + 1}:${column + 1}: unexpected ${offender.type} "${offSnippet}" near "${snippet.trim()}"`;
+}
+
+interface ParseProblem {
+  type: string;
+  isMissing: boolean;
+  text: string;
+  startPosition: { row: number; column: number };
+}
+
+function findFirstParseProblem(node: TreeSitterNode): ParseProblem | null {
+  // tree-sitter exposes hasError on a subtree, isMissing on a leaf,
+  // and ERROR is a node type. BFS keeps the FIRST problem in source
+  // order at the same depth — rougher than DFS but the wins are
+  // similar; either way the user gets a meaningful position.
+  const queue: TreeSitterNode[] = [node];
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    // Direct evidence of trouble.
+    if (cur.type === "ERROR" || cur.isMissing) {
+      return {
+        type: cur.type,
+        isMissing: !!cur.isMissing,
+        text: cur.text ?? "",
+        startPosition: cur.startPosition,
+      };
+    }
+    // Descend only into children that themselves report errors —
+    // skip subtrees we know are clean to keep the walk linear.
+    for (const child of cur.namedChildren) {
+      if (child.hasError || child.isMissing) queue.push(child);
+    }
+  }
+  return null;
 }
 
 function findFunctionDeclaration(

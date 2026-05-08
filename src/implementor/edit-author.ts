@@ -224,13 +224,25 @@ export async function editLeafViaTools(
       ? { temperature: input.temperature }
       : {}),
   };
-  const response = await client.chat(
-    [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userPrompt },
-    ],
-    opts,
-  );
+  // Audit issue #1: localize and applyEnvFixViaTools both wrap
+  // their chat() call in try/catch — a transient 5xx or socket
+  // error must not kill the entire leaf loop. Mirror that here so
+  // the caller falls through to retry on the next attempt.
+  let response;
+  try {
+    response = await client.chat(
+      [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: userPrompt },
+      ],
+      opts,
+    );
+  } catch (e) {
+    return {
+      ok: false,
+      error: `edit chat failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
   const toolCalls = response.toolCalls ?? [];
   if (toolCalls.length === 0) {
     return {

@@ -302,13 +302,53 @@ describe("security validators (review fix #1)", () => {
     expect(r.ok).toBe(false);
   });
 
-  it("npmRun rejects bogus script names before checking package.json", async () => {
+  it("npmRun rejects syntactically invalid script names", async () => {
+    const r = await npmRun({
+      outDir,
+      script: "../weird",
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/script name must match/);
+  });
+
+  // Audit issue #2: validateScriptName's lifecycle-hook check
+  // exists to stop the model from CREATING postinstall/prepare/etc.
+  // via setScript. Reusing it for npmRun blocks legitimate
+  // verification calls like `npm run start` or `npm run prepublish`
+  // on scripts the project already declared. npmRun must accept
+  // any name that's syntactically valid AND present in
+  // package.json — independent of whether the name happens to
+  // collide with a lifecycle hook.
+  it("npmRun ALLOWS running an existing script even when its name is a lifecycle hook (audit issue #2)", async () => {
+    const seeded = {
+      ...VALID_PKG,
+      scripts: { ...VALID_PKG.scripts, start: "node ./dist/index.js" },
+    };
+    await writeFile(
+      path.join(outDir, "package.json"),
+      JSON.stringify(seeded, null, 2),
+    );
+    const stub = await makeStubBinary({ exitCode: 0, stdout: "started\n" });
+    const r = await npmRun({
+      outDir,
+      script: "start",
+      npmBinary: stub,
+    });
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("npmRun rejects a lifecycle-hook name only when no such script exists", async () => {
+    // No `preinstall` script declared — npmRun should refuse with
+    // the same not-in-package.json reason it gives for any other
+    // missing script. NOT with the lifecycle-hook RCE message.
     const r = await npmRun({
       outDir,
       script: "preinstall",
     });
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/lifecycle hook/);
+    expect(r.error).toMatch(/not in package.json/);
+    expect(r.error).not.toMatch(/lifecycle hook/);
   });
 });
 
