@@ -313,26 +313,36 @@ export async function implementLeaf(
       bodyByLeafId: input.bodyByLeafId,
       rpg: input.rpg,
     });
-    // Build retry feedback. Two flavors:
-    //   - prior attempt returned an empty body → tell the model
-    //     directly so it doesn't repeat the mistake.
-    //   - prior attempt returned a non-empty body that failed tests →
-    //     replay the body and the failing assertion.
-    // First attempt (i === 0) gets no feedback.
+    // Build retry feedback. Three flavors, in priority order:
+    //   - prior attempt's TOOL/AUTHOR refused (edit-tool rejected
+    //     the new source, body author returned empty, etc.). Surface
+    //     `lastFatal` verbatim so the model sees the actual refusal
+    //     reason — without this, every refusal collapses to a canned
+    //     "your response was empty" message and the model repeats
+    //     the same naming bug forever.
+    //   - prior attempt produced a body that ran but failed a test.
+    //     Replay the body + the assertion message.
+    //   - first attempt (i === 0): no feedback.
     let retryFeedback:
       | { previousBody: string; failureMessage: string }
       | undefined;
     if (i > 0) {
-      if (priorBodyEmpty) {
+      if (lastFatal && priorBodyEmpty) {
+        // Prior attempt didn't produce a usable body — show the
+        // actual refusal reason rather than a canned "blank
+        // response" message. lastFatal is set by:
+        //   - body author returned empty content
+        //   - edit author tool call refused (wrong name, parse
+        //     error, etc.)
+        //   - vitest produced no outcome (suite-level load fail)
         retryFeedback = {
-          previousBody: "(empty — your previous response was blank)",
-          failureMessage:
-            "Your previous response was empty. Return a non-empty function body. Do not include the signature, just the statements.",
+          previousBody: body || "(no body produced this attempt)",
+          failureMessage: lastFatal,
         };
-      } else {
+      } else if (lastFailure) {
         retryFeedback = {
           previousBody: body,
-          failureMessage: lastFailure?.failureMessage ?? "(no message)",
+          failureMessage: lastFailure.failureMessage,
         };
       }
     }
@@ -394,6 +404,11 @@ export async function implementLeaf(
       }
       body = extracted;
       priorBodyEmpty = false;
+      // Clear lastFatal — the prior refusal was just resolved by
+      // this attempt's successful edit. Next iteration's retry
+      // feedback should reflect any NEW failure (test outcome),
+      // not stale tool-refusal text.
+      lastFatal = undefined;
       input.bodyByLeafId.set(leafId, body);
     } else {
       const bodyPrompt = buildBodyAuthorUserPrompt({
@@ -421,11 +436,15 @@ export async function implementLeaf(
       );
       body = stripCodeFences(bodyResponse.content);
       if (body.length === 0) {
-        lastFatal = "body author returned empty content";
+        // Prior body was empty — but include what the model actually
+        // returned (often prose without code fences) so the retry
+        // prompt is informative, not "your response was empty".
+        lastFatal = `body author returned empty content. Raw response head: ${bodyResponse.content.slice(0, 600).replace(/\s+/g, " ")}`;
         priorBodyEmpty = true;
         continue;
       }
       priorBodyEmpty = false;
+      lastFatal = undefined;
       input.bodyByLeafId.set(leafId, body);
     }
 

@@ -370,6 +370,106 @@ describe("Counter.inc", () => {
   );
 });
 
+describe("implementLeaf — edit-tool refusal surfaces to next attempt", () => {
+  it(
+    "shows the model the edit-tool's specific refusal reason in the retry prompt (gap #10)",
+    { timeout: 60_000 },
+    async () => {
+      const { rpg, hostFile } = buildFnRpg();
+      const TEST = `import { describe, it, expect } from "vitest";
+import { add } from "../../src/add.js";
+describe("add", () => { it("sums", () => { expect(add(2, 3)).toBe(5); }); });
+`;
+      const userPrompts: string[] = [];
+      const client: LLMClient = {
+        async chat(messages, opts): Promise<LLMResponse> {
+          const sys = messages[0]!.content;
+          if (
+            sys.includes("producing a vitest test file") &&
+            !opts?.tools
+          ) {
+            return { content: TEST, finishReason: "stop" };
+          }
+          if (sys.includes("§D.2") || opts?.tools) {
+            const u = messages[messages.length - 1]!.content;
+            userPrompts.push(u);
+            // First attempt: emit a function with the WRONG name.
+            // edit-tool refuses with "new source must declare a
+            // function named 'add'" — the test's whole point is
+            // that this refusal reaches attempt #2's prompt.
+            if (userPrompts.length === 1) {
+              return {
+                content: "",
+                finishReason: "tool_calls",
+                toolCalls: [
+                  {
+                    id: "c1",
+                    type: "function",
+                    function: {
+                      name: "edit_function_in_file",
+                      arguments: JSON.stringify({
+                        function_name: "add",
+                        new_source: `export function notAdd(a: number, b: number): number {
+  return a + b;
+}`,
+                      }),
+                    },
+                  },
+                ],
+              };
+            }
+            // Second attempt: do it right.
+            return {
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: "c2",
+                  type: "function",
+                  function: {
+                    name: "edit_function_in_file",
+                    arguments: JSON.stringify({
+                      function_name: "add",
+                      new_source: `export function add(a: number, b: number): number {
+  return a + b;
+}`,
+                    }),
+                  },
+                },
+              ],
+            };
+          }
+          return { content: "", finishReason: "stop" };
+        },
+        async listModels() {
+          return ["mock"];
+        },
+      };
+
+      const result = await implementLeaf(client, {
+        leaf: hostFile.interfacePlan!.entries[0]!,
+        hostFile,
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        workDir,
+        maxAttempts: 3,
+        useEditTools: true,
+      });
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      // Two edit-author attempts captured.
+      expect(userPrompts.length).toBeGreaterThanOrEqual(2);
+      // The 2nd attempt's prompt MUST reference the edit-tool's
+      // specific refusal — not a canned "your response was empty".
+      const secondPrompt = userPrompts[1]!;
+      expect(secondPrompt).toContain("must declare a function named");
+      expect(secondPrompt).not.toContain(
+        "Your previous response was empty",
+      );
+    },
+  );
+});
+
 describe("implementLeaf — useEditTools error fallback", () => {
   it(
     "treats edit-author failure as an empty body and continues retry",
