@@ -104,6 +104,14 @@ export type {
   FunctionalitySearchResult,
 } from "./localization-tools.js";
 
+// §D.1 localization agent — multi-step tool-using loop with Terminate.
+export { localize } from "./localization.js";
+export type {
+  LocalizationInput,
+  LocalizationResult,
+  LocatedInterface,
+} from "./localization.js";
+
 // Failure diagnosis — 5-round majority-vote routing for test failures.
 export { diagnoseFailure } from "./diagnose-failure.js";
 export type {
