@@ -1,5 +1,23 @@
 // Architect public surface.
 
+// Phase 0 — stack & dependencies (TS-specific addition; not in paper).
+export {
+  proposeStack,
+  parsePackageJson,
+  runNpmInstall,
+} from "./stack.js";
+export type {
+  PackageJson,
+  StackInput,
+  StackResult,
+} from "./stack.js";
+
+export {
+  STACK_SYSTEM_PROMPT,
+  buildStackUserPrompt,
+} from "./stack-prompts.js";
+export type { StackPromptInput } from "./stack-prompts.js";
+
 // Phase 3 — proposal-level construction.
 export {
   proposeFunctionalityGraph,

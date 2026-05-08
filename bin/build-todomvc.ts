@@ -22,6 +22,7 @@ import {
   designInterfaces,
   encodeFileStructure,
   proposeFunctionalityGraph,
+  proposeStack,
   runRefactorPass,
 } from "../src/architect/index.js";
 import {
@@ -102,6 +103,23 @@ async function main(): Promise<number> {
     renderPlannedFiles(rpg);
     await materializeRPG(rpg, outDir);
   };
+
+  // Phase 0 — stack & dependencies (TS-specific addition).
+  log("phase 0 — stack");
+  const stack = await proposeStack(client, {
+    description: DESCRIPTION,
+    outDir,
+    maxAttempts: 2,
+  });
+  if (!stack.ok) {
+    console.error(`[fatal] stack phase failed: ${stack.error}`);
+    return 2;
+  }
+  log(
+    `  ${Object.keys(stack.packageJson?.dependencies ?? {}).length} deps + ${
+      Object.keys(stack.packageJson?.devDependencies ?? {}).length
+    } devDeps; npm install ${stack.installOk ? "ok" : "skipped/failed"}`,
+  );
 
   log("phase 3 — proposal");
   const proposal = await proposeFunctionalityGraph(client, rpg, {

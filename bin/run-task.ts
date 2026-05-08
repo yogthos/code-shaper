@@ -38,6 +38,7 @@ import {
   designInterfaces,
   encodeFileStructure,
   proposeFunctionalityGraph,
+  proposeStack,
   runRefactorPass,
 } from "../src/architect/index.js";
 import {
@@ -162,6 +163,32 @@ async function run(args: ParsedArgs): Promise<number> {
     renderPlannedFiles(rpg);
     await materializeRPG(rpg, outDir);
   };
+
+  // Phase 0: stack & dependencies (TS-specific). Runs BEFORE
+  // proposal so subsequent phases can rely on declared deps.
+  log("phase=stack");
+  const stack = await proposeStack(client, {
+    description: args.task,
+    outDir,
+    mode: mode === "greenfield" ? "greenfield" : "extend",
+    maxAttempts: 2,
+  });
+  if (!stack.ok) {
+    await writeResult(args.resultPath, {
+      ok: false,
+      summary: "stack phase failed",
+      materializedTo: outDir,
+      leafResults: [],
+      integrationOk: null,
+      error: stack.error ?? "unknown",
+    });
+    return 1;
+  }
+  log(
+    `  ${Object.keys(stack.packageJson?.dependencies ?? {}).length} deps + ${
+      Object.keys(stack.packageJson?.devDependencies ?? {}).length
+    } devDeps; npm install ${stack.installOk ? "ok" : "skipped/failed"}`,
+  );
 
   // Phase 1: proposal
   log("phase=proposal");
