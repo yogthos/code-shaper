@@ -264,6 +264,85 @@ export function editImportsAndAssignmentsInFile(
   return spliceRange(source, 0, endIndex, newSource.trimEnd() + "\n\n");
 }
 
+/**
+ * Extract just the body STATEMENTS of a top-level function from a
+ * source string. Returns null if the function isn't found or its
+ * body block can't be located.
+ *
+ * "Body statements" = the bytes between `{` and `}` (exclusive),
+ * with leading/trailing whitespace trimmed but interior structure
+ * preserved. This is what the renderer expects in `bodyByLeafId` —
+ * the renderer wraps it in a signature + braces. So feeding the
+ * extraction back into the renderer reproduces the input function
+ * up to whitespace.
+ */
+export function extractFunctionBody(
+  source: string,
+  name: string,
+): string | null {
+  const parsed = parseTs(source);
+  if (!parsed.ok) return null;
+  const fn = findFunctionDeclaration(parsed.tree.rootNode, name);
+  if (!fn) return null;
+  // The actual function_declaration may be wrapped in
+  // export_statement; descend if so.
+  let target = fn;
+  if (target.type === "export_statement") {
+    const decl = target.childForFieldName("declaration");
+    if (decl && decl.type === "function_declaration") target = decl;
+  }
+  const body = target.childForFieldName("body");
+  if (!body) return null;
+  return extractBodyContent(body.text);
+}
+
+/**
+ * Extract just the body STATEMENTS of a method on a class. Returns
+ * null if the class or method isn't found. Same trim semantics as
+ * `extractFunctionBody`.
+ */
+export function extractMethodBody(
+  source: string,
+  className: string,
+  methodName: string,
+): string | null {
+  const parsed = parseTs(source);
+  if (!parsed.ok) return null;
+  const cls = findClassDeclaration(parsed.tree.rootNode, className);
+  if (!cls) return null;
+  const method = findMethodDefinition(cls, methodName);
+  if (!method) return null;
+  const body = method.childForFieldName("body");
+  if (!body) return null;
+  return extractBodyContent(body.text);
+}
+
+/** Strip the outer `{` / `}` from a statement_block's text. */
+function extractBodyContent(blockText: string): string {
+  let s = blockText.trim();
+  if (s.startsWith("{")) s = s.slice(1);
+  if (s.endsWith("}")) s = s.slice(0, -1);
+  // Common indentation cleanup: every body line typically starts
+  // with at least 2 spaces (inside the function scope). Dedent by
+  // the minimum leading whitespace across non-blank lines so the
+  // renderer's own indenting does the right thing.
+  const lines = s.split("\n");
+  let minIndent = Infinity;
+  for (const line of lines) {
+    if (line.trim().length === 0) continue;
+    const m = line.match(/^(\s*)/);
+    const indent = m ? m[1]!.length : 0;
+    if (indent < minIndent) minIndent = indent;
+  }
+  if (minIndent !== Infinity && minIndent > 0) {
+    return lines
+      .map((l) => (l.length >= minIndent ? l.slice(minIndent) : l))
+      .join("\n")
+      .trim();
+  }
+  return s.trim();
+}
+
 // ── Internals ────────────────────────────────────────────────────────
 
 function parseTs(source: string): ParseSuccess | ParseFailure {

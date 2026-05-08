@@ -26,6 +26,11 @@ import {
   type FailureCategory,
   type FailureDiagnosisResult,
 } from "../architect/diagnose-failure.js";
+import { editLeafViaTools, type ToolName } from "./edit-author.js";
+import {
+  extractFunctionBody,
+  extractMethodBody,
+} from "./edit-tools.js";
 import {
   BODY_AUTHOR_SYSTEM_PROMPT,
   TEST_AUTHOR_SYSTEM_PROMPT,
@@ -128,6 +133,16 @@ export interface LeafImplementInput {
    *  `test_brittleness` diagnosis. Paper §5.3: "20 remediation
    *  attempts for test or environment errors." Default 20. */
   maxTestRewrites?: number;
+  /** When true, replace the streaming body-author with the §D.2
+   *  tool-using edit author: the LLM is given the rendered file
+   *  source plus the leaf's task and picks `edit_function_in_file`
+   *  or `edit_method_of_class_in_file` (depending on the leaf
+   *  kind), emits structured args, and the harness applies the
+   *  tool. The leaf's body is then extracted from the new file
+   *  source via tree-sitter and stored in `bodyByLeafId` so the
+   *  renderer continues to drive subsequent leaves on the same
+   *  file consistently. Default false; production drivers opt in. */
+  useEditTools?: boolean;
 }
 
 export interface LeafImplementResult {
@@ -297,37 +312,98 @@ export async function implementLeaf(
         };
       }
     }
-    const bodyPrompt = buildBodyAuthorUserPrompt({
-      leaf: input.leaf,
-      hostFile: input.hostFile,
-      testSource,
-      renderedFile,
-      ...(retryFeedback ?? {}),
-      // Architect's fresh-approach hint applies only to the FIRST
-      // attempt of this re-run. After that the model is iterating on
-      // its own attempts; reinforcing the hint when it isn't working
-      // would just reinforce the bad strategy.
-      ...(i === 0 && input.approachHint
-        ? { approachHint: input.approachHint }
-        : {}),
-    });
-    const bodyResponse = await client.chat(
-      [
-        { role: "system", content: BODY_AUTHOR_SYSTEM_PROMPT },
-        { role: "user", content: bodyPrompt },
-      ],
-      input.temperature !== undefined
-        ? { temperature: input.temperature }
-        : undefined,
-    );
-    body = stripCodeFences(bodyResponse.content);
-    if (body.length === 0) {
-      lastFatal = "body author returned empty content";
-      priorBodyEmpty = true;
-      continue;
+    if (input.useEditTools) {
+      // §D.2 tool-using author: the LLM picks an edit tool scoped
+      // to this leaf's kind, emits structured args, the harness
+      // applies the tool to the rendered file, and we extract the
+      // body for `bodyByLeafId` so the renderer drives subsequent
+      // leaves consistently.
+      //
+      // Tool restriction: methods only get edit_method_of_class_in_file;
+      // free-standing functions only get edit_function_in_file. The
+      // imports tool is intentionally NOT exposed here — imports
+      // are owned by the architect's operation vocabulary and
+      // refreshed on every plan mutation. Letting the body author
+      // edit imports would race with that flow.
+      const allowedTools: ToolName[] =
+        input.leaf.kind === "method"
+          ? ["edit_method_of_class_in_file"]
+          : ["edit_function_in_file"];
+      const taskDescription = buildEditTaskDescription(
+        input.leaf,
+        i === 0 && input.approachHint ? input.approachHint : null,
+      );
+      const editResult = await editLeafViaTools(client, {
+        fileSource: renderedFile,
+        filePath: input.hostFile.path,
+        taskDescription,
+        testSource,
+        allowedTools,
+        ...(retryFeedback?.failureMessage !== undefined
+          ? { failureMessage: retryFeedback.failureMessage }
+          : {}),
+        ...(input.temperature !== undefined
+          ? { temperature: input.temperature }
+          : {}),
+      });
+      if (!editResult.ok || !editResult.source) {
+        lastFatal = `edit author failed: ${editResult.error ?? "(unknown)"}`;
+        // Treat as if the body was empty — the loop logic already
+        // handles "no usable body this attempt" via priorBodyEmpty.
+        priorBodyEmpty = true;
+        continue;
+      }
+      // Extract the leaf's body STATEMENTS from the edited file
+      // source. This is what the renderer wants in bodyByLeafId.
+      const extracted =
+        input.leaf.kind === "method" && input.leaf.ownerClassName
+          ? extractMethodBody(
+              editResult.source,
+              input.leaf.ownerClassName,
+              input.leaf.name,
+            )
+          : extractFunctionBody(editResult.source, input.leaf.name);
+      if (!extracted) {
+        lastFatal = `edit author produced source missing the target ${input.leaf.kind} ${input.leaf.name}`;
+        priorBodyEmpty = true;
+        continue;
+      }
+      body = extracted;
+      priorBodyEmpty = false;
+      input.bodyByLeafId.set(leafId, body);
+    } else {
+      const bodyPrompt = buildBodyAuthorUserPrompt({
+        leaf: input.leaf,
+        hostFile: input.hostFile,
+        testSource,
+        renderedFile,
+        ...(retryFeedback ?? {}),
+        // Architect's fresh-approach hint applies only to the FIRST
+        // attempt of this re-run. After that the model is iterating on
+        // its own attempts; reinforcing the hint when it isn't working
+        // would just reinforce the bad strategy.
+        ...(i === 0 && input.approachHint
+          ? { approachHint: input.approachHint }
+          : {}),
+      });
+      const bodyResponse = await client.chat(
+        [
+          { role: "system", content: BODY_AUTHOR_SYSTEM_PROMPT },
+          { role: "user", content: bodyPrompt },
+        ],
+        input.temperature !== undefined
+          ? { temperature: input.temperature }
+          : undefined,
+      );
+      body = stripCodeFences(bodyResponse.content);
+      if (body.length === 0) {
+        lastFatal = "body author returned empty content";
+        priorBodyEmpty = true;
+        continue;
+      }
+      priorBodyEmpty = false;
+      input.bodyByLeafId.set(leafId, body);
     }
-    priorBodyEmpty = false;
-    input.bodyByLeafId.set(leafId, body);
 
     // 3. Run leaf's tests.
     const result = await runTests(input.rpg, {
@@ -516,6 +592,47 @@ export async function implementLeaf(
     testRewrites,
     ...(diagnoses.length > 0 ? { diagnoses } : {}),
   };
+}
+
+/**
+ * Plain-language task brief for the tool-using edit author. Wraps
+ * the leaf's name + signature + description, plus an optional
+ * approach hint when the orchestrator's fresh_approach recovery
+ * fired on this leaf. The edit author already sees the rendered
+ * file source separately; this is just the "what to do" prose.
+ */
+function buildEditTaskDescription(
+  leaf: PlannedInterface,
+  approachHint: string | null,
+): string {
+  const lines: string[] = [];
+  if (leaf.kind === "method" && leaf.ownerClassName) {
+    lines.push(
+      `Implement method \`${leaf.ownerClassName}.${leaf.name}\` so it satisfies the test below.`,
+    );
+  } else {
+    lines.push(
+      `Implement function \`${leaf.name}\` so it satisfies the test below.`,
+    );
+  }
+  lines.push("");
+  lines.push("Description:");
+  lines.push(leaf.description.trim());
+  lines.push("");
+  lines.push("Signature:");
+  const params = leaf.signature.params
+    .map((p) => `${p.name}: ${p.type}`)
+    .join(", ");
+  const asyncPrefix = leaf.signature.isAsync ? "async " : "";
+  lines.push(
+    `${asyncPrefix}${leaf.name}(${params}): ${leaf.signature.returnType}`,
+  );
+  if (approachHint) {
+    lines.push("");
+    lines.push("Architect's fresh-approach hint (must follow):");
+    lines.push(approachHint);
+  }
+  return lines.join("\n");
 }
 
 /**

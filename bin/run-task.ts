@@ -257,6 +257,7 @@ async function run(args: ParsedArgs): Promise<number> {
     preserveHarness: true,
     diagnosis: { enabled: true, rounds: 5, afterFailures: 1 },
     maxTestRewrites: 20,
+    useEditTools: true,
   });
   const greenLeaves = build.leafResults.filter((r) => r.ok);
   const redLeaves = build.leafResults.filter((r) => !r.ok);

@@ -176,6 +176,11 @@ async function main(): Promise<number> {
     // calls for limited additional value.
     diagnosis: { enabled: true, rounds: 5, afterFailures: 1 },
     maxTestRewrites: 20,
+    // §D.2 tool-using edit author replaces the streaming body
+    // author. The LLM picks a scope (edit_function_in_file or
+    // edit_method_of_class_in_file) and emits structured args; the
+    // harness applies the tool with AST-aware splicing.
+    useEditTools: true,
   });
   const failedLeaves = build.leafResults.filter((r) => !r.ok);
   log(

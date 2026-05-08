@@ -245,6 +245,78 @@ import y from "./other";
   });
 });
 
+describe("extractFunctionBody / extractMethodBody", () => {
+  it("extracts the body STATEMENTS of a top-level function", async () => {
+    const { extractFunctionBody } = await import(
+      "../src/implementor/edit-tools.js"
+    );
+    const src = `function add(a: number, b: number): number {
+  const r = a + b;
+  return r;
+}`;
+    const body = extractFunctionBody(src, "add");
+    expect(body).toContain("const r = a + b;");
+    expect(body).toContain("return r;");
+    expect(body).not.toContain("function add");
+    expect(body).not.toMatch(/^\s*\{/);
+  });
+
+  it("extracts the body of an export-wrapped function", async () => {
+    const { extractFunctionBody } = await import(
+      "../src/implementor/edit-tools.js"
+    );
+    const src = `export function add(a: number, b: number): number {
+  return a + b;
+}`;
+    expect(extractFunctionBody(src, "add")).toContain("return a + b;");
+  });
+
+  it("extracts the body of a method on a class", async () => {
+    const { extractMethodBody } = await import(
+      "../src/implementor/edit-tools.js"
+    );
+    const src = `class Counter {
+  inc(): number {
+    this.value += 1;
+    return this.value;
+  }
+  value = 0;
+}`;
+    const body = extractMethodBody(src, "Counter", "inc");
+    expect(body).toContain("this.value += 1;");
+    expect(body).toContain("return this.value;");
+    expect(body).not.toContain("inc(): number");
+  });
+
+  it("returns null when the function isn't present", async () => {
+    const { extractFunctionBody } = await import(
+      "../src/implementor/edit-tools.js"
+    );
+    expect(extractFunctionBody(`function bar() {}`, "missing")).toBeNull();
+  });
+
+  it("dedents bodies to the minimum leading whitespace", async () => {
+    const { extractFunctionBody } = await import(
+      "../src/implementor/edit-tools.js"
+    );
+    const src = `function f(): number {
+        const x = 1;
+        if (x > 0) {
+          return x;
+        }
+        return 0;
+      }`;
+    const body = extractFunctionBody(src, "f");
+    // First non-blank line had 8 leading spaces; after dedent it
+    // should start at column 0.
+    expect(body!.startsWith("const x = 1;")).toBe(true);
+    // Nested indentation (inside the if) is preserved relative to
+    // the outermost body — `return x;` was 10 spaces in, so 2
+    // spaces deeper than the rest after dedent.
+    expect(body).toContain("  return x;");
+  });
+});
+
 describe("edit-tools — post-splice validation", () => {
   it("rejects edits that produce a non-parseable result", () => {
     // New function source is valid in isolation but the splice

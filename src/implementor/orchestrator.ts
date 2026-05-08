@@ -76,6 +76,10 @@ export interface BuildInput {
   /** Per-leaf budget for test-rewrite remediations triggered by the
    *  `test_brittleness` diagnostic. Forwarded to implementLeaf. */
   maxTestRewrites?: number;
+  /** Switch the per-leaf body author to the §D.2 tool-using edit
+   *  author. Forwarded to implementLeaf. Default false; production
+   *  drivers (build-todomvc.ts, run-task.ts) opt in. */
+  useEditTools?: boolean;
 }
 
 export interface BuildResult {
@@ -179,6 +183,9 @@ export async function buildImplementations(
           : {}),
         ...(input.maxTestRewrites !== undefined
           ? { maxTestRewrites: input.maxTestRewrites }
+          : {}),
+        ...(input.useEditTools !== undefined
+          ? { useEditTools: input.useEditTools }
           : {}),
       });
       leafResults.push(result);
