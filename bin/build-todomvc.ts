@@ -166,6 +166,11 @@ async function main(): Promise<number> {
     maxAttemptsPerLeaf: 8,
     outDir,
     preserveHarness: true,
+    // 5-round MV diagnostic + auto test-rewrite (§5.3, Algorithm 4).
+    // Each leaf failure is classified; brittle tests are auto-fixed
+    // without consuming body-debug budget.
+    diagnosis: { enabled: true, rounds: 5, afterFailures: 0 },
+    maxTestRewrites: 20,
   });
   const failedLeaves = build.leafResults.filter((r) => !r.ok);
   log(

@@ -22,6 +22,11 @@ import type {
   RPG,
 } from "../rpg/types.js";
 import {
+  diagnoseFailure,
+  type FailureCategory,
+  type FailureDiagnosisResult,
+} from "../architect/diagnose-failure.js";
+import {
   BODY_AUTHOR_SYSTEM_PROMPT,
   TEST_AUTHOR_SYSTEM_PROMPT,
   buildBodyAuthorUserPrompt,
@@ -86,6 +91,34 @@ export interface LeafImplementInput {
    *  3. The body-author retry budget is separate (see
    *  `maxAttempts`). */
   maxTestAuthorAttempts?: number;
+  /** Failure-diagnosis configuration. When `enabled`, every body-
+   *  retry failure runs through a 5-round majority-vote LLM judge
+   *  (see RPG paper §5.3) that classifies the failure as
+   *  `implementation` / `test_brittleness` / `environment`. A
+   *  `test_brittleness` verdict triggers a test rewrite that
+   *  consumes from the separate `maxTestRewrites` budget; the body
+   *  retry continues against the new test. `environment` and
+   *  `implementation` verdicts both fall through to normal body
+   *  retry — env auto-fix is gated on the future stack/package.json
+   *  phase and not yet wired here.
+   *
+   *  Default: disabled, preserving the legacy "test contract is
+   *  immutable across body retries" behavior for unit tests. The
+   *  production drivers (build-todomvc, run-task) opt in. */
+  diagnosis?: {
+    enabled?: boolean;
+    /** Per-failure judge rounds; paper specifies 5. */
+    rounds?: number;
+    /** Skip diagnosis for the first N failures of each leaf — the
+     *  paper diagnoses every failure but in practice most early
+     *  failures are real implementation bugs. Default 0 (diagnose
+     *  every failure). */
+    afterFailures?: number;
+  };
+  /** Per-leaf budget for test-rewrite remediations triggered by a
+   *  `test_brittleness` diagnosis. Paper §5.3: "20 remediation
+   *  attempts for test or environment errors." Default 20. */
+  maxTestRewrites?: number;
 }
 
 export interface LeafImplementResult {
@@ -107,6 +140,19 @@ export interface LeafImplementResult {
    *  failure on the rendered file) prevented the loop from completing,
    *  the message is here. */
   fatal?: string;
+  /** Number of test-rewrite remediations the diagnostic triggered.
+   *  Distinct from `attempts` (which counts body-author retries).
+   *  Always 0 when diagnosis is disabled or no brittle test was
+   *  detected. */
+  testRewrites?: number;
+  /** Per-failure diagnosis trail for observability. One entry per
+   *  failure that triggered the diagnostic; entries appear in the
+   *  order they fired. */
+  diagnoses?: Array<{
+    attempt: number;
+    category: FailureCategory;
+    votes: FailureDiagnosisResult["votes"];
+  }>;
 }
 
 export async function implementLeaf(
@@ -200,6 +246,18 @@ export async function implementLeaf(
   let lastFailure: LeafTestOutcome | undefined;
   let lastFatal: string | undefined;
 
+  // Diagnosis + test-rewrite state. Per the RPG paper §5.3:
+  //   - 5-round MV diagnosis attributes each failure
+  //   - 20 remediation attempts for test/env errors (separate budget
+  //     from the 8 body-debug attempts)
+  const diagnosisEnabled = input.diagnosis?.enabled === true;
+  const diagnosisRounds = input.diagnosis?.rounds ?? 5;
+  const afterFailures = input.diagnosis?.afterFailures ?? 0;
+  const maxTestRewrites = input.maxTestRewrites ?? 20;
+  let testRewrites = 0;
+  let failuresSeen = 0;
+  const diagnoses: NonNullable<LeafImplementResult["diagnoses"]> = [];
+
   for (let i = 0; i < maxAttempts; i++) {
     attempts = i + 1;
     const renderedFile = renderTypeScriptFile({
@@ -292,7 +350,15 @@ export async function implementLeaf(
       continue;
     }
     if (outcome.ok) {
-      return { leafId, ok: true, body, testSource, attempts };
+      return {
+        leafId,
+        ok: true,
+        body,
+        testSource,
+        attempts,
+        testRewrites,
+        ...(diagnoses.length > 0 ? { diagnoses } : {}),
+      };
     }
     lastFailure = outcome;
     // When the per-leaf failure message is suite-level and stderr
@@ -304,6 +370,100 @@ export async function implementLeaf(
         failureMessage: `${outcome.failureMessage}\nstderr:\n${result.fatal}`,
       };
     }
+    failuresSeen++;
+
+    // 5-round MV failure diagnosis (RPG paper §5.3 + Algorithm 4
+    // step 5). Skips the first `afterFailures` failures to avoid
+    // burning judge calls before the body has had any retries; once
+    // engaged, runs once per subsequent failure.
+    if (diagnosisEnabled && failuresSeen > afterFailures) {
+      const diag = await diagnoseFailure(client, {
+        description: input.leaf.description,
+        failureMessage: lastFailure.failureMessage,
+        testSource,
+        bodySource: body,
+        rounds: diagnosisRounds,
+      });
+      diagnoses.push({
+        attempt: attempts,
+        category: diag.category,
+        votes: diag.votes,
+      });
+
+      if (
+        diag.category === "test_brittleness" &&
+        testRewrites < maxTestRewrites
+      ) {
+        // Auto-fix the test. The rewrite is a single test-author
+        // call seeded with the rewrite hint + the failure + the
+        // body source (the diagnostic vouches that the body is
+        // plausibly correct). Validation: the new source must
+        // parse as TS; otherwise we keep the prior test.
+        const rewritten = await reviseTestForBrittleness(
+          client,
+          {
+            originalUserPrompt: buildTestAuthorUserPrompt({
+              leaf: input.leaf,
+              hostFile: input.hostFile,
+              ownerClassName: input.leaf.ownerClassName ?? undefined,
+              renderedFile: renderTypeScriptFile({
+                file: input.hostFile,
+                bodyByLeafId: input.bodyByLeafId,
+                rpg: input.rpg,
+              }),
+              importSpecifier: testImportSpecifier(input.hostFile.path),
+            }),
+            priorTestSource: testSource,
+            failureMessage: lastFailure.failureMessage,
+            rewriteHint: diag.testRewriteHint ?? "(no hint provided)",
+            bodySource: body,
+          },
+          input.temperature,
+        );
+        if (rewritten.ok && rewritten.testSource) {
+          testSource = rewritten.testSource;
+          input.testsByLeafId.set(leafId, testSource);
+          testRewrites++;
+          // Re-run the SAME body against the rewritten test in this
+          // same iteration. If it now passes, we return success.
+          // If it still fails, the next loop iteration will retry
+          // the body — which now correctly sees the new (presumably
+          // less brittle) test.
+          const rerun = await runTests(input.rpg, {
+            bodyByLeafId: input.bodyByLeafId,
+            testsByLeafId: input.testsByLeafId,
+            leafIds: [leafId],
+            workDir: input.workDir,
+            ...(input.testTimeoutMs !== undefined
+              ? { timeoutMs: input.testTimeoutMs }
+              : {}),
+          });
+          const slug2 = leafToTestFilename(leafId).replace(".test.ts", "");
+          const outcome2 = rerun.byLeaf.get(slug2);
+          if (outcome2?.ok) {
+            return {
+              leafId,
+              ok: true,
+              body,
+              testSource,
+              attempts,
+              testRewrites,
+              ...(diagnoses.length > 0 ? { diagnoses } : {}),
+            };
+          }
+          if (outcome2) {
+            lastFailure = outcome2;
+          }
+        }
+        // If the rewrite failed to produce a parseable test, fall
+        // through to normal body retry — the body author still has
+        // budget and may bridge the gap.
+      }
+      // category === "environment": auto-fix is gated on the
+      // future stack/package.json phase. Until then, fall through
+      // to body retry as if classified `implementation`.
+      // category === "implementation": fall through normally.
+    }
   }
 
   return {
@@ -314,5 +474,78 @@ export async function implementLeaf(
     attempts,
     ...(lastFailure ? { lastFailure } : {}),
     ...(lastFatal ? { fatal: lastFatal } : {}),
+    testRewrites,
+    ...(diagnoses.length > 0 ? { diagnoses } : {}),
   };
+}
+
+/**
+ * Single-shot test rewrite triggered by a `test_brittleness`
+ * diagnosis. Reuses TEST_AUTHOR_SYSTEM_PROMPT and the original test
+ * author user prompt, then layers an assistant turn (the failing
+ * test) and a corrective user turn carrying the rewrite hint, the
+ * failure output, and the body source the diagnostic considered
+ * correct.
+ *
+ * Validates the new source as TypeScript (same gate the initial
+ * test author goes through). Returns ok: false if the model emits
+ * unparseable source — the caller falls back to the prior test.
+ */
+async function reviseTestForBrittleness(
+  client: LLMClient,
+  input: {
+    originalUserPrompt: string;
+    priorTestSource: string;
+    failureMessage: string;
+    rewriteHint: string;
+    bodySource: string;
+  },
+  temperature: number | undefined,
+): Promise<{ ok: boolean; testSource?: string; error?: string }> {
+  const trimmedFailure =
+    input.failureMessage.length > 2000
+      ? input.failureMessage.slice(0, 2000) + "\n... [truncated]"
+      : input.failureMessage;
+  const reviseTurn = `Your previous test was diagnosed as brittle by a 5-round majority-vote LLM judge. The body under test is plausibly correct under a reasonable reading of the leaf description; the test itself needs to be rewritten.
+
+Failure output:
+\`\`\`
+${trimmedFailure}
+\`\`\`
+
+Rewrite hint from the diagnostic:
+${input.rewriteHint}
+
+Body source the diagnostic considered correct:
+\`\`\`
+${input.bodySource}
+\`\`\`
+
+Rewrite the test so it correctly validates the body's intended behavior per the leaf description, fixing the brittleness. Output ONLY the corrected, complete vitest test file source — no prose, no fences.`;
+
+  try {
+    const response = await client.chat(
+      [
+        { role: "system", content: TEST_AUTHOR_SYSTEM_PROMPT },
+        { role: "user", content: input.originalUserPrompt },
+        { role: "assistant", content: input.priorTestSource },
+        { role: "user", content: reviseTurn },
+      ],
+      temperature !== undefined ? { temperature } : undefined,
+    );
+    const candidate = stripCodeFences(response.content);
+    if (candidate.length === 0) {
+      return { ok: false, error: "test reviser returned empty content" };
+    }
+    const parse = validateTypeScriptSource(candidate);
+    if (!parse.ok) {
+      return {
+        ok: false,
+        error: `test reviser produced unparseable TypeScript: ${parse.error}`,
+      };
+    }
+    return { ok: true, testSource: candidate };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
 }

@@ -65,6 +65,17 @@ export interface BuildInput {
    *  default is 120s — generous for small suites. Override here when
    *  you have leaves whose tests are expected to take longer. */
   perLeafTimeoutMs?: number;
+  /** Failure-diagnosis settings forwarded to every implementLeaf
+   *  call. See `LeafImplementInput.diagnosis`. The orchestrator
+   *  doesn't transform these — they pass through verbatim. */
+  diagnosis?: {
+    enabled?: boolean;
+    rounds?: number;
+    afterFailures?: number;
+  };
+  /** Per-leaf budget for test-rewrite remediations triggered by the
+   *  `test_brittleness` diagnostic. Forwarded to implementLeaf. */
+  maxTestRewrites?: number;
 }
 
 export interface BuildResult {
@@ -155,6 +166,12 @@ export async function buildImplementations(
           ? { testTimeoutMs: input.perLeafTimeoutMs }
           : {}),
         ...(approachHint !== undefined ? { approachHint } : {}),
+        ...(input.diagnosis !== undefined
+          ? { diagnosis: input.diagnosis }
+          : {}),
+        ...(input.maxTestRewrites !== undefined
+          ? { maxTestRewrites: input.maxTestRewrites }
+          : {}),
       });
       leafResults.push(result);
 

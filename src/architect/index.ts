@@ -89,3 +89,17 @@ export {
   renderRefactorPromptBody,
 } from "./refactor-prompts.js";
 export type { RefactorPromptInput } from "./refactor-prompts.js";
+
+// Failure diagnosis — 5-round majority-vote routing for test failures.
+export { diagnoseFailure } from "./diagnose-failure.js";
+export type {
+  FailureCategory,
+  FailureDiagnosisInput,
+  FailureDiagnosisResult,
+} from "./diagnose-failure.js";
+
+export {
+  FAILURE_DIAGNOSIS_SYSTEM_PROMPT,
+  buildFailureDiagnosisUserPrompt,
+} from "./diagnose-failure-prompts.js";
+export type { FailureDiagnosisPromptInput } from "./diagnose-failure-prompts.js";

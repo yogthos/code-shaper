@@ -255,6 +255,8 @@ async function run(args: ParsedArgs): Promise<number> {
     maxAttemptsPerLeaf: 8,
     outDir,
     preserveHarness: true,
+    diagnosis: { enabled: true, rounds: 5, afterFailures: 0 },
+    maxTestRewrites: 20,
   });
   const greenLeaves = build.leafResults.filter((r) => r.ok);
   const redLeaves = build.leafResults.filter((r) => !r.ok);
