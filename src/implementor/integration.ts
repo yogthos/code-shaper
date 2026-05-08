@@ -105,6 +105,12 @@ export interface IntegrationResult {
     culpritLeafId: NodeId;
     decision: "fresh_approach" | "decompose";
     reason: string;
+    /** When the harness tried to apply this recovery and the apply
+     *  step itself failed (sub-leaf body never satisfied its unit
+     *  tests, decompose introduced unbuildable sub-leaves, etc.).
+     *  The integration loop continues to the next round so blame
+     *  can pick a different culprit or decision. */
+    applyError?: string;
   }>;
   /** Branches that still have failing integration tests after the
    *  loop exhausts. Empty when ok=true. */
@@ -359,15 +365,25 @@ export async function runIntegrationTests(
         : {}),
     });
     if (!applyResult.ok) {
-      return {
-        ok: false,
-        testsByBranchId,
-        finalRun: lastRun,
-        recoveries,
-        failingBranchIds: stillFailing,
-        rounds,
-        error: `recovery apply failed: ${applyResult.error}`,
+      // Audit gap #15: the previous behavior was to abort the
+      // entire integration loop on the first apply failure,
+      // throwing away the remaining 19 rounds of recovery budget.
+      // A failed fresh_approach on culprit A should not prevent
+      // round N+1 from picking culprit B with a different
+      // decision.
+      //
+      // Record the failure on the recovery trail so callers can
+      // see it, but continue to the next round — the next blame
+      // call sees the still-failing branch with refreshed
+      // context (failure messages from the partial-apply state)
+      // and can pick a different culprit OR a different decision.
+      recoveries[recoveries.length - 1] = {
+        ...recoveries[recoveries.length - 1]!,
+        applyError: applyResult.error,
       };
+      // Branch status remains "failing" — drop into the next
+      // round naturally.
+      continue;
     }
   }
 

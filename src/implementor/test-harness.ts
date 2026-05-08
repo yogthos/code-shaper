@@ -388,8 +388,17 @@ function finalizeResult(
   result: TestRunResult,
 ): TestRunResult {
   const { stdout, stderr, exitCode, timedOut, timeoutMs } = proc;
+  // Audit gap #6: tail-truncate stderr for ALL failure paths.
+  // Compile errors, tsc/tsx parser diagnostics, dlopen failures
+  // (Cannot find module 'better-sqlite3.node') — all of these
+  // appear at the END of stderr; head-slicing showed the model 4 KB
+  // of vitest startup banner instead of the cause.
+  const stderrTail = (max: number): string => {
+    if (stderr.length <= max) return stderr;
+    return "...[truncated head]\n" + stderr.slice(stderr.length - max);
+  };
   if (timedOut) {
-    result.fatal = `vitest timed out after ${timeoutMs}ms (exit=${exitCode}). stderr (truncated):\n${stderr.slice(0, 2000)}`;
+    result.fatal = `vitest timed out after ${timeoutMs}ms (exit=${exitCode}). stderr:\n${stderrTail(2000)}`;
     return result;
   }
 
@@ -398,7 +407,13 @@ function finalizeResult(
   // matching closing brace.
   const jsonText = extractJsonObject(stdout);
   if (!jsonText) {
-    result.fatal = `vitest produced no parseable JSON (exit=${exitCode}). stderr:\n${stderr.slice(0, 4000)}`;
+    // Include both stdout (often has the runner's pre-JSON
+    // traceback) and stderr (compile errors). Audit gap #9.
+    const stdoutTail =
+      stdout.length > 2000
+        ? "...[truncated head]\n" + stdout.slice(stdout.length - 2000)
+        : stdout;
+    result.fatal = `vitest produced no parseable JSON (exit=${exitCode}).\nstdout:\n${stdoutTail}\nstderr:\n${stderrTail(4000)}`;
     return result;
   }
 
@@ -406,7 +421,7 @@ function finalizeResult(
   try {
     parsed = JSON.parse(jsonText);
   } catch (e) {
-    result.fatal = `JSON.parse failed: ${(e as Error).message}\nbody: ${jsonText.slice(0, 1000)}`;
+    result.fatal = `JSON.parse failed: ${(e as Error).message}\nbody (head):\n${jsonText.slice(0, 1000)}\nstderr:\n${stderrTail(2000)}`;
     return result;
   }
 
@@ -434,7 +449,17 @@ function finalizeResult(
           : null) ??
         tr.failureMessage ??
         "(no assertion details — likely a file-load or compile error)";
-      failureMessage = `[suite-level failure] ${suiteMsg}`;
+      // Audit gap #6: blend stderr into suite-level failures.
+      // When the suite fails to load (compile error, missing
+      // import, etc.), the JSON reporter has nothing useful in
+      // tr.message — but stderr usually carries the actual TS or
+      // node error. Without this the model gets only the canned
+      // "no assertion details" string and can't act.
+      const stderrSnippet =
+        stderr.trim().length > 0
+          ? `\nstderr:\n${stderrTail(2000)}`
+          : "";
+      failureMessage = `[suite-level failure] ${suiteMsg}${stderrSnippet}`;
     }
     if (!ok) allOk = false;
     const outcome: LeafTestOutcome = {
@@ -454,7 +479,14 @@ function finalizeResult(
 
   if (!result.ok && stderr.length > 0) {
     const trimmed = stderr.trim();
-    if (trimmed.length > 0) result.fatal = trimmed.slice(0, 4000);
+    if (trimmed.length > 0) {
+      // Tail-truncate: the actionable diagnostic is at the END of
+      // stderr. Audit gap #6.
+      result.fatal =
+        trimmed.length > 4000
+          ? "...[truncated head]\n" + trimmed.slice(trimmed.length - 4000)
+          : trimmed;
+    }
   }
   return result;
 }
