@@ -113,6 +113,13 @@ export async function buildImplementations(
 
   const bodyByLeafId = new Map<string, string>();
   const testsByLeafId = new Map<string, string>();
+  // Snapshot of the original test source for each leaf, populated
+  // by `implementLeaf` the first time the diagnostic rewrites a
+  // brittle test. Used by the recovery paths below to restore the
+  // original contract before re-implementing — without this, a
+  // rewrite would silently weaken the contract for every subsequent
+  // retry of the same leaf, hiding regressions on body changes.
+  const originalTestsByLeafId = new Map<string, string>();
   const leafResults: LeafImplementResult[] = [];
   const decomposeDecisions: BuildResult["decomposeDecisions"] = [];
 
@@ -157,6 +164,7 @@ export async function buildImplementations(
         rpg,
         bodyByLeafId,
         testsByLeafId,
+        originalTestsByLeafId,
         workDir,
         maxAttempts: input.maxAttemptsPerLeaf,
         ...(input.temperature !== undefined
@@ -232,6 +240,15 @@ export async function buildImplementations(
         // strategy, not the contract; re-authoring the test would
         // throw away assertions the architect didn't ask to change.
         bodyByLeafId.delete(leaf.leafCapabilityId);
+        // Restore the ORIGINAL test if a brittleness rewrite
+        // weakened it earlier. Otherwise the fresh-approach body
+        // would be measured against a contract that was tailored
+        // to the previous (failed) body, hiding bugs.
+        restoreOriginalTest(
+          leaf.leafCapabilityId,
+          testsByLeafId,
+          originalTestsByLeafId,
+        );
         queue.unshift({
           leaf,
           hostFile,
@@ -253,7 +270,15 @@ export async function buildImplementations(
       // Drop the original leaf's prior body — it will be rewritten as
       // an assembly that calls the new helpers. Tests stay in place;
       // the assembly satisfies the same contract by composition.
+      // Same as fresh_approach: restore the original test if it was
+      // rewritten under brittleness, since the assembly will be
+      // measured against the original contract.
       bodyByLeafId.delete(leaf.leafCapabilityId);
+      restoreOriginalTest(
+        leaf.leafCapabilityId,
+        testsByLeafId,
+        originalTestsByLeafId,
+      );
       queue.unshift({ leaf, hostFile });
       queue.unshift(...subLeaves);
     }
@@ -306,6 +331,27 @@ export async function buildImplementations(
 interface OrderedLeaf {
   leaf: PlannedInterface;
   hostFile: FileNode;
+}
+
+/**
+ * If the leaf's test was rewritten under brittleness diagnosis, put
+ * the original back. The recovery paths (fresh_approach, decompose)
+ * change the body strategy, so they need to measure new bodies
+ * against the original contract — not against a contract tailored
+ * to the body that just failed.
+ *
+ * No-op when the snapshot map is empty for this leaf (the common
+ * case — most leaves never trigger a rewrite).
+ */
+function restoreOriginalTest(
+  leafId: string,
+  testsByLeafId: Map<string, string>,
+  originalTestsByLeafId: Map<string, string>,
+): void {
+  const original = originalTestsByLeafId.get(leafId);
+  if (original !== undefined) {
+    testsByLeafId.set(leafId, original);
+  }
 }
 
 /** Pre-render every plan-bearing file's `content` from the architect's

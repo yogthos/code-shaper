@@ -70,6 +70,15 @@ export interface LeafImplementInput {
   /** Per-leaf test source map (used by the harness). Test authoring
    *  populates this for the current leaf if it isn't already set. */
   testsByLeafId: Map<string, string>;
+  /** Optional snapshot store for test sources that have been
+   *  rewritten in response to a `test_brittleness` diagnostic. The
+   *  ORIGINAL test (the one the body author was first held to) is
+   *  saved here on the first rewrite and never overwritten — the
+   *  orchestrator's recovery paths (fresh_approach / decompose) use
+   *  it to restore the original contract before retrying the body.
+   *  Without this, a brittleness rewrite would silently weaken the
+   *  contract for every subsequent retry of the same leaf. */
+  originalTestsByLeafId?: Map<string, string>;
   /** Shared harness directory. The orchestrator owns it; the leaf
    *  loop only reads. */
   workDir: string;
@@ -338,6 +347,13 @@ export async function implementLeaf(
       // before any test ran. Surface the harness's stderr so the
       // body author has something actionable; treat as a recoverable
       // failure so the retry loop continues.
+      //
+      // Important: count this as a failure for diagnostic-budget
+      // purposes. The diagnostic can correctly classify a failed-to-
+      // load test as `test_brittleness` (e.g., a typo in an import
+      // path) or `environment` (missing dep). Without incrementing
+      // `failuresSeen`, leaves with malformed tests would burn the
+      // entire body-debug budget without ever firing the diagnostic.
       lastFatal =
         result.fatal ?? `vitest reported no outcome for leaf ${leafId}`;
       lastFailure = {
@@ -347,6 +363,7 @@ export async function implementLeaf(
           "vitest produced no results for this leaf (likely a file-load or compile error)",
         testCount: 0,
       };
+      failuresSeen++;
       continue;
     }
     if (outcome.ok) {
@@ -376,7 +393,18 @@ export async function implementLeaf(
     // step 5). Skips the first `afterFailures` failures to avoid
     // burning judge calls before the body has had any retries; once
     // engaged, runs once per subsequent failure.
-    if (diagnosisEnabled && failuresSeen > afterFailures) {
+    //
+    // Also short-circuits once the test-rewrite budget is exhausted:
+    // if `testRewrites >= maxTestRewrites`, even a `test_brittleness`
+    // verdict can't be acted on, so running the 5-round judge would
+    // waste ~5 LLM calls per remaining failure for no behavior
+    // change. Two checks below — exhausted budget skips the
+    // diagnostic entirely.
+    if (
+      diagnosisEnabled &&
+      failuresSeen > afterFailures &&
+      testRewrites < maxTestRewrites
+    ) {
       const diag = await diagnoseFailure(client, {
         description: input.leaf.description,
         failureMessage: lastFailure.failureMessage,
@@ -394,6 +422,17 @@ export async function implementLeaf(
         diag.category === "test_brittleness" &&
         testRewrites < maxTestRewrites
       ) {
+        // Snapshot the original test BEFORE the first rewrite so
+        // the orchestrator's recovery paths can restore the
+        // original contract. Subsequent rewrites on the same leaf
+        // do NOT overwrite the snapshot — the original stays the
+        // canonical contract. Skip if no snapshot store was passed.
+        if (
+          input.originalTestsByLeafId &&
+          !input.originalTestsByLeafId.has(leafId)
+        ) {
+          input.originalTestsByLeafId.set(leafId, testSource);
+        }
         // Auto-fix the test. The rewrite is a single test-author
         // call seeded with the rewrite hint + the failure + the
         // body source (the diagnostic vouches that the body is

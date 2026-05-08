@@ -256,6 +256,144 @@ describe("add", () => { it("sums", () => { expect(add(2,3)).toBe(5); }); });
   );
 
   it(
+    "stops invoking the diagnostic once maxTestRewrites is exhausted (review fix #4)",
+    { timeout: 60_000 },
+    async () => {
+      const { rpg, hostFile } = buildAddFnRpg();
+      let diagCalls = 0;
+      let bodyCalls = 0;
+      const client: LLMClient = {
+        async chat(messages): Promise<LLMResponse> {
+          const sys = messages[0]!.content;
+          if (
+            sys.includes("producing a vitest test file") &&
+            messages.length === 2
+          ) {
+            return { content: BRITTLE_TEST, finishReason: "stop" };
+          }
+          if (
+            sys.includes("producing a vitest test file") &&
+            messages.length > 2
+          ) {
+            // Reviser keeps producing the same brittle test (so the
+            // re-run keeps failing). After maxTestRewrites=1 fires
+            // once and is consumed, no further diagnostic should
+            // run on subsequent failures.
+            return { content: BRITTLE_TEST, finishReason: "stop" };
+          }
+          if (sys.includes("Diagnostic agent")) {
+            diagCalls++;
+            return {
+              content: JSON.stringify({
+                category: "test_brittleness",
+                reasoning: "x",
+                testRewriteHint: "y",
+              }),
+              finishReason: "stop",
+            };
+          }
+          if (sys.includes("producing the body of a single")) {
+            bodyCalls++;
+            return { content: "return a + b;", finishReason: "stop" };
+          }
+          return { content: "", finishReason: "stop" };
+        },
+        async listModels() {
+          return ["mock"];
+        },
+      };
+
+      const result = await implementLeaf(client, {
+        leaf: hostFile.interfacePlan!.entries[0]!,
+        hostFile,
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        workDir,
+        maxAttempts: 3,
+        diagnosis: { enabled: true, rounds: 5, afterFailures: 0 },
+        maxTestRewrites: 1,
+      });
+
+      expect(result.ok).toBe(false);
+      // First failure → diagnostic (5 rounds) → rewrite #1 (still brittle).
+      // Second failure → no diagnostic (budget exhausted).
+      // Third failure → no diagnostic.
+      // Total diagnostic rounds: exactly 5 (one diagnose-and-act
+      // event), not 15 (one per failure).
+      expect(diagCalls).toBe(5);
+      expect(bodyCalls).toBe(3);
+      expect(result.testRewrites).toBe(1);
+    },
+  );
+
+  it(
+    "snapshots the original test before the first rewrite (review fix #3)",
+    { timeout: 60_000 },
+    async () => {
+      const { rpg, hostFile } = buildAddFnRpg();
+      const client: LLMClient = {
+        async chat(messages): Promise<LLMResponse> {
+          const sys = messages[0]!.content;
+          if (
+            sys.includes("producing a vitest test file") &&
+            messages.length === 2
+          ) {
+            return { content: BRITTLE_TEST, finishReason: "stop" };
+          }
+          if (
+            sys.includes("producing a vitest test file") &&
+            messages.length > 2
+          ) {
+            return { content: FIXED_TEST, finishReason: "stop" };
+          }
+          if (sys.includes("Diagnostic agent")) {
+            return {
+              content: JSON.stringify({
+                category: "test_brittleness",
+                reasoning: "x",
+                testRewriteHint: "y",
+              }),
+              finishReason: "stop",
+            };
+          }
+          if (sys.includes("producing the body of a single")) {
+            return { content: "return a + b;", finishReason: "stop" };
+          }
+          return { content: "", finishReason: "stop" };
+        },
+        async listModels() {
+          return ["mock"];
+        },
+      };
+
+      const originalTestsByLeafId = new Map<string, string>();
+      const result = await implementLeaf(client, {
+        leaf: hostFile.interfacePlan!.entries[0]!,
+        hostFile,
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        originalTestsByLeafId,
+        workDir,
+        maxAttempts: 3,
+        diagnosis: { enabled: true, rounds: 5, afterFailures: 0 },
+      });
+
+      expect(result.ok).toBe(true);
+      // Snapshot map carries the ORIGINAL brittle test that was the
+      // contract before the rewrite. Recovery paths in the
+      // orchestrator use this to restore the original contract.
+      const leafId = hostFile.interfacePlan!.entries[0]!.leafCapabilityId;
+      expect(originalTestsByLeafId.has(leafId)).toBe(true);
+      // The snapshot should be the ORIGINAL pre-rewrite test, not the
+      // FIXED_TEST we ended up running.
+      expect(originalTestsByLeafId.get(leafId)).toBe(BRITTLE_TEST.trim());
+      expect(originalTestsByLeafId.get(leafId)).not.toBe(FIXED_TEST.trim());
+    },
+  );
+
+  it(
     "keeps the prior test when the reviser emits unparseable source",
     { timeout: 60_000 },
     async () => {

@@ -107,19 +107,27 @@ export async function diagnoseFailure(
   }
   const fulfilled = reasoning.length;
 
-  // Tiebreak: prefer implementation. Order in `categories` matters.
-  const categories: FailureCategory[] = [
-    "implementation",
-    "test_brittleness",
-    "environment",
-  ];
+  // Conservative attribution: a non-implementation verdict requires
+  // STRICT majority over implementation+environment combined (for
+  // test_brittleness) or implementation+test_brittleness combined
+  // (for environment). Plurality alone isn't enough.
+  //
+  // Why: relaxing a test contract (test_brittleness path) or
+  // mutating the environment (environment path) actively HIDES
+  // implementation bugs that future rounds might have caught.
+  // Plurality lets a 2-2-1 split route to brittleness even though
+  // half the judges thought the body was wrong. Strict majority
+  // ensures the rewrite path only fires when the rounds clearly
+  // agree the test (or env) is the cause.
   let winner: FailureCategory = "implementation";
-  let best = -1;
-  for (const c of categories) {
-    if (votes[c] > best) {
-      best = votes[c];
-      winner = c;
-    }
+  if (
+    votes.test_brittleness > votes.implementation + votes.environment
+  ) {
+    winner = "test_brittleness";
+  } else if (
+    votes.environment > votes.implementation + votes.test_brittleness
+  ) {
+    winner = "environment";
   }
 
   // If no rounds parsed, default to implementation — the safe

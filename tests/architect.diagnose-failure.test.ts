@@ -71,7 +71,7 @@ describe("diagnoseFailure — vote tallying", () => {
     expect(r.fulfilledRounds).toBe(5);
   });
 
-  it("breaks ties in favor of implementation", async () => {
+  it("breaks ties in favor of implementation (plurality alone insufficient)", async () => {
     const responses = [
       json({ category: "test_brittleness", reasoning: "x", testRewriteHint: "y" }),
       json({ category: "test_brittleness", reasoning: "x", testRewriteHint: "y" }),
@@ -81,7 +81,60 @@ describe("diagnoseFailure — vote tallying", () => {
     ];
     const { client } = mockClient((i) => responses[i]!);
     const r = await diagnoseFailure(client, sampleInput);
-    // 2 vs 2 vs 1 — implementation wins by tiebreak.
+    // 2 brittleness vs 2 impl vs 1 env. The strict-majority rule
+    // requires brittleness > impl + env (i.e., 2 > 3) which is
+    // false; brittleness loses. Falls back to implementation.
+    expect(r.category).toBe("implementation");
+  });
+
+  it("requires strict majority over the conservative default to choose test_brittleness", async () => {
+    // 3 brittleness, 1 impl, 1 env: 3 > 1+1 = 2, so brittleness wins.
+    const responses = [
+      json({
+        category: "test_brittleness",
+        reasoning: "x",
+        testRewriteHint: "use toEqual",
+      }),
+      json({
+        category: "test_brittleness",
+        reasoning: "x",
+        testRewriteHint: "use toEqual",
+      }),
+      json({
+        category: "test_brittleness",
+        reasoning: "x",
+        testRewriteHint: "use toEqual",
+      }),
+      json({ category: "implementation", reasoning: "x" }),
+      json({ category: "environment", reasoning: "x", envPatchHint: "y" }),
+    ];
+    const { client } = mockClient((i) => responses[i]!);
+    const r = await diagnoseFailure(client, sampleInput);
+    expect(r.category).toBe("test_brittleness");
+  });
+
+  it("does NOT pick test_brittleness on plurality alone (2-1-2 split)", async () => {
+    // 2 brittleness, 1 impl, 2 env. Brittleness has plurality (tied
+    // with env) but 2 is not > 1+2 = 3, so brittleness loses. Env
+    // similarly not > 2+1 = 3, so env loses. Both fail strict-
+    // majority test → conservative default fires.
+    const responses = [
+      json({
+        category: "test_brittleness",
+        reasoning: "x",
+        testRewriteHint: "y",
+      }),
+      json({
+        category: "test_brittleness",
+        reasoning: "x",
+        testRewriteHint: "y",
+      }),
+      json({ category: "implementation", reasoning: "x" }),
+      json({ category: "environment", reasoning: "x", envPatchHint: "y" }),
+      json({ category: "environment", reasoning: "x", envPatchHint: "y" }),
+    ];
+    const { client } = mockClient((i) => responses[i]!);
+    const r = await diagnoseFailure(client, sampleInput);
     expect(r.category).toBe("implementation");
   });
 
