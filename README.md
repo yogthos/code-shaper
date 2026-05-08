@@ -9,30 +9,30 @@ Currently TypeScript-target only; the language-adapter layer is pluggable.
 Given a project description (greenfield or existing repo), the harness runs a fixed pipeline that produces working TypeScript with passing tests:
 
 ```
-Phase 3 — Proposal              capability tree (what to build)
+1 — Proposal              capability tree (what to build)
    ↓
-Phase 4 — File structure        folders + files (where it lives)
+2 — File structure        folders + files (where it lives)
    ↓
-Phase 5 — Interfaces            signatures + dataflow (what each leaf does)
+3 — Interfaces            signatures + dataflow (what each leaf does)
    ↓
-Refactor pass                   conservative restructuring (extract base class,
-                                extract utility, split, merge, rename, move)
+4 — Refactor              conservative restructuring (extract base class,
+                          extract utility, split, merge, rename, move)
    ↓
-Phase 6 — Implementor           per-leaf TDD: tests authored, body authored,
-                                vitest run, retry with prior failure as feedback;
-                                topological build by dataflow + extends
+5 — Implementor           per-leaf TDD: tests authored, body authored,
+                          vitest run, retry with prior failure as feedback;
+                          topological build by dataflow + extends
    ↓
-Phase 7a — Decompose recovery   when a leaf gets stuck: architect picks
-                                `decompose` (split into single-responsibility
-                                sub-leaves) or `fresh_approach` (different
-                                strategy, same contract). Bounded by
-                                MAX_DECOMPOSE_DEPTH=5
+6 — Decompose recovery    when a leaf gets stuck: architect picks
+                          `decompose` (split into single-responsibility
+                          sub-leaves) or `fresh_approach` (different
+                          strategy, same contract). Bounded by
+                          MAX_DECOMPOSE_DEPTH=5
    ↓
-Phase 7b — Integration tests    branch-level tests across multiple leaves;
-                                failures route through architect blame
-                                attribution → fresh_approach / decompose
-                                recovery on the named leaf. Bounded by
-                                MAX_INTEGRATION_ROUNDS=5
+7 — Integration tests     branch-level tests across multiple leaves;
+                          failures route through architect blame
+                          attribution → fresh_approach / decompose
+                          recovery on the named leaf. Bounded by
+                          MAX_INTEGRATION_ROUNDS=5
 ```
 
 Every phase mutates an in-memory **Repository Planning Graph** (RPG): folders, files, classes, functions, methods, plus capability-level metadata, data-flow edges, and inheritance edges. Files on disk are an output of `materializeRPG`; the graph is the source of truth. AST extraction is via `tree-sitter`, edits operate on byte-precise ranges, and cross-file imports are resolved on every mutation.
@@ -95,14 +95,14 @@ await encodeFileStructure(client, rpg, { description });
 await designInterfaces(client, rpg, { description });
 await runRefactorPass(client, rpg, { description });
 
-// Phase 6 — per-leaf TDD with topological build
+// Phase 5 — per-leaf TDD with topological build
 const build = await buildImplementations(client, rpg, {
   outDir: "./out",
   preserveHarness: true,
 });
 
 if (build.ok && build.workDir) {
-  // Phase 7b — branch-level integration tests
+  // Phase 7 — branch-level integration tests
   const bodyByLeafId = new Map<string, string>();
   const testsByLeafId = new Map<string, string>();
   for (const lr of build.leafResults) {
@@ -129,14 +129,14 @@ Architect mutations all flow through a shared vocabulary in `src/architect/opera
 
 | Op | Use |
 | --- | --- |
-| `create_folder` / `create_file` | Phase 4 + extend mode |
-| `move_file` (subsumes rename) | Refactor — updates every importer's specifier |
-| `delete_file` | Refactor — refuses if anyone still imports the file |
-| `split_file` | Refactor — partition members; class methods can't span destinations |
-| `merge_files` | Refactor — concatenate plans, redirect imports |
-| `extract_base_class` | Refactor — lift recurring class methods, set `extendsName` + `extendsFromFile` cross-file |
-| `extract_utility` | Refactor — move recurring helper functions to a shared file |
-| `set_interface_plan` / `set_data_flow` | Phase 5 + refactor |
+| `create_folder` / `create_file` | Phase 2 + extend mode |
+| `move_file` (subsumes rename) | Phase 4 — updates every importer's specifier |
+| `delete_file` | Phase 4 — refuses if anyone still imports the file |
+| `split_file` | Phase 4 — partition members; class methods can't span destinations |
+| `merge_files` | Phase 4 — concatenate plans, redirect imports |
+| `extract_base_class` | Phase 4 — lift recurring class methods, set `extendsName` + `extendsFromFile` cross-file |
+| `extract_utility` | Phase 4 — move recurring helper functions to a shared file |
+| `set_interface_plan` / `set_data_flow` | Phase 3 + Phase 4 |
 
 Every op is idempotent where it can be (re-creating an existing folder is a no-op), surfaces typed conflicts loudly (deleting a file that's still imported, splitting a file across overlapping member partitions), and re-runs `resolveImportEdges` + `resolveInheritEdges` on every successful mutation so cross-file edges stay consistent.
 
@@ -144,12 +144,12 @@ Every op is idempotent where it can be (re-creating an existing folder is a no-o
 
 The user-facing principle is **no broken code in the build**. When a leaf can't be implemented, the orchestrator routes through architect-driven recovery:
 
-1. **Body retry within Phase 6** — failure assertion fed back to the body author, up to `maxAttemptsPerLeaf`.
-2. **Phase 7a decompose recovery** — when the per-leaf retry budget exhausts:
+1. **Body retry within Phase 5** — failure assertion fed back to the body author, up to `maxAttemptsPerLeaf`.
+2. **Phase 6 decompose recovery** — when the per-leaf retry budget exhausts:
    - **`decompose`**: architect splits into 2–5 single-responsibility sub-leaves; each implements first; original leaf becomes an assembly composing them.
    - **`fresh_approach`**: architect identifies the leaf is doing one thing but the strategy is wrong; supplies a hint that's spliced into the next body-author prompt.
    - Bounded by `MAX_DECOMPOSE_DEPTH = 5`. At depth = MAX-1 the validator forces `fresh_approach`.
-3. **Phase 7b integration recovery** — when a branch-level integration test fails:
+3. **Phase 7 integration recovery** — when a branch-level integration test fails:
    - Architect picks a single culprit leaf via blame attribution.
    - Routes through the same `fresh_approach` / `decompose` vocabulary.
    - Bounded by `MAX_INTEGRATION_ROUNDS = 5`.
@@ -164,14 +164,14 @@ This mattered: in the live e2e run (`npm test`) GLM hit at least one test-author
 
 ## Existing-project support
 
-`loadRepo(rootDir)` parses an existing repo into an RPG (folders, files, classes, functions, methods, imports, exports, inheritance). Phase 3+4+5 in `mode: "extend"` accept this RPG and:
+`loadRepo(rootDir)` parses an existing repo into an RPG (folders, files, classes, functions, methods, imports, exports, inheritance). Phases 1–3 in `mode: "extend"` accept this RPG and:
 
 - Render existing structure into the architect prompts so it integrates with what's there
-- Skip already-implemented leaves in Phase 5
+- Skip already-implemented leaves in Phase 3
 - Reuse existing folders for new capabilities when names align
 - Add new files only when capabilities don't fit in existing ones
 
-The refactor pass can additionally rename, move, split, merge, or extract helpers across existing files. Imports are rewritten on every move so the repo stays compilable.
+Phase 4 (refactor) can additionally rename, move, split, merge, or extract helpers across existing files. Imports are rewritten on every move so the repo stays compilable.
 
 ## Constraints + known limitations
 

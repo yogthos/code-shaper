@@ -44,8 +44,12 @@ export interface BuildInput {
   maxAttemptsPerLeaf?: number;
   /** Optional LLM temperature override for both author calls. */
   temperature?: number;
-  /** When set, the orchestrator writes the final rendered repo to
-   *  this directory after the build finishes (success or partial). */
+  /** When set, the orchestrator writes the rendered repo to this
+   *  directory **incrementally** — once before the leaf-loop starts
+   *  (so empty files appear with the planned structure), then after
+   *  every successful leaf so the on-disk source tracks live progress.
+   *  A final materialize at the end captures the cross-file rendered
+   *  state. */
   outDir?: string;
   /** When true, leaves the harness work directory in place after the
    *  run for debugging. Defaults to false. */
@@ -102,6 +106,16 @@ export async function buildImplementations(
   const decomposeDecisions: BuildResult["decomposeDecisions"] = [];
 
   try {
+    // Pre-leaf materialize: write the planned folder/file skeleton
+    // to disk before any leaf has implemented. New files get rendered
+    // with throwing stubs, so the user can `tree demo/` and see the
+    // shape immediately. Subsequent per-leaf materializes overwrite
+    // bodies as they land.
+    if (input.outDir) {
+      renderPlannedFiles(rpg, bodyByLeafId);
+      await materializeRPG(rpg, input.outDir);
+    }
+
     // Work queue. Decompose-recovery prepends sub-leaves AND re-queues
     // the original leaf so it implements after its children. Each
     // entry tracks an `attemptCount` so we don't re-run a leaf
@@ -143,6 +157,28 @@ export async function buildImplementations(
         ...(approachHint !== undefined ? { approachHint } : {}),
       });
       leafResults.push(result);
+
+      // After every leaf attempt — successful or not — re-render the
+      // affected file and persist to disk if the caller is watching
+      // an outDir. The user can tail the tree as code lands.
+      //
+      // Why we don't free `hostFile.content` after the write:
+      //   `materializeRPG` writes `node.content` for EVERY file in
+      //   the graph, not just the one we just touched. If we cleared
+      //   the just-rendered file's content, the next leaf's
+      //   materialize (running in a different file) would see this
+      //   one as empty and clobber it on disk. Keeping the rendered
+      //   string cached scales fine — it's at most one rendered file
+      //   per node, and rendered TS for a typical leaf-heavy file
+      //   stays in the kilobytes.
+      if (input.outDir) {
+        hostFile.content = renderTypeScriptFile({
+          file: hostFile,
+          bodyByLeafId,
+          rpg,
+        });
+        await materializeRPG(rpg, input.outDir);
+      }
 
       if (result.ok) continue;
 
@@ -253,6 +289,29 @@ export async function buildImplementations(
 interface OrderedLeaf {
   leaf: PlannedInterface;
   hostFile: FileNode;
+}
+
+/** Pre-render every plan-bearing file's `content` from the architect's
+ *  interfacePlan + whatever bodies exist in `bodyByLeafId` so that a
+ *  subsequent `materializeRPG` call writes a coherent skeleton (with
+ *  throwing stubs for unimplemented leaves) rather than the
+ *  empty-string placeholders Phase 2 left behind.
+ *
+ *  Exported so build-script drivers can materialize incrementally
+ *  between architect phases — call this, then `materializeRPG`. */
+export function renderPlannedFiles(
+  rpg: RPG,
+  bodyByLeafId: Map<string, string> = new Map(),
+): void {
+  for (const node of Object.values(rpg.nodes)) {
+    if (!isFile(node)) continue;
+    if (!node.interfacePlan) continue;
+    node.content = renderTypeScriptFile({
+      file: node,
+      bodyByLeafId,
+      rpg,
+    });
+  }
 }
 
 /** Decompose-recovery: when implementLeaf returns failure, pull the

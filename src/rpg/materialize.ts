@@ -8,11 +8,18 @@
  *
  * The Phase 2 AST tools will rewrite `FileNode.content` in place when
  * they edit AST nodes, so persistence stays a flat dump.
+ *
+ * Failure semantics: NOT transactional. If a `safeResolve` rejects a
+ * malicious path mid-walk, files written before that point stay on
+ * disk. They correspond to legitimate graph nodes, so leaving them is
+ * the right call — but readers should know the function isn't
+ * all-or-nothing if it throws.
  */
 
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { safeResolve } from "./safe-path.js";
 import { isFile, isFolder, walk, type RPG } from "./types.js";
 
 export interface MaterializeReport {
@@ -33,11 +40,13 @@ export async function materializeRPG(
   for (const node of walk(rpg)) {
     if (isFolder(node)) {
       if (node.path === "") continue; // root already exists
-      const dir = path.join(absRoot, node.path);
+      // Sandbox guard: a malicious or buggy graph cannot make us
+      // mkdir/write outside the project root.
+      const dir = safeResolve(absRoot, node.path);
       await mkdir(dir, { recursive: true });
       folders.push(node.path);
     } else if (isFile(node)) {
-      const dest = path.join(absRoot, node.path);
+      const dest = safeResolve(absRoot, node.path);
       await mkdir(path.dirname(dest), { recursive: true });
       await writeFile(dest, node.content, "utf-8");
       files.push(node.path);

@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { isFile, type RPG } from "../rpg/types.js";
+import { safeResolve } from "../rpg/safe-path.js";
 import { renderTypeScriptFile } from "./render.js";
 
 export interface TestRunOptions {
@@ -202,10 +203,11 @@ async function materializeForRun(
   testsByLeafId: Map<string, string>,
   integrationTestsByBranchId: Map<string, string> | undefined,
 ): Promise<void> {
-  // Source files: render the in-progress RPG.
+  // Source files: render the in-progress RPG. Same sandbox guard as
+  // materializeRPG — refuse to write outside the harness work dir.
   for (const node of Object.values(rpg.nodes)) {
     if (!isFile(node)) continue;
-    const dest = path.join(workDir, node.path);
+    const dest = safeResolve(workDir, node.path);
     await mkdir(path.dirname(dest), { recursive: true });
     const source = node.interfacePlan
       ? renderTypeScriptFile({ file: node, bodyByLeafId, rpg })
@@ -236,7 +238,13 @@ async function materializeForRun(
 }
 
 /** Wipe `dir` and rewrite the supplied test files. Idempotent: if
- *  `entries` is empty, the directory ends up empty too. */
+ *  `entries` is empty, the directory ends up empty too.
+ *
+ *  Filenames are sanitized upstream by `leafToTestFilename` /
+ *  `branchToTestFilename` (alphanumerics + `_` + `-` only), so the
+ *  `path.join(dir, filename)` writes are safe by construction. The
+ *  `safeResolve(dir, filename)` here is defense-in-depth in case a
+ *  future caller forgets to sanitize. */
 async function replaceTestDir(
   dir: string,
   entries: Array<{ filename: string; source: string }>,
@@ -244,7 +252,8 @@ async function replaceTestDir(
   await rm(dir, { recursive: true, force: true });
   await mkdir(dir, { recursive: true });
   for (const { filename, source } of entries) {
-    await writeFile(path.join(dir, filename), source, "utf-8");
+    const dest = safeResolve(dir, filename);
+    await writeFile(dest, source, "utf-8");
   }
 }
 

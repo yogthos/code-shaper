@@ -32,7 +32,7 @@ export type {
 export { implementLeaf } from "./leaf.js";
 export type { LeafImplementInput, LeafImplementResult } from "./leaf.js";
 
-export { buildImplementations } from "./orchestrator.js";
+export { buildImplementations, renderPlannedFiles } from "./orchestrator.js";
 export type { BuildInput, BuildResult } from "./orchestrator.js";
 
 export {

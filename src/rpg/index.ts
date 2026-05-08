@@ -7,6 +7,11 @@ import "./adapters/index.js";
 
 export * from "./types.js";
 export { loadRepo } from "./load.js";
+export {
+  safeResolve,
+  isSafePath,
+  PathEscapeError,
+} from "./safe-path.js";
 export type { LoadOptions } from "./load.js";
 export { materializeRPG } from "./materialize.js";
 export type { MaterializeReport } from "./materialize.js";
