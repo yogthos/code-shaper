@@ -250,10 +250,18 @@ export function getInterfaceContent(
       for (const mid of node.children) {
         const method = rpg.nodes[mid];
         if (method && isMethod(method) && method.name === methodName) {
+          const src = extractFromContent(file, method);
+          // Review fix #7: empty extraction is treated as
+          // not_found. Otherwise callers get kind:"method"
+          // with source:"" and no signal that the lookup
+          // actually failed.
+          if (!src) {
+            return { spec, kind: "not_found", source: "", filePath };
+          }
           return {
             spec,
             kind: "method",
-            source: extractFromContent(file, method),
+            source: src,
             filePath,
             features: featuresForName(file, methodName, classOrFn),
           };
@@ -268,19 +276,27 @@ export function getInterfaceContent(
     const node = rpg.nodes[id];
     if (!node) continue;
     if (isFunction(node) && node.name === classOrFn) {
+      const src = extractFromContent(file, node);
+      if (!src) {
+        return { spec, kind: "not_found", source: "", filePath };
+      }
       return {
         spec,
         kind: "function",
-        source: extractFromContent(file, node),
+        source: src,
         filePath,
         features: featuresForName(file, classOrFn, null),
       };
     }
     if (isClass(node) && node.name === classOrFn) {
+      const src = extractFromContent(file, node);
+      if (!src) {
+        return { spec, kind: "not_found", source: "", filePath };
+      }
       return {
         spec,
         kind: "class",
-        source: extractFromContent(file, node),
+        source: src,
         filePath,
         features: featuresForName(file, classOrFn, null),
       };
@@ -438,14 +454,24 @@ interface ParsedFqn {
   methodName: string | null;
 }
 
+/**
+ * Parse a fully qualified spec like "src/foo.ts:bar" or
+ * "src/foo.ts:Bar.baz". The split point is the LAST colon (so file
+ * paths can't contain colons — POSIX repo-relative paths can't, so
+ * this is fine for our targets). The entity then splits on the
+ * LAST dot — review fix #2: a class/function with multiple dots
+ * (e.g. "Bar.Baz.qux") is parsed as `class Bar.Baz` + `method qux`,
+ * which matches what writers actually mean by a fully qualified
+ * name. The previous first-dot split mistakenly mapped
+ * "obj.inner.fn" to `obj` + `inner.fn`.
+ */
 function parseFqn(spec: string): ParsedFqn | null {
-  // "src/foo.ts:Bar.baz" or "src/foo.ts:bar"
   const colon = spec.lastIndexOf(":");
   if (colon < 0) return null;
   const filePath = spec.slice(0, colon).trim();
   const entity = spec.slice(colon + 1).trim();
   if (!filePath || !entity) return null;
-  const dot = entity.indexOf(".");
+  const dot = entity.lastIndexOf(".");
   if (dot < 0) {
     return { filePath, classOrFn: entity, methodName: null };
   }
@@ -462,15 +488,31 @@ function findCapabilityByPath(
 ): CapabilityNode | null {
   // Path segments separated by "/". Each segment matches a capability
   // name at the corresponding depth (case-sensitive). The walk starts
-  // from any top-level capability whose name matches the first segment.
+  // from a TOP-LEVEL capability whose name matches the first segment.
+  // Review fix #10: we previously matched any capability anywhere in
+  // the graph; if "Mutations" appeared under multiple parents the
+  // walker matched the first by Object.values order — non-deterministic.
   const parts = featurePath
     .split("/")
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
   if (parts.length === 0) return null;
 
-  const allCaps = Object.values(rpg.nodes).filter(isCapability);
-  for (const cap of allCaps) {
+  // Top-level capabilities = direct children of the root folder, OR
+  // capabilities whose parent isn't itself a capability (some RPGs
+  // attach top-level caps directly under a non-root grouping).
+  const topLevelCaps = Object.values(rpg.nodes).filter(
+    (n): n is CapabilityNode => {
+      if (!isCapability(n)) return false;
+      // parent is NodeId | null; null means top-level under the
+      // root folder. A capability whose parent is non-capability
+      // (folder/file) is also "top-level" in the capability tree.
+      if (n.parent === null) return true;
+      const parent = rpg.nodes[n.parent];
+      return !parent || !isCapability(parent);
+    },
+  );
+  for (const cap of topLevelCaps) {
     if (cap.name !== parts[0]) continue;
     let cursor: CapabilityNode | null = cap;
     let matched = true;
@@ -584,21 +626,62 @@ function extractFromContent(
   return file.content.slice(start, end);
 }
 
+/** Common English words we skip so they don't dominate score. */
+const STOPLIST = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "from",
+  "into",
+  "this",
+  "that",
+  "into",
+  "but",
+  "not",
+  "are",
+  "was",
+  "use",
+  "uses",
+  "used",
+]);
+
+/**
+ * Tokenize for fuzzy search. Splits on non-alphanumerics (so
+ * "user_name" → "user","name") AND on camelCase boundaries (so
+ * "addTodo" → "add","todo"). Without the camelCase split the
+ * search misses every AST-extracted hit by name only — review
+ * fix #13.
+ */
 function tokenize(s: string): string[] {
-  return s
+  // First split camelCase: insert spaces between lower→upper and
+  // between letter→digit. Then lowercase + split on non-alnum.
+  const normalized = s
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+  return normalized
     .toLowerCase()
     .split(/[^a-z0-9]+/)
-    .filter((t) => t.length > 1);
+    .filter((t) => t.length > 1 && !STOPLIST.has(t));
 }
 
+/**
+ * Length-normalized overlap: hits / sqrt(haystack token count).
+ * Review fix #5: pure overlap let long descriptions dominate the
+ * ranking purely by surface area. Square-root denominator reins in
+ * runaway descriptions without over-penalizing short names.
+ */
 function scoreOverlap(haystack: string, queryTokens: Set<string>): number {
   if (queryTokens.size === 0) return 0;
-  const tokens = new Set(tokenize(haystack));
+  const tokens = tokenize(haystack);
+  if (tokens.length === 0) return 0;
+  const tokenSet = new Set(tokens);
   let hits = 0;
   for (const q of queryTokens) {
-    if (tokens.has(q)) hits++;
+    if (tokenSet.has(q)) hits++;
   }
-  return hits;
+  if (hits === 0) return 0;
+  return hits / Math.sqrt(tokens.length);
 }
 
 // Re-export RPGNode so callers don't need a second import for type

@@ -330,9 +330,13 @@ describe("searchInterfaceByFunctionality", () => {
     const { rpg } = buildPlannedRpg();
     const r = searchInterfaceByFunctionality(rpg, ["unique", "id"]);
     expect(r.hits.length).toBeGreaterThan(0);
-    // makeId's description "Mint a new unique id." matches both "unique" and "id".
+    // makeId's description "Mint a new unique id." matches both
+    // "unique" and "id" (camelCase tokenization on `makeId` adds
+    // "make"/"id" to the haystack tokens too).
     expect(r.hits[0]!.name).toBe("makeId");
-    expect(r.hits[0]!.score).toBeGreaterThanOrEqual(2);
+    // Score is now length-normalized (review fix #5): hits / sqrt(tokens).
+    // We just need it positive and beating the lower-ranked entries.
+    expect(r.hits[0]!.score).toBeGreaterThan(0);
   });
 
   it("returns at most topK results", () => {

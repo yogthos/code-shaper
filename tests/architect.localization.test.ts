@@ -362,6 +362,168 @@ describe("localize — terminal failures", () => {
   });
 });
 
+describe("localize — review fixes (multi-call rejection, prefix strictness)", () => {
+  it("rejects multi-tool-call turns with one tool message per call_id (#6)", async () => {
+    let i = 0;
+    const client: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        i++;
+        if (i === 1) {
+          // Two calls in one turn — must be rejected; the loop
+          // sends a tool_error per call_id and lets the model retry.
+          return {
+            content: "",
+            finishReason: "tool_calls",
+            toolCalls: [
+              {
+                id: "c1",
+                type: "function",
+                function: {
+                  name: "search_interface_by_functionality",
+                  arguments: JSON.stringify({ keywords: ["a"] }),
+                },
+              },
+              {
+                id: "c2",
+                type: "function",
+                function: {
+                  name: "search_interface_by_functionality",
+                  arguments: JSON.stringify({ keywords: ["b"] }),
+                },
+              },
+            ],
+          };
+        }
+        // Retry: single Terminate.
+        return {
+          content: "",
+          finishReason: "tool_calls",
+          toolCalls: [
+            {
+              id: "c3",
+              type: "function",
+              function: {
+                name: "Terminate",
+                arguments: JSON.stringify({
+                  result: [
+                    {
+                      file_path: "src/store.ts",
+                      interface: "method: TodoStore.addTodo",
+                    },
+                  ],
+                }),
+              },
+            },
+          ],
+        };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    const r = await localize(client, {
+      rpg: buildRpgWithStore(),
+      task: "x",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.iterations).toBe(2);
+    // First trail entry tracks the multi-call rejection.
+    expect(r.trail[0]!.tool).toBe("[multi-call rejected]");
+  });
+
+  it("rejects 'functionality:' (and other near-prefixes) in Terminate.result (#1)", async () => {
+    let i = 0;
+    const client: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        i++;
+        if (i === 1) {
+          return {
+            content: "",
+            finishReason: "tool_calls",
+            toolCalls: [
+              {
+                id: "c1",
+                type: "function",
+                function: {
+                  name: "Terminate",
+                  arguments: JSON.stringify({
+                    // "functionality:" matched the old startsWith
+                    // check; the strict regex rejects it.
+                    result: [
+                      { file_path: "src/x.ts", interface: "functionality: foo" },
+                    ],
+                  }),
+                },
+              },
+            ],
+          };
+        }
+        return {
+          content: "",
+          finishReason: "tool_calls",
+          toolCalls: [
+            {
+              id: "c2",
+              type: "function",
+              function: {
+                name: "Terminate",
+                arguments: JSON.stringify({
+                  result: [
+                    { file_path: "src/store.ts", interface: "function: foo" },
+                  ],
+                }),
+              },
+            },
+          ],
+        };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    const r = await localize(client, {
+      rpg: buildRpgWithStore(),
+      task: "x",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.iterations).toBe(2);
+  });
+
+  it("rejects 'function:foo' (no space) in Terminate.result (#1)", async () => {
+    const client: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        return {
+          content: "",
+          finishReason: "tool_calls",
+          toolCalls: [
+            {
+              id: "c1",
+              type: "function",
+              function: {
+                name: "Terminate",
+                arguments: JSON.stringify({
+                  result: [
+                    { file_path: "src/x.ts", interface: "function:foo" },
+                  ],
+                }),
+              },
+            },
+          ],
+        };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    const r = await localize(client, {
+      rpg: buildRpgWithStore(),
+      task: "x",
+      maxIterations: 2,
+    });
+    expect(r.ok).toBe(false);
+  });
+});
+
 describe("localize — initial prompt", () => {
   it("includes the repo skeleton and the task", async () => {
     let observed: string | undefined;

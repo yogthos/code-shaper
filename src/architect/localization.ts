@@ -81,6 +81,15 @@ export interface LocalizationResult {
 }
 
 const DEFAULT_MAX_ITERATIONS = 20;
+/** Per-tool-result truncation cap. Without this, a single
+ *  `get_interface_content` returning a 50 KB file body lands in
+ *  the conversation verbatim — and stays there for every
+ *  subsequent iteration. Review fix #3. */
+const TOOL_RESULT_MAX_BYTES = 4_000;
+/** Max files + folders rendered in the initial repo skeleton.
+ *  Review fix #4. Beyond this, the skeleton is truncated and the
+ *  agent is told to use search_interface_by_functionality. */
+const REPO_SKELETON_MAX_ENTRIES = 200;
 
 const SYSTEM_PROMPT = `You are a Localization agent in the RPG-guided code-generation pipeline (§D.1).
 
@@ -263,6 +272,40 @@ export async function localize(
         error: "agent did not emit a tool call (must Terminate or use a data tool)",
       };
     }
+    // Review fix #6: §D.1 specifies one-call-per-turn. The previous
+    // implementation processed all calls but counted the whole
+    // batch as one iteration — a model emitting 5 calls/turn got
+    // effectively 100 invocations against a 20-budget. Worse, if
+    // Terminate appeared mid-batch alongside other calls, the
+    // earlier calls' tool_call_ids were left unanswered (causing
+    // OpenAI-protocol errors on a retry). Enforce the contract:
+    // exactly one tool call per turn.
+    if (toolCalls.length > 1) {
+      messages.push({
+        role: "assistant",
+        content: response.content ?? "",
+        tool_calls: toolCalls,
+      });
+      // Answer EVERY tool_call_id (protocol requirement) with the
+      // same error so the model is told to retry with one call.
+      for (const call of toolCalls) {
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify({
+            error:
+              "Emit exactly ONE tool call per turn. The harness processes one call at a time and feeds the result back to you for the next decision.",
+          }),
+        });
+      }
+      trail.push({
+        iteration: i + 1,
+        tool: "[multi-call rejected]",
+        args: toolCalls.map((c) => c.function.name),
+        output: "rejected: one call per turn",
+      });
+      continue;
+    }
     // Append the assistant turn so the model sees its own state on
     // the next round. The OpenAI tool-message protocol requires
     // the assistant tool-call message to precede tool-result messages.
@@ -271,8 +314,7 @@ export async function localize(
       content: response.content ?? "",
       tool_calls: toolCalls,
     });
-    // Process EACH tool call (the model may emit multiple per turn).
-    // Terminate ends the loop the moment we see it.
+    // Single call (post-validation).
     for (const call of toolCalls) {
       const toolName = call.function.name;
       let parsedArgs: unknown;
@@ -330,7 +372,9 @@ export async function localize(
       messages.push({
         role: "tool",
         tool_call_id: call.id,
-        content: JSON.stringify(dataResult.payload ?? { error: dataResult.error }),
+        content: capToolResult(
+          JSON.stringify(dataResult.payload ?? { error: dataResult.error }),
+        ),
       });
       trail.push({
         iteration: i + 1,
@@ -374,9 +418,11 @@ function buildInitialUserPrompt(input: LocalizationInput): string {
 }
 
 /**
- * Compact list of all files and folders in the RPG. Keeps the
- * initial context window small; the agent can drill down with
- * view_file_interface_feature_map when it picks a file.
+ * Compact list of files and folders in the RPG. Capped at
+ * REPO_SKELETON_MAX_ENTRIES (review fix #4) — beyond that we tell
+ * the agent to use search_interface_by_functionality. Without the
+ * cap, a 1000-file repo dumped tens of KB into the prompt before
+ * the agent even started navigating.
  */
 function renderRepoSkeleton(rpg: RPG): string {
   const folders: string[] = [];
@@ -387,17 +433,49 @@ function renderRepoSkeleton(rpg: RPG): string {
   }
   folders.sort();
   files.sort();
+  const total = folders.length + files.length;
   const lines: string[] = [];
+  let remaining = REPO_SKELETON_MAX_ENTRIES;
   if (folders.length > 0) {
     lines.push("Folders:");
-    for (const f of folders) lines.push(`  ${f}`);
+    for (const f of folders) {
+      if (remaining <= 0) break;
+      lines.push(`  ${f}`);
+      remaining--;
+    }
   }
-  if (files.length > 0) {
+  if (files.length > 0 && remaining > 0) {
     if (lines.length > 0) lines.push("");
     lines.push("Files:");
-    for (const f of files) lines.push(`  ${f}`);
+    for (const f of files) {
+      if (remaining <= 0) break;
+      lines.push(`  ${f}`);
+      remaining--;
+    }
+  }
+  if (total > REPO_SKELETON_MAX_ENTRIES) {
+    lines.push("");
+    lines.push(
+      `… (${total - REPO_SKELETON_MAX_ENTRIES} more entries truncated; use search_interface_by_functionality to find what you need)`,
+    );
   }
   return lines.length === 0 ? "(empty repo)" : lines.join("\n");
+}
+
+/**
+ * Truncate a tool-result JSON string to TOOL_RESULT_MAX_BYTES
+ * before it lands in the conversation. Review fix #3: at 20
+ * iterations a single big file fetched twice would otherwise
+ * accumulate in the conversation indefinitely. We trim past the
+ * cap and append an explicit "truncated" marker so the model
+ * knows it's seeing a partial view and can re-query if needed.
+ */
+function capToolResult(json: string): string {
+  if (json.length <= TOOL_RESULT_MAX_BYTES) return json;
+  return (
+    json.slice(0, TOOL_RESULT_MAX_BYTES) +
+    `… [truncated: ${json.length - TOOL_RESULT_MAX_BYTES} more bytes; re-query with narrower args if you need detail]`
+  );
 }
 
 interface DataToolPayload {
@@ -480,14 +558,14 @@ function validateTerminateResult(
         error: `Terminate.result[${i}] requires file_path:string + interface:string`,
       };
     }
-    if (
-      !iface.startsWith("function:") &&
-      !iface.startsWith("class:") &&
-      !iface.startsWith("method:")
-    ) {
+    // Strict format: "function: name" / "class: Name" / "method: Class.method"
+    // — exact prefix + space + non-empty entity. Review fix #1: the
+    // previous startsWith check accepted "functionality:" /
+    // "classification:" etc., which the harness then can't act on.
+    if (!/^(function|class|method):\s+\S/.test(iface)) {
       return {
         ok: false,
-        error: `Terminate.result[${i}].interface must start with "function: ", "class: ", or "method: " (got "${iface}")`,
+        error: `Terminate.result[${i}].interface must match /^(function|class|method):\\s+\\S/ (got "${iface}")`,
       };
     }
     out.push({ filePath: fp, interface: iface });

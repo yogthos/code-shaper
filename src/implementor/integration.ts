@@ -253,25 +253,40 @@ export async function runIntegrationTests(
       | Array<{ filePath: string; interface: string }>
       | undefined;
     if (input.useLocalization) {
-      const loc = await localize(client, {
-        rpg,
-        task: `Integration test for branch "${branch.branch.name}" failed. Find the leaf or set of leaves most likely to be the culprit. Failure:\n${failureMessage.slice(0, 1500)}`,
-        ...(input.temperature !== undefined
-          ? { temperature: input.temperature }
-          : {}),
-        ...(input.localizationMaxIterations !== undefined
-          ? { maxIterations: input.localizationMaxIterations }
-          : {}),
-      });
-      if (loc.ok && loc.result.length > 0) {
-        localizationHint = loc.result.map((r) => ({
-          filePath: r.filePath,
-          interface: r.interface,
-        }));
+      // Review fix #9: default 8 iterations (vs the §5.3 paper-wide
+      // 20) when invoked from integration recovery. Recovery loops
+      // already have 20 rounds × N branches; running the localize
+      // agent at full 20-iteration budget per round means hundreds
+      // of localization LLM calls per failing branch. The blame
+      // model has full branch context regardless — localization
+      // is a hint, not a substitute, so a tighter budget is the
+      // right tradeoff.
+      // Review fix #8: localize() can throw (LLM client timeout,
+      // 5xx after retries exhausted). The comment claimed
+      // "non-fatal" but a thrown error would have crashed the
+      // whole integration round. Wrap in try/catch and fall
+      // through without the hint on any failure.
+      const localizationBudget = input.localizationMaxIterations ?? 8;
+      try {
+        const loc = await localize(client, {
+          rpg,
+          task: `Integration test for branch "${branch.branch.name}" failed. Find the leaf or set of leaves most likely to be the culprit. Failure:\n${failureMessage.slice(0, 1500)}`,
+          maxIterations: localizationBudget,
+          ...(input.temperature !== undefined
+            ? { temperature: input.temperature }
+            : {}),
+        });
+        if (loc.ok && loc.result.length > 0) {
+          localizationHint = loc.result.map((r) => ({
+            filePath: r.filePath,
+            interface: r.interface,
+          }));
+        }
+      } catch {
+        // Throw → fall through to blame without the hint. The
+        // legacy single-shot blame still has the full branch
+        // context to work from.
       }
-      // Localization failure is non-fatal — fall through to blame
-      // without the hint. The legacy single-shot blame still has
-      // the full branch context to work from.
     }
 
     const blame = await runBlameAttribution(client, rpg, {
