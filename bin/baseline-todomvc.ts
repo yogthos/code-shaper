@@ -29,36 +29,52 @@ import { loadConfig, missingForPath } from "../src/config.js";
 import { createClient } from "../src/llm/factory.js";
 import type { ChatMessage } from "../src/llm/types.js";
 
-const DESCRIPTION = `Build a TypeScript TodoMVC core library — the data + operation layer only, NO UI rendering or DOM code:
+const DESCRIPTION = `Build a working TodoMVC web application that I can open in a browser, type into, and use end-to-end. TypeScript end to end.
 
-  - A Todo type: { id: string; text: string; completed: boolean }
-  - A TodoStore class that maintains an in-memory list of todos.
-  - Operations:
-      addTodo(text: string): Todo
-        — appends a new active todo with a fresh unique id; returns the new todo.
-        — throws if text is empty or whitespace-only.
+REQUIREMENTS — these MUST be present:
 
-      toggleTodo(id: string): Todo
-        — flips the completed flag; returns the updated todo.
-        — throws if id is unknown.
+  Functionality (the canonical TodoMVC feature set):
+    - Add a todo by typing in the input and pressing Enter
+    - Mark a todo complete / incomplete via a checkbox
+    - Edit a todo by double-clicking it (Enter to save, Escape to cancel)
+    - Delete an individual todo via a hover-revealed × button
+    - Toggle-all checkbox that marks every todo complete (or active if all are already complete)
+    - Filter view: All / Active / Completed (URL-routed via hash, e.g. #/active)
+    - "X items left" counter (only counts active todos)
+    - "Clear completed" button (only visible when at least one todo is completed)
+    - Empty input rejects (don't add blank todos)
 
-      removeTodo(id: string): boolean
-        — removes the todo by id; returns true if removed, false if id unknown.
+  Persistence:
+    - SQLite (better-sqlite3 or your preferred sqlite binding). Todos survive a page refresh AND a server restart.
+    - Schema: at minimum (id TEXT PRIMARY KEY, text TEXT, completed INTEGER, created_at INTEGER). Add columns if your design needs them.
 
-      editTodo(id: string, text: string): Todo
-        — replaces the text; returns the updated todo.
-        — throws if id unknown OR text is empty.
+  Server:
+    - HTTP server exposing whatever endpoints the frontend needs (REST or otherwise — your call).
+    - Serves the frontend assets too. ONE process, ONE port. \`npm start\` launches it; the README tells me which URL to open.
 
-      clearCompleted(): number
-        — removes every completed todo; returns the number removed.
+  Tests:
+    - Unit tests for the storage / business logic layer (the parts that don't need a DOM).
+    - Integration tests for the HTTP API (a fetch-based test that hits real endpoints against a temp database).
+    - All tests run via \`npm test\` and pass cleanly.
 
-      getAll(): readonly Todo[]
-      getActive(): readonly Todo[]
-      getCompleted(): readonly Todo[]
-        — return the current list as a frozen array; no mutation observable.
+  Quality bar:
+    - Clean module boundaries: storage, business logic, HTTP, frontend each isolated.
+    - Errors are real Error subclasses, not strings — server returns sensible HTTP codes, frontend doesn't crash on a 4xx.
+    - Frontend is responsive and matches the canonical TodoMVC visual style closely enough that a TodoMVC fan recognizes it.
 
-  - Pure logic, no I/O, no async. Each operation is independently testable.
-  - Use crypto.randomUUID() for ids.
+DECISIONS LEFT TO YOU:
+  - UI: vanilla DOM, Lit, Preact, React, Vue, Solid, vanilla + a templating lib — your call. Pick what gives the best result with the least dependency surface for a project this size.
+  - HTTP framework: hono, express, fastify, raw node http, etc.
+  - SQLite binding: better-sqlite3, node-sqlite3, drizzle, kysely — pick one.
+  - Build / bundle: vite, esbuild, tsx + plain script tags, no-bundler — your call. Keep it minimal.
+  - File / folder layout: lay it out the way you'd organize a real codebase. Don't flatten just because it's small; don't over-nest just because of habit.
+
+DON'T:
+  - Don't add features the requirements list doesn't ask for (no auth, no themes, no multi-user, no drag-and-drop reordering — keep it focused).
+  - Don't depend on global state or singletons that the tests can't isolate.
+  - Don't ship debug \`console.log\`s in production paths.
+
+I want a project where \`git clone … && npm install && npm test && npm start\` produces a working app I can interact with.
 `;
 
 const SYSTEM_PROMPT = `You are a senior TypeScript engineer.
