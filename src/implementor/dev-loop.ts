@@ -32,6 +32,7 @@ import {
   editImportsAndAssignmentsInFile,
   extractFunctionBody,
   extractMethodBody,
+  extractTopLevelImports,
   type EditResult,
 } from "./edit-tools.js";
 import {
@@ -361,6 +362,12 @@ async function applyTool(
         old_str: oldStr,
         new_str: newStr,
       });
+      if (r.ok && r.newContent !== undefined) {
+        // Mirror the model's imports back into FileNode.rawImports
+        // so subsequent renders preserve them. See
+        // syncImportsFromSource for the rationale.
+        syncImportsFromSource(input, r.newContent);
+      }
       return {
         ok: r.ok,
         toolResult: r.ok ? { ok: true } : { error: r.error },
@@ -540,6 +547,11 @@ function applySurgicalEdit(
     };
   }
   input.bodyByLeafId.set(input.leaf.leafCapabilityId, body);
+  // Mirror imports — the §D.2 edit_imports_and_assignments_in_file
+  // path most obviously needs this; the function/class/method
+  // edits leave imports unchanged but syncing is idempotent and
+  // keeps the rule consistent.
+  syncImportsFromSource(input, result.source!);
   return {
     ok: true,
     toolResult: { ok: true },
@@ -573,6 +585,23 @@ function extractBodyForActiveLeaf(
     return extractMethodBody(source, leaf.ownerClassName, leaf.name);
   }
   return extractFunctionBody(source, leaf.name);
+}
+
+/** Mirror imports the model added during this edit back into
+ *  `hostFile.rawImports`. The renderer emits imports from
+ *  rawImports, so without this every render after the edit
+ *  would strip the model's new imports — leaf bodies that
+ *  reference imported symbols would then become unresolved on
+ *  the next read_file / run_test. We REPLACE rather than merge
+ *  because removing an obsolete import is a legitimate edit;
+ *  the model controls the import set as long as the dev loop
+ *  is active. */
+function syncImportsFromSource(input: DevLoopInput, newSource: string): void {
+  input.hostFile.rawImports = extractTopLevelImports(newSource).map((i) => ({
+    name: i.name,
+    source: i.source,
+    isDefault: i.isDefault,
+  }));
 }
 
 function tailTruncate(s: string, cap: number): string {

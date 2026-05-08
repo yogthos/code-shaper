@@ -413,6 +413,83 @@ export function checkTypescriptSyntax(
   return { ok: true };
 }
 
+/** Top-level import statements extracted from `source`. Used by the
+ *  dev loop after an edit lands: the renderer drives imports from
+ *  FileNode.rawImports, so persistent imports added by the model
+ *  must be reflected back into that field. Otherwise the next
+ *  render strips them and the leaf body's references to imported
+ *  symbols become unresolved. */
+export interface ExtractedImport {
+  name: string;
+  source: string;
+  isDefault: boolean;
+}
+
+export function extractTopLevelImports(source: string): ExtractedImport[] {
+  const parsed = parseTs(source);
+  if (!parsed.ok) return [];
+  const out: ExtractedImport[] = [];
+  for (const child of parsed.tree.rootNode.namedChildren) {
+    if (child.type === "import_statement") collectFromImportStatement(child, out);
+  }
+  return out;
+}
+
+function collectFromImportStatement(node: TreeSitterNode, out: ExtractedImport[]): void {
+  const sourceNode = node.childForFieldName("source");
+  if (!sourceNode) return;
+  const source = stripQuotes(sourceNode.text);
+  // Walk the import_statement's children to find the import_clause.
+  let clause: TreeSitterNode | null = null;
+  for (const c of node.namedChildren) {
+    if (c.type === "import_clause") {
+      clause = c;
+      break;
+    }
+  }
+  if (!clause) {
+    out.push({ name: "", source, isDefault: false });
+    return;
+  }
+  for (const child of clause.namedChildren) {
+    if (child.type === "identifier") {
+      out.push({ name: child.text, source, isDefault: true });
+      continue;
+    }
+    if (child.type === "named_imports") {
+      for (const spec of child.namedChildren) {
+        if (spec.type !== "import_specifier") continue;
+        const aliasNode = spec.childForFieldName("alias");
+        const nameNode = spec.childForFieldName("name");
+        const localName = (aliasNode ?? nameNode)?.text;
+        if (localName) out.push({ name: localName, source, isDefault: false });
+      }
+      continue;
+    }
+    if (child.type === "namespace_import") {
+      // `import * as X from "y"` — record `X` as default-style for
+      // the renderer's emit logic.
+      for (const c of child.namedChildren) {
+        if (c.type === "identifier") {
+          out.push({ name: c.text, source, isDefault: true });
+          break;
+        }
+      }
+    }
+  }
+}
+
+function stripQuotes(s: string): string {
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'")) ||
+    (s.startsWith("`") && s.endsWith("`"))
+  ) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
 // ── Internals ────────────────────────────────────────────────────────
 
 function parseTs(source: string): ParseSuccess | ParseFailure {
