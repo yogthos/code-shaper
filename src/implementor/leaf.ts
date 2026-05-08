@@ -31,6 +31,7 @@ import {
   extractFunctionBody,
   extractMethodBody,
 } from "./edit-tools.js";
+import { applyEnvFixViaTools } from "./env-fix.js";
 import {
   BODY_AUTHOR_SYSTEM_PROMPT,
   TEST_AUTHOR_SYSTEM_PROMPT,
@@ -133,6 +134,25 @@ export interface LeafImplementInput {
    *  `test_brittleness` diagnosis. Paper §5.3: "20 remediation
    *  attempts for test or environment errors." Default 20. */
   maxTestRewrites?: number;
+  /** Project directory containing package.json. Required when
+   *  env-fix is enabled (the diagnostic's `environment` branch
+   *  mutates package.json + node_modules at this path). */
+  projectDir?: string;
+  /** Per-leaf budget for env-fix remediations triggered by an
+   *  `environment` diagnosis. Shares the same paper §5.3 spirit
+   *  as `maxTestRewrites`. Default 5 — env issues should resolve
+   *  in a few patches; more typically signals the diagnosis is
+   *  wrong. Requires `projectDir` and `enableEnvFix`. */
+  maxEnvPatches?: number;
+  /** Enable env-fix on `environment` diagnostic verdicts. Default
+   *  false. Production drivers opt in; tests opt out so they
+   *  don't need a stub npm binary. Requires `projectDir`. */
+  enableEnvFix?: boolean;
+  /** Override the npm binary used by env-fix (tests). */
+  envFixNpmBinary?: string;
+  /** Skip the npm install re-run inside env-fix (tests; or when
+   *  the harness reuses a pre-populated node_modules). */
+  envFixSkipNpmInstall?: boolean;
   /** When true, replace the streaming body-author with the §D.2
    *  tool-using edit author: the LLM is given the rendered file
    *  source plus the leaf's task and picks `edit_function_in_file`
@@ -278,7 +298,11 @@ export async function implementLeaf(
   const diagnosisRounds = input.diagnosis?.rounds ?? 5;
   const afterFailures = input.diagnosis?.afterFailures ?? 0;
   const maxTestRewrites = input.maxTestRewrites ?? 20;
+  const maxEnvPatches = input.maxEnvPatches ?? 5;
+  const envFixEnabled =
+    input.enableEnvFix === true && typeof input.projectDir === "string";
   let testRewrites = 0;
+  let envPatches = 0;
   let failuresSeen = 0;
   const diagnoses: NonNullable<LeafImplementResult["diagnoses"]> = [];
 
@@ -574,9 +598,70 @@ export async function implementLeaf(
         // through to normal body retry — the body author still has
         // budget and may bridge the gap.
       }
-      // category === "environment": auto-fix is gated on the
-      // future stack/package.json phase. Until then, fall through
-      // to body retry as if classified `implementation`.
+      // category === "environment" (Stage C of feature #5): when
+      // env-fix is enabled, the model picks one of the four npm-
+      // mutation tools (add_dependency / remove_dependency /
+      // set_script / npm_run) and the harness applies it via the
+      // npm-tools primitives. We then re-run the SAME test against
+      // the SAME body — if the failure was indeed env-related, the
+      // rerun passes without burning body-author retries. If
+      // env-fix fails OR the rerun still fails, fall through to
+      // body retry. Bounded by `maxEnvPatches`.
+      if (
+        diag.category === "environment" &&
+        envFixEnabled &&
+        envPatches < maxEnvPatches
+      ) {
+        const envFix = await applyEnvFixViaTools(client, {
+          projectDir: input.projectDir!,
+          envPatchHint: diag.envPatchHint ?? "(no hint provided)",
+          failureMessage: lastFailure.failureMessage,
+          bodySource: body,
+          testSource,
+          ...(input.envFixNpmBinary !== undefined
+            ? { npmBinary: input.envFixNpmBinary }
+            : {}),
+          ...(input.envFixSkipNpmInstall !== undefined
+            ? { skipNpmInstall: input.envFixSkipNpmInstall }
+            : {}),
+          ...(input.temperature !== undefined
+            ? { temperature: input.temperature }
+            : {}),
+        });
+        envPatches++;
+        if (envFix.ok) {
+          // Re-run the test against the same body. If it now passes,
+          // the env was indeed the issue.
+          const rerun = await runTests(input.rpg, {
+            bodyByLeafId: input.bodyByLeafId,
+            testsByLeafId: input.testsByLeafId,
+            leafIds: [leafId],
+            workDir: input.workDir,
+            ...(input.testTimeoutMs !== undefined
+              ? { timeoutMs: input.testTimeoutMs }
+              : {}),
+          });
+          const slug3 = leafToTestFilename(leafId).replace(".test.ts", "");
+          const outcome3 = rerun.byLeaf.get(slug3);
+          if (outcome3?.ok) {
+            return {
+              leafId,
+              ok: true,
+              body,
+              testSource,
+              attempts,
+              testRewrites,
+              ...(diagnoses.length > 0 ? { diagnoses } : {}),
+            };
+          }
+          if (outcome3) {
+            lastFailure = outcome3;
+          }
+        }
+        // env-fix failed or test still red — fall through to body
+        // retry. The next iteration's prompt sees the same failure
+        // (with the env condition fixed if we got that far).
+      }
       // category === "implementation": fall through normally.
     }
   }

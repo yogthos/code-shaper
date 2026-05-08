@@ -311,6 +311,7 @@ async function run(args: ParsedArgs): Promise<number> {
     diagnosis: { enabled: true, rounds: 5, afterFailures: 1 },
     maxTestRewrites: 20,
     useEditTools: true,
+    enableEnvFix: true,
   });
   const greenLeaves = build.leafResults.filter((r) => r.ok);
   const redLeaves = build.leafResults.filter((r) => !r.ok);

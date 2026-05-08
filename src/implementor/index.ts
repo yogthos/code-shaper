@@ -52,6 +52,16 @@ export {
 } from "./decompose-prompts.js";
 export type { DecomposePromptInput } from "./decompose-prompts.js";
 
+// Stage C of feature #5 — env-fix tool author for `environment`
+// diagnostic verdicts. Wraps the npm-mutation primitives as
+// OpenAI tool calls; one call per author session.
+export { applyEnvFixViaTools } from "./env-fix.js";
+export type {
+  EnvFixInput,
+  EnvFixResult,
+  EnvToolName,
+} from "./env-fix.js";
+
 // §D.2 surgical edit tools — scope-bounded source mutations.
 export {
   editFunctionInFile,

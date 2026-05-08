@@ -199,6 +199,11 @@ async function main(): Promise<number> {
     // edit_method_of_class_in_file) and emits structured args; the
     // harness applies the tool with AST-aware splicing.
     useEditTools: true,
+    // Stage C: when the diagnostic says environment, the model can
+    // call add_dependency / remove_dependency / set_script /
+    // npm_run via a structured tool call. The harness applies the
+    // change to outDir/package.json + node_modules.
+    enableEnvFix: true,
   });
   const failedLeaves = build.leafResults.filter((r) => !r.ok);
   log(

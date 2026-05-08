@@ -80,6 +80,12 @@ export interface BuildInput {
    *  author. Forwarded to implementLeaf. Default false; production
    *  drivers (build-todomvc.ts, run-task.ts) opt in. */
   useEditTools?: boolean;
+  /** Enable env-fix on `environment` diagnostic verdicts. Forwarded
+   *  to implementLeaf as `enableEnvFix`. Requires `outDir` (which
+   *  the orchestrator passes through as `projectDir` to leaf). */
+  enableEnvFix?: boolean;
+  /** Per-leaf env-fix budget. Forwarded to implementLeaf. */
+  maxEnvPatches?: number;
 }
 
 export interface BuildResult {
@@ -186,6 +192,15 @@ export async function buildImplementations(
           : {}),
         ...(input.useEditTools !== undefined
           ? { useEditTools: input.useEditTools }
+          : {}),
+        ...(input.enableEnvFix && input.outDir
+          ? {
+              enableEnvFix: true,
+              projectDir: input.outDir,
+              ...(input.maxEnvPatches !== undefined
+                ? { maxEnvPatches: input.maxEnvPatches }
+                : {}),
+            }
           : {}),
       });
       leafResults.push(result);
