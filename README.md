@@ -1,6 +1,6 @@
 # code-graph-agent
 
-Graph-driven code-generation harness implementing the [Repository Planning Graph (RPG)](2509.16198v6.md) approach: an explicit, structured plan in place of free-form natural-language planning, with TDD-per-leaf code generation, recursive decomposition when leaves get stuck, and branch-level integration testing across leaves.
+Graph-driven code-generation harness implementing the Repository Planning Graph (RPG) approach from [Ouyang et al., 2025 (arXiv:2509.16198)](https://arxiv.org/abs/2509.16198): an explicit, structured plan in place of free-form natural-language planning, with TDD-per-leaf code generation, recursive decomposition when leaves get stuck, and branch-level integration testing across leaves.
 
 Currently TypeScript-target only; the language-adapter layer is pluggable.
 
