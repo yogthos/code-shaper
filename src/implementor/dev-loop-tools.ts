@@ -24,6 +24,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import nodePath from "node:path";
 
 import { isFile } from "../rpg/types.js";
@@ -432,14 +433,38 @@ export async function typecheckTool(
     return { ran: false, ok: true, diagnostics: [] };
   }
   const timeoutMs = input.timeoutMs ?? DEFAULT_TYPECHECK_TIMEOUT_MS;
+  // Resolve tsc through the host project's typescript install.
+  // `npx tsc` is unreliable in CI and other clean environments —
+  // when there's no node_modules walking up from `outDir`, npx
+  // falls back to downloading tsc, which (a) takes time and
+  // (b) sometimes ignores the project's tsconfig flags. Resolving
+  // explicitly via require.resolve gives us deterministic
+  // behavior.
+  let tscBin: string;
+  try {
+    const req = createRequire(import.meta.url);
+    tscBin = req.resolve("typescript/bin/tsc");
+  } catch (e) {
+    return Promise.resolve({
+      ran: false,
+      ok: true,
+      diagnostics: [
+        `typescript not resolvable from harness — typecheck skipped (${e instanceof Error ? e.message : String(e)})`,
+      ],
+    });
+  }
   return new Promise<TypecheckResult>((resolve) => {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const child = spawn("npx", ["tsc", "--noEmit", "-p", input.outDir], {
-      cwd: input.outDir,
-      env: process.env,
-    });
+    const child = spawn(
+      process.execPath,
+      [tscBin, "--noEmit", "-p", input.outDir],
+      {
+        cwd: input.outDir,
+        env: process.env,
+      },
+    );
     child.stdout.on("data", (d) => (stdout += d.toString()));
     child.stderr.on("data", (d) => (stderr += d.toString()));
     const timer = setTimeout(() => {
