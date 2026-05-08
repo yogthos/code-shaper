@@ -129,9 +129,20 @@ async function main(): Promise<number> {
     outDir,
     maxAttempts: 2,
   });
-  if (!stack.ok) {
-    console.error(`[fatal] stack phase failed: ${stack.error}`);
+  // Match run-task.ts review fix #13: distinguish "package.json
+  // invalid" (fatal) from "valid + install failed" (warn + continue).
+  // The install can fail for environmental reasons (native deps
+  // that don't compile against bleeding-edge node, network blips,
+  // etc.) — the materialized package.json still has value and the
+  // user can retry install manually.
+  if (!stack.ok && !stack.packageJson) {
+    console.error(`[fatal] stack phase failed (invalid package.json): ${stack.error}`);
     return 2;
+  }
+  if (!stack.ok && stack.packageJson) {
+    log(
+      `  warning: package.json materialized but npm install failed: ${stack.error ?? "(no detail)"}`,
+    );
   }
   log(
     `  ${Object.keys(stack.packageJson?.dependencies ?? {}).length} deps + ${
