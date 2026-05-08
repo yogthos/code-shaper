@@ -38,6 +38,7 @@ import {
   type PlannedClass,
   type PlannedInterface,
   type RPG,
+  type RPGNode,
 } from "../rpg/types.js";
 import {
   INTERFACE_SYSTEM_PROMPT,
@@ -55,6 +56,15 @@ export interface InterfaceInput {
   mode?: "greenfield" | "extend";
   maxAttempts?: number;
   temperature?: number;
+  /** Max number of per-group LLM calls to run in parallel. Default
+   *  1 (legacy single-call behavior — keeps test mocks happy). The
+   *  TodoMVC + run-task drivers opt in with parallelism>1 to fan
+   *  out across mapped-ancestor groups: each group gets its own
+   *  LLM call scoped to its leaves, so a slow upstream on one
+   *  group doesn't block the others and per-call prompts stay
+   *  small (which the GLM endpoint handles much better than one
+   *  giant whole-project prompt). */
+  parallelism?: number;
 }
 
 export interface InterfaceResult {
@@ -145,9 +155,132 @@ export async function designInterfaces(
   }
 
   const allowedExtensions = getRegisteredExtensions();
-  const skipLeafIds = new Set(
+  const parallelism = Math.max(1, input.parallelism ?? 1);
+
+  // Group leaves by their nearest mapped ancestor. Groups whose
+  // leaves share a host folder/file get planned together; different
+  // groups can run in parallel because Phase 5 only declares
+  // within-file class extends — no cross-group dependencies are
+  // possible by construction.
+  const groups = groupLeavesByAncestor(rpg, leaves);
+  const skipBaseline = new Set(
     allLeaves.filter((l) => !leaves.includes(l)).map((l) => l.id),
   );
+
+  // Single-group OR caller forced parallelism=1: take the legacy
+  // single-call path. Test mocks expect one chat() per phase 5 run.
+  if (groups.length <= 1 || parallelism === 1) {
+    const result = await runOneInterfaceCall(
+      client,
+      rpg,
+      input,
+      leaves,
+      skipBaseline,
+      allowedExtensions,
+      mode,
+      maxAttempts,
+    );
+    if (!result.plan) {
+      return {
+        ok: false,
+        entries: [],
+        classes: [],
+        dataFlow: [],
+        unplannedLeaves: leaves.map((l) => l.id),
+        filesCreated: [],
+        error: result.error ?? "no plan produced",
+        attempts: result.attempts,
+      };
+    }
+    return applyInterfacePlan(rpg, result.plan, leaves, result.attempts);
+  }
+
+  // Per-group fan-out. Each group only sees its own leaves in the
+  // "Leaves to map" + capability tree; the other groups' leaves are
+  // listed in skipLeafIds so the architect doesn't reference them.
+  const groupResults = await runWithConcurrency(
+    groups,
+    parallelism,
+    async (group) => {
+      const skip = new Set(skipBaseline);
+      for (const other of groups) {
+        if (other.key === group.key) continue;
+        for (const l of other.leaves) skip.add(l.id);
+      }
+      return runOneInterfaceCall(
+        client,
+        rpg,
+        input,
+        group.leaves,
+        skip,
+        allowedExtensions,
+        mode,
+        maxAttempts,
+      );
+    },
+  );
+
+  // If any group failed, return a consolidated error.
+  const failed = groupResults
+    .map((r, i) => ({ r, group: groups[i]! }))
+    .filter((x) => !x.r.plan);
+  if (failed.length > 0) {
+    return {
+      ok: false,
+      entries: [],
+      classes: [],
+      dataFlow: [],
+      unplannedLeaves: failed.flatMap(({ group }) =>
+        group.leaves.map((l) => l.id),
+      ),
+      filesCreated: [],
+      error: `parallel phase 5 failed for ${failed.length} group(s): ${failed
+        .map(({ group, r }) => `${group.key}: ${r.error ?? "?"}`)
+        .join("; ")}`,
+      attempts: Math.max(...groupResults.map((r) => r.attempts)),
+    };
+  }
+
+  // Merge per-group plans into a single one. Each group only
+  // contains its leaves' interfaces and the classes those leaves
+  // declare; merging is a flat concat. dataFlow is accumulated
+  // across groups too — within-group edges land here. Cross-group
+  // dataFlow is currently lost (the architect can't see other
+  // groups), which matches the structural rule that each leaf lives
+  // in exactly one host file. If cross-group dataFlow becomes
+  // important, add a final aggregation call.
+  const merged: ParsedInterfacePlan = {
+    interfaces: [],
+    classes: [],
+    dataFlow: [],
+  };
+  let totalAttempts = 0;
+  for (const r of groupResults) {
+    if (!r.plan) continue;
+    merged.interfaces.push(...r.plan.interfaces);
+    merged.classes.push(...r.plan.classes);
+    merged.dataFlow.push(...r.plan.dataFlow);
+    totalAttempts = Math.max(totalAttempts, r.attempts);
+  }
+  return applyInterfacePlan(rpg, merged, leaves, totalAttempts);
+}
+
+interface SingleCallResult {
+  plan: ParsedInterfacePlan | null;
+  error: string | null;
+  attempts: number;
+}
+
+async function runOneInterfaceCall(
+  client: LLMClient,
+  rpg: RPG,
+  input: InterfaceInput,
+  scopeLeaves: CapabilityNode[],
+  skipLeafIds: Set<string>,
+  allowedExtensions: string[],
+  mode: "greenfield" | "extend",
+  maxAttempts: number,
+): Promise<SingleCallResult> {
   const body = renderInterfacePromptBody(rpg, skipLeafIds);
   const userPrompt = buildInterfaceUserPrompt({
     projectDescription: input.description,
@@ -185,7 +318,7 @@ export async function designInterfaces(
     });
     const parsed = parseInterfaceResponse(
       response.content,
-      leaves,
+      scopeLeaves,
       allowedExtensions,
       rpg,
     );
@@ -196,21 +329,74 @@ export async function designInterfaces(
     lastError = parsed.error;
     lastResponse = response.content;
   }
+  return { plan, error: lastError, attempts };
+}
 
-  if (!plan) {
-    return {
-      ok: false,
-      entries: [],
-      classes: [],
-      dataFlow: [],
-      unplannedLeaves: leaves.map((l) => l.id),
-      filesCreated: [],
-      error: lastError ?? "no plan produced",
-      attempts,
-    };
+interface LeafGroup {
+  /** The grouping key — "file:<path>" or "folder:<path>" or
+   *  "<unmapped>" for leaves without a mapped ancestor. */
+  key: string;
+  leaves: CapabilityNode[];
+}
+
+function groupLeavesByAncestor(
+  rpg: RPG,
+  leaves: CapabilityNode[],
+): LeafGroup[] {
+  const groups = new Map<string, CapabilityNode[]>();
+  for (const leaf of leaves) {
+    const key = ancestorKeyOf(rpg, leaf);
+    const bucket = groups.get(key) ?? [];
+    bucket.push(leaf);
+    groups.set(key, bucket);
   }
+  return Array.from(groups.entries()).map(([key, leaves]) => ({
+    key,
+    leaves,
+  }));
+}
 
-  return applyInterfacePlan(rpg, plan, leaves, attempts);
+function ancestorKeyOf(rpg: RPG, leaf: CapabilityNode): string {
+  let current: CapabilityNode | null = leaf;
+  while (current) {
+    if (current.status === "mapped" && current.mappedToId) {
+      const target = rpg.nodes[current.mappedToId];
+      if (target && isFile(target)) return `file:${target.path}`;
+      if (target && isFolder(target)) return `folder:${target.path}`;
+    }
+    const parentNode: RPGNode | undefined = current.parent
+      ? rpg.nodes[current.parent]
+      : undefined;
+    if (parentNode && isCapability(parentNode)) {
+      current = parentNode;
+    } else {
+      current = null;
+    }
+  }
+  return "<unmapped>";
+}
+
+/** Run `tasks` with at most `concurrency` in flight at a time. */
+async function runWithConcurrency<T, R>(
+  tasks: T[],
+  concurrency: number,
+  fn: (t: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(tasks.length);
+  let next = 0;
+  const workers: Promise<void>[] = [];
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const idx = next++;
+      if (idx >= tasks.length) return;
+      results[idx] = await fn(tasks[idx]!);
+    }
+  };
+  for (let i = 0; i < Math.min(concurrency, tasks.length); i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+  return results;
 }
 
 /**

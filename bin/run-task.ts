@@ -209,6 +209,7 @@ async function run(args: ParsedArgs): Promise<number> {
     description: args.task,
     maxAttempts: 2,
     mode: mode === "greenfield" ? "greenfield" : "extend",
+    parallelism: 4,
   });
   if (!interfaces.ok) {
     await writeResult(args.resultPath, {

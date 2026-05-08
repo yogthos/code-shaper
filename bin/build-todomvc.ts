@@ -131,6 +131,10 @@ async function main(): Promise<number> {
   const interfaces = await designInterfaces(client, rpg, {
     description: DESCRIPTION,
     maxAttempts: 2,
+    // Fan out per ancestor group when there's more than one. Keeps
+    // each LLM prompt small enough that GLM doesn't stall on
+    // large whole-project requests.
+    parallelism: 4,
   });
   if (!interfaces.ok) {
     console.error(`[fatal] interfaces failed: ${interfaces.error}`);
