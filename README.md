@@ -37,46 +37,6 @@ Phase 7b — Integration tests    branch-level tests across multiple leaves;
 
 Every phase mutates an in-memory **Repository Planning Graph** (RPG): folders, files, classes, functions, methods, plus capability-level metadata, data-flow edges, and inheritance edges. Files on disk are an output of `materializeRPG`; the graph is the source of truth. AST extraction is via `tree-sitter`, edits operate on byte-precise ranges, and cross-file imports are resolved on every mutation.
 
-## Project structure
-
-```
-src/
-  config.ts                           env-var-interpolated JSON config loader
-  llm/                                provider abstraction (OpenAI-compatible HTTP)
-    types.ts                          LLMClient + ChatOptions
-    openai-provider.ts                works with OpenAI, DeepSeek, GLM, OpenRouter, Ollama /v1
-    factory.ts                        ProviderConfig → LLMClient
-  rpg/                                Repository Planning Graph
-    types.ts                          Folder/File/Class/Function/Method/Capability nodes; edges
-    load.ts                           dir → RPG (uses tree-sitter via adapters)
-    materialize.ts                    RPG → dir
-    resolve.ts                        cross-file import + inheritance edges
-    adapters/                         language adapters; TS + TSX shipped
-  tools/                              AST-aware in-process tools
-    edit.ts                           edit_function, edit_method, edit_whole_class, edit_imports
-    view.ts                           view_file_interface_feature_map, get_interface_content
-    locate.ts                         find AST nodes by name; ambiguity detection
-    refresh.ts                        re-extract a file after a byte splice; cross-edge re-resolve
-  architect/                          phases 3–5 + refactor + operation vocabulary
-    proposal.ts                       Phase 3 — capability tree
-    structure.ts                      Phase 4 — folders + files
-    interface.ts                      Phase 5 — signatures + dataflow
-    operations.ts                     RPGOperation union + apply layer with import maintenance
-    refactor.ts                       Phase 5.5 — conservative restructuring orchestrator
-  implementor/                        Phases 6 + 7
-    render.ts                         pure: InterfacePlan + bodies → TypeScript source
-    test-harness.ts                   spawn vitest with JSON reporter; per-leaf + per-branch glob
-    validate-ts.ts                    tree-sitter validation for LLM-produced sources
-    leaf.ts                           per-leaf TDD loop (test author → body author → run → retry)
-    decompose.ts                      Phase 7a — split-or-fresh-approach recovery
-    orchestrator.ts                   Phase 6 topological build with decompose recovery
-    integration.ts                    Phase 7b — branch tests + blame attribution + recovery
-tests/                                vitest suites — 25 files, 151 unit + 5 GLM integration
-bin/
-  smoke.ts                            manual provider check
-config.json                           runtime configuration
-```
-
 ## Quick start
 
 ### 1. Install dependencies
@@ -104,32 +64,6 @@ npm install
 ```
 
 The OpenAI-compatible provider works with anything speaking `/chat/completions`: GLM (Zhipu), DeepSeek, OpenAI, OpenRouter, Together, Ollama via `/v1`, llama.cpp servers, etc. The `url` may include or omit `/chat/completions` — it's normalized either way.
-
-### 3. Smoke-test the provider
-
-```bash
-npm run smoke
-```
-
-Expected output:
-```
-[smoke] provider=glm model=glm-5.1 url=...
-[smoke] finish=stop took=Xms
-[smoke] usage={"promptTokens":...}
----
-pong
----
-```
-
-### 4. Run the test suite
-
-```bash
-# Unit tests only (fast, ~30s)
-npm test -- --exclude '**/*.integration.test.ts'
-
-# Including LLM-driven integration tests (~15-20 minutes)
-npm test
-```
 
 ## Programmatic use
 
@@ -250,12 +184,37 @@ The refactor pass can additionally rename, move, split, merge, or extract helper
 | EpiCoder feature-tree retrieval | Skipped (paper §3.2's explore-exploit step); pure-LLM exploration on small targets |
 | Token budget for large repos | `summarizeExistingRPG` and `renderStructurePromptBody` not yet truncated |
 
-## Testing
+## Local development
+
+### Smoke-test the provider
+
+After configuring `config.json`, verify the provider is reachable:
 
 ```bash
-npm test                                                # all
-npm test -- --exclude '**/*.integration.test.ts'        # unit only
-npm test -- tests/architect.proposal.test.ts            # one file
+npm run smoke
+```
+
+Expected output:
+```
+[smoke] provider=glm model=glm-5.1 url=...
+[smoke] finish=stop took=Xms
+[smoke] usage={"promptTokens":...}
+---
+pong
+---
+```
+
+### Tests
+
+```bash
+# Unit tests only (fast, ~30s)
+npm test -- --exclude '**/*.integration.test.ts'
+
+# Including LLM-driven integration tests (~15-20 minutes; needs an API key)
+npm test
+
+# A single file
+npm test -- tests/architect.proposal.test.ts
 ```
 
 Test layout:
@@ -268,7 +227,7 @@ Current count: 25 test files, 151 unit tests + 5 LLM-driven integration tests.
 
 ### CI
 
-`.github/workflows/ci.yml` runs the typecheck + unit tests on every push and PR. The LLM-driven integration tests are gated behind `workflow_dispatch` with a `run_llm_integration: true` input — they're non-deterministic and consume real API credits, so opt in via:
+`.github/workflows/ci.yml` runs typecheck + unit tests on every push and PR. The LLM-driven integration tests are gated behind `workflow_dispatch` with a `run_llm_integration: true` input — they're non-deterministic and consume real API credits, so opt in via:
 
 1. **Settings → Secrets and variables → Actions** — add `ZHIPU_API_KEY` (or your provider's key + corresponding `config.json` adjustments).
 2. **Actions → CI → Run workflow** — flip the `Run LLM-driven integration tests` toggle on before dispatching.
