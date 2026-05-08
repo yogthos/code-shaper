@@ -34,6 +34,7 @@ import {
   extractFunctionBody,
   extractMethodBody,
 } from "./edit-tools.js";
+import { runTests, leafToTestFilename } from "./test-harness.js";
 
 // ── listFilesTool ────────────────────────────────────────────────────
 
@@ -495,4 +496,78 @@ function lineReferencesPath(line: string, repoRelative: string): boolean {
   // repo-relative path as a literal substring; that's what tsc
   // produces when invoked with `-p outDir`.
   return line.includes(repoRelative);
+}
+
+// ── runTestTool ──────────────────────────────────────────────────────
+//
+// Thin wrapper over the existing `runTests` harness that runs ONE
+// leaf's test against the current bodyByLeafId / testsByLeafId
+// state. Lets the dev-loop agent verify a code change before
+// terminating, the same way a developer would type `vitest run
+// some.test.ts` mid-edit.
+
+export interface RunTestInput {
+  rpg: RPG;
+  bodyByLeafId: Map<string, string>;
+  testsByLeafId: Map<string, string>;
+  /** Capability id of the leaf currently being implemented. The
+   *  test source for THIS leaf is what gets run. */
+  activeLeafId: string;
+  /** Optional reusable harness work directory. When omitted the
+   *  underlying runTests creates+disposes its own. */
+  workDir?: string;
+  /** Wall-clock cap. Default 120s — same as `runTests` default. */
+  timeoutMs?: number;
+}
+
+export interface RunTestResult {
+  /** True iff every assertion in the leaf's test passed. */
+  ok: boolean;
+  /** Tail-truncated assertion output / failure message. Empty
+   *  on full pass. */
+  output: string;
+  /** When the harness itself crashed (vitest spawn error, tsc
+   *  parse fail in another file, etc.) — the agent should
+   *  generally `read_file` the harness's outDir to investigate. */
+  fatal?: string;
+}
+
+const RUN_TEST_OUTPUT_TAIL_CAP = 4000;
+
+export async function runTestTool(input: RunTestInput): Promise<RunTestResult> {
+  // Guard: the active leaf must have a test source. Without one,
+  // there's nothing to run. Better to return a clean error than
+  // to feed the model an empty pass.
+  if (!input.testsByLeafId.has(input.activeLeafId)) {
+    return {
+      ok: false,
+      output: `no test source for leaf ${JSON.stringify(input.activeLeafId)} — write the test before invoking run_test`,
+    };
+  }
+  const result = await runTests(input.rpg, {
+    bodyByLeafId: input.bodyByLeafId,
+    testsByLeafId: input.testsByLeafId,
+    leafIds: [input.activeLeafId],
+    ...(input.workDir !== undefined ? { workDir: input.workDir } : {}),
+    ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+  });
+  if (result.fatal) {
+    return { ok: false, output: tailTruncate(result.fatal, RUN_TEST_OUTPUT_TAIL_CAP), fatal: result.fatal };
+  }
+  const slug = leafToTestFilename(input.activeLeafId).replace(".test.ts", "");
+  const outcome = result.byLeaf.get(slug);
+  if (!outcome) {
+    return {
+      ok: false,
+      output: `harness produced no outcome for leaf ${JSON.stringify(input.activeLeafId)} (slug ${JSON.stringify(slug)}). Other outcomes: ${[...result.byLeaf.keys()].join(", ") || "(none)"}`,
+    };
+  }
+  return {
+    ok: outcome.ok,
+    output: outcome.ok ? "" : tailTruncate(outcome.failureMessage, RUN_TEST_OUTPUT_TAIL_CAP),
+  };
+}
+
+function tailTruncate(s: string, cap: number): string {
+  return s.length > cap ? "...[truncated head]\n" + s.slice(s.length - cap) : s;
 }
