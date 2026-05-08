@@ -117,6 +117,47 @@ describe("applyEnvFixViaTools — happy paths (multi-turn)", () => {
     expect(pkg.dependencies.zod).toBe("^3.22.0");
   });
 
+  // Audit issue #11: npm_run is a probe — installRan/installOk
+  // are meaningless for it. The serialized tool result must NOT
+  // include those fields, otherwise the model reads
+  // "ok:true, installRan:false, installOk:false" on a clean
+  // build and treats it as a failure signal.
+  it("strips installRan/installOk from npm_run tool result (audit issue #11)", async () => {
+    // Pre-seed a `build` script so npmRun has something to invoke.
+    const seeded = {
+      name: "test-app",
+      version: "0.1.0",
+      type: "module" as const,
+      scripts: { test: "vitest run", build: "echo ok" },
+      dependencies: {},
+      devDependencies: { vitest: "^2.0.0" },
+    };
+    await writeFile(
+      path.join(outDir, "package.json"),
+      JSON.stringify(seeded, null, 2),
+    );
+    const client = scriptedClient([
+      { name: "npm_run", args: { script: "build" } },
+      { name: "Terminate", args: {} },
+    ]);
+    await applyEnvFixViaTools(client, {
+      ...baseInput,
+      projectDir: outDir,
+    });
+    // Inspect the second turn's tool message — that's the result
+    // sent back to the model after npm_run.
+    const secondTurnMessages = client.messages[1]!;
+    const toolMsg = secondTurnMessages.find((m) => m.role === "tool");
+    expect(toolMsg).toBeDefined();
+    const parsed = JSON.parse(toolMsg!.content) as Record<string, unknown>;
+    expect(parsed["installRan"]).toBeUndefined();
+    expect(parsed["installOk"]).toBeUndefined();
+    // exitCode must still be there for the model to verify the
+    // build succeeded.
+    expect(parsed["exitCode"]).toBe(0);
+    expect(parsed["ok"]).toBe(true);
+  });
+
   it("threads tool result back to next turn (audit gap #16: npm_run output)", async () => {
     // First call: set_script. Second turn the model should see
     // the result. Third: Terminate.
@@ -229,6 +270,10 @@ describe("applyEnvFixViaTools — error paths (recovery via tool messages)", () 
     expect(r.ok).toBe(true);
     // First trail entry records the rejection.
     expect(r.trail[0]!.error).toMatch(/unknown tool/);
+    // Audit issue #5: pre-apply rejection labelled `_invalid`
+    // (not "Terminate") so the trail accurately reflects what
+    // happened.
+    expect(r.trail[0]!.tool).toBe("_invalid");
     // Second trail entry is the successful retry.
     expect(r.trail[1]!.tool).toBe("add_dependency");
   });
@@ -314,6 +359,52 @@ describe("applyEnvFixViaTools — error paths (recovery via tool messages)", () 
     expect(trail0.npmResult?.ok).toBe(false);
     expect(trail0.npmResult?.error).toMatch(/version/);
     expect(trail0.npmResult?.error).toMatch(/null|object/i);
+  });
+
+  // Audit issue #10: Terminate must not overwrite lastTool /
+  // lastArgs / lastNpmResult — they should describe the most
+  // recent SUBSTANTIVE step (e.g., the add_dependency that
+  // mutated disk).
+  it("preserves lastTool/lastArgs from the last substantive step on Terminate", async () => {
+    const client = scriptedClient([
+      {
+        name: "add_dependency",
+        args: { name: "zod", version: "^3.22.0", which: "runtime" },
+      },
+      { name: "Terminate", args: { reason: "added" } },
+    ]);
+    const r = await applyEnvFixViaTools(client, {
+      ...baseInput,
+      projectDir: outDir,
+    });
+    expect(r.terminatedExplicitly).toBe(true);
+    // The "last" reflects the add_dependency, not the Terminate.
+    expect(r.lastTool).toBe("add_dependency");
+    expect((r.lastArgs as Record<string, unknown>).name).toBe("zod");
+    expect(r.lastNpmResult?.ok).toBe(true);
+  });
+
+  // Audit issue #6: chat-failure on iteration 1 must report
+  // iterations: 1, not 0. Off-by-one was breaking telemetry and
+  // summarizeEnvFix's iteration counter.
+  it("reports iterations: 1 when chat throws on the first iteration", async () => {
+    let calls = 0;
+    const client: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        calls++;
+        throw new Error("upstream 503");
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    const r = await applyEnvFixViaTools(client, {
+      ...baseInput,
+      projectDir: outDir,
+    });
+    expect(calls).toBe(1);
+    expect(r.iterations).toBe(1);
+    expect(r.error).toMatch(/upstream 503/);
   });
 
   it("exhausts iteration budget when the model never Terminates", async () => {

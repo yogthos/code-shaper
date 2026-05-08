@@ -434,24 +434,31 @@ function renderRepoSkeleton(rpg: RPG): string {
   folders.sort();
   files.sort();
   const total = folders.length + files.length;
+
+  // Audit issue #14: when total > REPO_SKELETON_MAX_ENTRIES, the
+  // previous code listed folders FIRST and consumed budget
+  // greedily. On a repo with ~250 folders and ~100 files the
+  // model saw 200 folders and zero files — it couldn't pick
+  // view_file_interface_feature_map because no file paths were
+  // visible. Reserve at least half the budget for files so the
+  // model sees a usable mix.
+  const fileBudget =
+    total <= REPO_SKELETON_MAX_ENTRIES
+      ? files.length
+      : Math.min(files.length, Math.ceil(REPO_SKELETON_MAX_ENTRIES / 2));
+  const folderBudget = REPO_SKELETON_MAX_ENTRIES - fileBudget;
+
   const lines: string[] = [];
-  let remaining = REPO_SKELETON_MAX_ENTRIES;
   if (folders.length > 0) {
     lines.push("Folders:");
-    for (const f of folders) {
-      if (remaining <= 0) break;
-      lines.push(`  ${f}`);
-      remaining--;
-    }
+    const shown = folders.slice(0, folderBudget);
+    for (const f of shown) lines.push(`  ${f}`);
   }
-  if (files.length > 0 && remaining > 0) {
+  if (files.length > 0) {
     if (lines.length > 0) lines.push("");
     lines.push("Files:");
-    for (const f of files) {
-      if (remaining <= 0) break;
-      lines.push(`  ${f}`);
-      remaining--;
-    }
+    const shown = files.slice(0, fileBudget);
+    for (const f of shown) lines.push(`  ${f}`);
   }
   if (total > REPO_SKELETON_MAX_ENTRIES) {
     lines.push("");
@@ -553,9 +560,19 @@ function validateTerminateResult(
     const fp = (item as Record<string, unknown>)["file_path"];
     const iface = (item as Record<string, unknown>)["interface"];
     if (typeof fp !== "string" || typeof iface !== "string") {
+      // Audit issue #12: include the offending entry so the model
+      // can see exactly what it sent (typo'd field name, wrong
+      // type, etc.) and correct.
+      let dump: string;
+      try {
+        const j = JSON.stringify(item);
+        dump = j.length > 200 ? j.slice(0, 200) + "…" : j;
+      } catch {
+        dump = String(item);
+      }
       return {
         ok: false,
-        error: `Terminate.result[${i}] requires file_path:string + interface:string`,
+        error: `Terminate.result[${i}] requires file_path:string + interface:string. Got: ${dump}`,
       };
     }
     // Strict format: "function: name" / "class: Name" / "method: Class.method"
@@ -563,9 +580,12 @@ function validateTerminateResult(
     // previous startsWith check accepted "functionality:" /
     // "classification:" etc., which the harness then can't act on.
     if (!/^(function|class|method):\s+\S/.test(iface)) {
+      // Audit issue #8: surface a positive example alongside the
+      // regex so the model can correlate. Models tend to re-emit
+      // the same near-miss when shown only the regex.
       return {
         ok: false,
-        error: `Terminate.result[${i}].interface must match /^(function|class|method):\\s+\\S/ (got "${iface}")`,
+        error: `Terminate.result[${i}].interface must match /^(function|class|method):\\s+\\S/ (got "${iface}"). Examples: "function: handleClick", "class: UserService", "method: UserService.findById".`,
       };
     }
     out.push({ filePath: fp, interface: iface });

@@ -821,9 +821,15 @@ function summarizeEnvFix(
   // an npm op. The body author needs to see what was tried in
   // sequence so it can avoid repeating the same dead end.
   envFix.trail.forEach((entry, idx) => {
-    lines.push(
-      `\n[step ${idx + 1}] ${entry.tool}(${JSON.stringify(entry.args)})`,
-    );
+    // Audit issue #5: render `_invalid` entries (multi-call /
+    // unknown-tool / JSON-parse rejections) as a clear refusal
+    // line so the body author isn't misled into thinking
+    // env-fix did something useful.
+    const label =
+      entry.tool === "_invalid"
+        ? `[step ${idx + 1}] (refused before apply)`
+        : `[step ${idx + 1}] ${entry.tool}(${JSON.stringify(entry.args)})`;
+    lines.push(`\n${label}`);
     const npm = entry.npmResult;
     if (npm) {
       const exitCode =

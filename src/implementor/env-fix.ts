@@ -78,7 +78,13 @@ export type EnvToolName =
 
 export interface EnvFixTrailEntry {
   iteration: number;
-  tool: EnvToolName;
+  /** Audit issue #5: the actual tool name the model emitted, OR
+   *  the synthetic tag `_invalid` when the call was rejected
+   *  pre-apply (multi-call turn, unknown tool, JSON parse).
+   *  Previously these rejections were recorded as
+   *  `tool: "Terminate"` which misled summarizeEnvFix into
+   *  rendering them as a clean termination. */
+  tool: EnvToolName | "_invalid";
   /** Args the model supplied. May be empty for Terminate. */
   args: Record<string, unknown>;
   /** Underlying npm-tool result, when applicable. */
@@ -270,10 +276,14 @@ export async function applyEnvFixViaTools(
     try {
       response = await client.chat(messages, opts);
     } catch (e) {
+      // Audit issue #6: report iterations: i + 1 (a chat call was
+      // attempted on this iteration), matching every other return
+      // path in this loop. Previously off-by-one: chat-fail on the
+      // first iteration reported iterations: 0.
       return {
         ok: landedRealMutation,
         trail,
-        iterations: i,
+        iterations: i + 1,
         terminatedExplicitly: false,
         error: `env-fix chat failed at iteration ${i + 1}: ${e instanceof Error ? e.message : String(e)}`,
         ...(lastTool ? { lastTool } : {}),
@@ -311,9 +321,12 @@ export async function applyEnvFixViaTools(
           }),
         });
       }
+      // Audit issue #5: tag pre-apply rejections as `_invalid`
+      // (not "Terminate") so summarizeEnvFix renders them
+      // accurately rather than implying clean termination.
       trail.push({
         iteration: i + 1,
-        tool: "Terminate",
+        tool: "_invalid",
         args: {},
         error: "rejected: multi-tool-call turn",
       });
@@ -338,7 +351,7 @@ export async function applyEnvFixViaTools(
       });
       trail.push({
         iteration: i + 1,
-        tool: "Terminate",
+        tool: "_invalid",
         args: {},
         error: `unknown tool: ${call.function.name}`,
       });
@@ -363,9 +376,9 @@ export async function applyEnvFixViaTools(
       });
       trail.push({
         iteration: i + 1,
-        tool: toolName,
+        tool: "_invalid",
         args: {},
-        error: `JSON parse: ${call.function.arguments.slice(0, 200)}`,
+        error: `JSON parse on ${toolName}: ${call.function.arguments.slice(0, 200)}`,
       });
       continue;
     }
@@ -388,15 +401,19 @@ export async function applyEnvFixViaTools(
         tool: "Terminate",
         args: parsedArgs,
       });
-      lastTool = "Terminate";
-      lastArgs = parsedArgs;
+      // Audit issue #10: do NOT overwrite lastTool / lastArgs /
+      // lastNpmResult — they should describe the most recent
+      // SUBSTANTIVE step (e.g., the add_dependency that mutated
+      // disk), not the Terminate that closed the session. The
+      // `terminatedExplicitly` flag is the signal that termination
+      // happened cleanly.
       return {
         ok: landedRealMutation,
         trail,
         iterations: i + 1,
         terminatedExplicitly: true,
-        lastTool,
-        lastArgs,
+        ...(lastTool ? { lastTool } : {}),
+        ...(lastArgs ? { lastArgs } : {}),
         ...(lastNpmResult ? { lastNpmResult } : {}),
       };
     }
@@ -440,7 +457,7 @@ export async function applyEnvFixViaTools(
     messages.push({
       role: "tool",
       tool_call_id: call.id,
-      content: JSON.stringify(serializeNpmResultForTool(npmResult)),
+      content: JSON.stringify(serializeNpmResultForTool(npmResult, toolName)),
     });
   }
 
@@ -579,8 +596,14 @@ async function runEnvTool(
   }
 }
 
+/** Audit issue #11: npm_run returns installRan:false /
+ *  installOk:false unconditionally — three of four flags read as
+ *  failure even on a clean `npm run build`. Caller passes the
+ *  TOOL NAME so we can prune install-* from npm_run's serialized
+ *  result (it never installs). */
 function serializeNpmResultForTool(
   npmResult: NpmOpResult & { exitCode?: number | null },
+  toolName?: EnvToolName,
 ): Record<string, unknown> {
   // Tail-truncate stdout/stderr — the actionable diagnostic is at
   // the END (npm warnings precede; gyp init noise precedes).
@@ -588,10 +611,19 @@ function serializeNpmResultForTool(
     if (!s) return s;
     return s.length > max ? "...[truncated head]\n" + s.slice(s.length - max) : s;
   };
+  // Audit issue #11: `npm_run` is a probe — it never installs.
+  // Stripping install-* from its tool result avoids the
+  // confusing "ok: true, installRan: false, installOk: false"
+  // that read as failure on a clean build.
+  const isProbe = toolName === "npm_run";
   return {
     ok: npmResult.ok,
-    installRan: npmResult.installRan,
-    installOk: npmResult.installOk,
+    ...(isProbe
+      ? {}
+      : {
+          installRan: npmResult.installRan,
+          installOk: npmResult.installOk,
+        }),
     // Audit issue #9: tell the model whether the call actually
     // mutated package.json. `changed: false` after `add_dependency`
     // means "already at this version" — useful signal for the
