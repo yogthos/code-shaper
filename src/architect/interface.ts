@@ -19,7 +19,7 @@
  * nodes appear alongside the plan (the plan stays for traceability).
  */
 
-import type { LLMClient } from "../llm/types.js";
+import type { ChatMessage, ChatOptions, LLMClient, LLMResponse } from "../llm/types.js";
 import {
   getAdapterForFile,
   getRegisteredExtensions,
@@ -177,7 +177,7 @@ export async function designInterfaces(
         content: `Your previous response failed validation: ${lastError}\nReturn corrected JSON now.`,
       });
     }
-    const response = await client.chat(messages, {
+    const response = await callWithStallDetection(client, messages, {
       responseFormat: { type: "json_object" },
       ...(input.temperature !== undefined
         ? { temperature: input.temperature }
@@ -211,6 +211,30 @@ export async function designInterfaces(
   }
 
   return applyInterfacePlan(rpg, plan, leaves, attempts);
+}
+
+/**
+ * Use the streaming variant when the provider supports it (the
+ * OpenAI-compatible provider does). Stalls trigger an early retry
+ * — phase 5 prompts are large enough that GLM has been observed to
+ * accept the request, run for many minutes, and fail without
+ * surfacing a clear timeout. With chatStream's stall watchdog,
+ * silence past `stallTimeoutMs` (60s default) aborts and retries,
+ * and we don't sit waiting on a dead connection for the full
+ * request-timeout ceiling.
+ *
+ * Falls back to plain chat() if the client doesn't expose the
+ * streaming method (test mocks etc.).
+ */
+async function callWithStallDetection(
+  client: LLMClient,
+  messages: ChatMessage[],
+  opts: ChatOptions,
+): Promise<LLMResponse> {
+  if (typeof client.chatStream === "function") {
+    return client.chatStream(messages, () => {}, opts);
+  }
+  return client.chat(messages, opts);
 }
 
 // ── Leaf discovery ───────────────────────────────────────────────────
