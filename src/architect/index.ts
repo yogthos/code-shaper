@@ -90,6 +90,20 @@ export {
 } from "./refactor-prompts.js";
 export type { RefactorPromptInput } from "./refactor-prompts.js";
 
+// §D.1 localization tools — graph-guided exploration primitives.
+export {
+  viewFileInterfaceFeatureMap,
+  getInterfaceContent,
+  expandLeafNodeInfo,
+  searchInterfaceByFunctionality,
+} from "./localization-tools.js";
+export type {
+  FileInterfaceMap,
+  InterfaceContent,
+  LeafNodeExpansion,
+  FunctionalitySearchResult,
+} from "./localization-tools.js";
+
 // Failure diagnosis — 5-round majority-vote routing for test failures.
 export { diagnoseFailure } from "./diagnose-failure.js";
 export type {
