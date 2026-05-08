@@ -253,24 +253,48 @@ describe("implementLeaf — env-fix on environment verdicts", () => {
             sys.includes("environment-level fixes") ||
             sys.includes("npm-mutation tools")
           ) {
+            // Multi-turn (audit gap #4): alternate add_dependency
+            // (which counts as a budgeted env-fix session) with
+            // Terminate (which closes the session). Each session
+            // = one add + one Terminate. envSessions counts the
+            // add_dependency turns — i.e., distinct sessions.
+            const inSession = envToolCalls % 2 === 0;
             envToolCalls++;
-            // Vary the package on each call so each is a REAL change
-            // (idempotent no-op calls don't count against the budget
-            // per review fix #6).
+            if (inSession) {
+              // Vary the package on each session so each is a
+              // REAL change (idempotent no-op calls don't count
+              // against the budget per review fix #6).
+              const sessionN = Math.floor((envToolCalls - 1) / 2) + 1;
+              return {
+                content: "",
+                finishReason: "tool_calls",
+                toolCalls: [
+                  {
+                    id: `ec${envToolCalls}`,
+                    type: "function",
+                    function: {
+                      name: "add_dependency",
+                      arguments: JSON.stringify({
+                        name: `dep-${sessionN}`,
+                        version: "^3.0.0",
+                        which: "runtime",
+                      }),
+                    },
+                  },
+                ],
+              };
+            }
+            // Terminate to close the session.
             return {
               content: "",
               finishReason: "tool_calls",
               toolCalls: [
                 {
-                  id: `ec${envToolCalls}`,
+                  id: `term${envToolCalls}`,
                   type: "function",
                   function: {
-                    name: "add_dependency",
-                    arguments: JSON.stringify({
-                      name: `dep-${envToolCalls}`,
-                      version: "^3.0.0",
-                      which: "runtime",
-                    }),
+                    name: "Terminate",
+                    arguments: JSON.stringify({ reason: "session done" }),
                   },
                 },
               ],
@@ -307,9 +331,13 @@ describe("implementLeaf — env-fix on environment verdicts", () => {
           envFixNpmBinary: stub,
         });
 
-        // env-fix called at most maxEnvPatches=2 times because
-        // each successful (installRan) call counts toward the budget.
-        expect(envToolCalls).toBeLessThanOrEqual(2);
+        // 2 sessions × 2 chat calls (add + Terminate) = 4. Each
+        // session lands a real mutation and increments envPatches;
+        // the loop stops issuing env-fix once envPatches ==
+        // maxEnvPatches.
+        expect(envToolCalls).toBeLessThanOrEqual(2 * 2);
+        const envSessions = Math.ceil(envToolCalls / 2);
+        expect(envSessions).toBeLessThanOrEqual(2);
       } finally {
         await rm(stubDir, { recursive: true, force: true });
       }

@@ -687,27 +687,28 @@ export async function implementLeaf(
             ? { temperature: input.temperature }
             : {}),
         });
-        // Review fix #6: only count toward `envPatches` when the
-        // tool actually changed disk state. Probes (npm_run) and
-        // no-op idempotent calls (add_dependency at matching
-        // version) shouldn't burn budget.
-        const realChange =
-          envFix.tool !== "npm_run" &&
-          envFix.npmResult !== undefined &&
-          (envFix.npmResult.installRan || envFix.tool === "set_script");
+        // Review fix #6: only count toward `envPatches` when at
+        // least one tool call in the trail actually changed disk
+        // state. Probes (npm_run) and no-op idempotent calls
+        // (add_dependency at matching version) shouldn't burn
+        // budget.
+        const realChange = envFix.trail.some(
+          (e) =>
+            (e.tool === "add_dependency" ||
+              e.tool === "remove_dependency" ||
+              e.tool === "set_script") &&
+            e.npmResult?.ok === true,
+        );
         if (realChange) envPatches++;
 
         // Review fix #7: re-run the test even when `envFix.ok` is
-        // false, IF the underlying npm op landed a package.json
-        // mutation (installRan but install exited non-zero, or
-        // set_script). The mutation may already be sufficient given
-        // the host repo's installed deps; a transient network
-        // failure on `npm install` shouldn't gate the rerun.
-        const shouldRerun =
-          envFix.ok ||
-          (envFix.npmResult !== undefined &&
-            (envFix.npmResult.installRan ||
-              envFix.tool === "set_script"));
+        // false, IF any tool call in the trail landed a
+        // package.json mutation (installRan but install exited
+        // non-zero, or set_script). The mutation may already be
+        // sufficient given the host repo's installed deps; a
+        // transient network failure on `npm install` shouldn't
+        // gate the rerun.
+        const shouldRerun = envFix.ok || realChange;
         if (shouldRerun) {
           // Re-run the test against the same body. If it now passes,
           // the env was indeed the issue.
@@ -752,9 +753,20 @@ export async function implementLeaf(
           };
         }
         recordPriorAttempt(
-          envFix.tool
-            ? `${envFix.tool}(${JSON.stringify(envFix.args ?? {})}) → ${envFix.ok ? "ok but rerun still failing" : "failed: " + (envFix.error ?? "(no error)").slice(0, 200)}`
-            : "env-fix tool call refused",
+          envFix.trail.length > 0
+            ? `env-fix trail: ${envFix.trail
+                .map(
+                  (e) =>
+                    `${e.tool}(${JSON.stringify(e.args)})${
+                      e.npmResult
+                        ? ` → installRan=${e.npmResult.installRan} installOk=${e.npmResult.installOk}`
+                        : e.error
+                          ? ` → error: ${e.error.slice(0, 100)}`
+                          : ""
+                    }`,
+                )
+                .join("; ")} → ${envFix.ok ? "rerun still failing" : "no-op or failed: " + (envFix.error ?? "(no error)").slice(0, 200)}`
+            : "env-fix produced no tool calls",
         );
       } else if (diag.category === "implementation") {
         recordPriorAttempt("body retry (no test/env intervention)");
@@ -795,42 +807,50 @@ export async function implementLeaf(
 function summarizeEnvFix(
   envFix: import("./env-fix.js").EnvFixResult,
 ): string | null {
-  if (!envFix.tool) return null;
+  if (envFix.trail.length === 0 && !envFix.error) return null;
   const lines: string[] = [];
-  lines.push(`tool=${envFix.tool} args=${JSON.stringify(envFix.args ?? {})}`);
-  const npm = envFix.npmResult;
-  if (npm) {
-    const exitCode =
-      "exitCode" in npm ? (npm as { exitCode?: unknown }).exitCode : "n/a";
-    lines.push(
-      `ok=${envFix.ok}  installRan=${npm.installRan}  installOk=${npm.installOk}  exitCode=${exitCode}`,
-    );
-  } else {
-    lines.push(`ok=${envFix.ok}  (no npmResult — agent-side failure)`);
-  }
+  lines.push(
+    `iterations=${envFix.iterations}  ok=${envFix.ok}  terminatedExplicitly=${envFix.terminatedExplicitly}`,
+  );
   if (envFix.error) {
-    lines.push(`error: ${envFix.error}`);
+    lines.push(`session error: ${envFix.error}`);
   }
-  // npm always writes the actionable diagnostic at the END of
-  // stderr; tail-truncate so the model sees the cause, not the
-  // peer-dep warning preamble. Cap at 2000 chars to keep the
-  // retry prompt under control.
-  if (npm?.installStderr) {
-    const tail =
-      npm.installStderr.length > 2000
-        ? "...[truncated head]\n" +
-          npm.installStderr.slice(npm.installStderr.length - 2000)
-        : npm.installStderr;
-    lines.push(`stderr:\n${tail}`);
-  }
-  if (npm?.installStdout) {
-    const tail =
-      npm.installStdout.length > 1000
-        ? "...[truncated head]\n" +
-          npm.installStdout.slice(npm.installStdout.length - 1000)
-        : npm.installStdout;
-    lines.push(`stdout (tail):\n${tail}`);
-  }
+  // Walk the trail in order. For each entry we emit one summary
+  // line + tail-truncated stderr/stdout when the tool call was
+  // an npm op. The body author needs to see what was tried in
+  // sequence so it can avoid repeating the same dead end.
+  envFix.trail.forEach((entry, idx) => {
+    lines.push(
+      `\n[step ${idx + 1}] ${entry.tool}(${JSON.stringify(entry.args)})`,
+    );
+    const npm = entry.npmResult;
+    if (npm) {
+      const exitCode =
+        "exitCode" in npm ? (npm as { exitCode?: unknown }).exitCode : "n/a";
+      lines.push(
+        `  ok=${npm.ok}  installRan=${npm.installRan}  installOk=${npm.installOk}  exitCode=${exitCode}`,
+      );
+      if (npm.error) lines.push(`  error: ${npm.error}`);
+      if (npm.installStderr) {
+        const tail =
+          npm.installStderr.length > 2000
+            ? "...[truncated head]\n" +
+              npm.installStderr.slice(npm.installStderr.length - 2000)
+            : npm.installStderr;
+        lines.push(`  stderr:\n${tail}`);
+      }
+      if (npm.installStdout) {
+        const tail =
+          npm.installStdout.length > 1000
+            ? "...[truncated head]\n" +
+              npm.installStdout.slice(npm.installStdout.length - 1000)
+            : npm.installStdout;
+        lines.push(`  stdout (tail):\n${tail}`);
+      }
+    } else if (entry.error) {
+      lines.push(`  agent-side error: ${entry.error}`);
+    }
+  });
   return lines.join("\n");
 }
 

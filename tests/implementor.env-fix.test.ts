@@ -1,5 +1,11 @@
 /**
  * env-fix tool-call author — Stage C of feature #5.
+ *
+ * Multi-turn (audit gap #4 + #16): the model can call multiple
+ * tools in sequence, with tool results sent back as tool messages,
+ * and signals end-of-session via Terminate. Tool refusals (bad
+ * args, lifecycle hook names, etc.) become tool-error messages so
+ * the model gets a chance to retry.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -8,7 +14,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { applyEnvFixViaTools } from "../src/implementor/env-fix.js";
-import type { LLMClient, LLMResponse } from "../src/llm/types.js";
+import type { ChatMessage, LLMClient, LLMResponse } from "../src/llm/types.js";
 
 const VALID_PKG = {
   name: "test-app",
@@ -33,22 +39,38 @@ afterEach(async () => {
   if (outDir) await rm(outDir, { recursive: true, force: true });
 });
 
-function toolCallClient(
-  toolName: string,
-  args: Record<string, unknown>,
-): LLMClient {
+interface ScriptedCall {
+  name: string;
+  args: Record<string, unknown>;
+  /** Override JSON.stringify(args) — used to inject malformed JSON. */
+  rawArgs?: string;
+}
+
+/** Returns the scripted call sequence; auto-Terminates after the
+ *  scripted calls run out so the loop converges. */
+function scriptedClient(
+  calls: ScriptedCall[],
+): LLMClient & { messages: ChatMessage[][] } {
+  let i = 0;
+  const messages: ChatMessage[][] = [];
   return {
-    async chat(): Promise<LLMResponse> {
+    messages,
+    async chat(msgs: ChatMessage[]): Promise<LLMResponse> {
+      messages.push([...msgs]);
+      const c =
+        calls[i] ??
+        ({ name: "Terminate", args: { reason: "scripted-end" } } as ScriptedCall);
+      i++;
       return {
         content: "",
         finishReason: "tool_calls",
         toolCalls: [
           {
-            id: "call_1",
+            id: `call_${i}`,
             type: "function",
             function: {
-              name: toolName,
-              arguments: JSON.stringify(args),
+              name: c.name,
+              arguments: c.rawArgs ?? JSON.stringify(c.args),
             },
           },
         ],
@@ -67,38 +89,65 @@ const baseInput = {
   bodySource: "return parse(input);",
   testSource: 'import { z } from "zod"; ...',
   skipNpmInstall: true,
+  // Tight budget so error-path tests converge quickly.
+  maxIterations: 4,
 };
 
-describe("applyEnvFixViaTools — happy paths", () => {
-  it("applies add_dependency and writes package.json", async () => {
-    const client = toolCallClient("add_dependency", {
-      name: "zod",
-      version: "^3.22.0",
-      which: "runtime",
-    });
+describe("applyEnvFixViaTools — happy paths (multi-turn)", () => {
+  it("applies add_dependency, then Terminates", async () => {
+    const client = scriptedClient([
+      {
+        name: "add_dependency",
+        args: { name: "zod", version: "^3.22.0", which: "runtime" },
+      },
+      { name: "Terminate", args: { reason: "added" } },
+    ]);
     const r = await applyEnvFixViaTools(client, {
       ...baseInput,
       projectDir: outDir,
     });
-    expect(r.ok, r.error).toBe(true);
-    expect(r.tool).toBe("add_dependency");
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    expect(r.terminatedExplicitly).toBe(true);
+    expect(r.trail).toHaveLength(2);
+    expect(r.trail[0]!.tool).toBe("add_dependency");
+    expect(r.trail[1]!.tool).toBe("Terminate");
     const pkg = JSON.parse(
       await readFile(path.join(outDir, "package.json"), "utf-8"),
     );
     expect(pkg.dependencies.zod).toBe("^3.22.0");
   });
 
+  it("threads tool result back to next turn (audit gap #16: npm_run output)", async () => {
+    // First call: set_script. Second turn the model should see
+    // the result. Third: Terminate.
+    const client = scriptedClient([
+      { name: "set_script", args: { name: "build", command: "tsc -p ." } },
+      { name: "Terminate", args: {} },
+    ]);
+    await applyEnvFixViaTools(client, {
+      ...baseInput,
+      projectDir: outDir,
+    });
+    // The second chat call's message list should contain a tool
+    // message with the set_script result — that's the proof the
+    // model can see what happened.
+    const secondTurnMessages = client.messages[1]!;
+    const toolMsg = secondTurnMessages.find((m) => m.role === "tool");
+    expect(toolMsg).toBeDefined();
+    const parsed = JSON.parse(toolMsg!.content) as Record<string, unknown>;
+    expect(parsed["ok"]).toBe(true);
+  });
+
   it("applies remove_dependency", async () => {
-    // Pre-seed a dep to remove.
-    const seeded = {
-      ...VALID_PKG,
-      dependencies: { lodash: "^4.0.0" },
-    };
+    const seeded = { ...VALID_PKG, dependencies: { lodash: "^4.0.0" } };
     await writeFile(
       path.join(outDir, "package.json"),
       JSON.stringify(seeded, null, 2),
     );
-    const client = toolCallClient("remove_dependency", { name: "lodash" });
+    const client = scriptedClient([
+      { name: "remove_dependency", args: { name: "lodash" } },
+      { name: "Terminate", args: {} },
+    ]);
     const r = await applyEnvFixViaTools(client, {
       ...baseInput,
       projectDir: outDir,
@@ -110,24 +159,42 @@ describe("applyEnvFixViaTools — happy paths", () => {
     expect(pkg.dependencies.lodash).toBeUndefined();
   });
 
-  it("applies set_script", async () => {
-    const client = toolCallClient("set_script", {
-      name: "build",
-      command: "tsc -p .",
-    });
+  it("multi-step: remove broken binding then add alternative", async () => {
+    const seeded = {
+      ...VALID_PKG,
+      dependencies: { "better-sqlite3": "^11.0.0" },
+    };
+    await writeFile(
+      path.join(outDir, "package.json"),
+      JSON.stringify(seeded, null, 2),
+    );
+    const client = scriptedClient([
+      { name: "remove_dependency", args: { name: "better-sqlite3" } },
+      {
+        name: "add_dependency",
+        args: { name: "libsql", version: "^0.4.0", which: "runtime" },
+      },
+      { name: "Terminate", args: { reason: "swapped binding" } },
+    ]);
     const r = await applyEnvFixViaTools(client, {
       ...baseInput,
       projectDir: outDir,
     });
     expect(r.ok).toBe(true);
+    expect(r.trail.map((e) => e.tool)).toEqual([
+      "remove_dependency",
+      "add_dependency",
+      "Terminate",
+    ]);
     const pkg = JSON.parse(
       await readFile(path.join(outDir, "package.json"), "utf-8"),
     );
-    expect(pkg.scripts.build).toBe("tsc -p .");
+    expect(pkg.dependencies["better-sqlite3"]).toBeUndefined();
+    expect(pkg.dependencies.libsql).toBe("^0.4.0");
   });
 });
 
-describe("applyEnvFixViaTools — error paths", () => {
+describe("applyEnvFixViaTools — error paths (recovery via tool messages)", () => {
   it("rejects when the model emits no tool call", async () => {
     const client: LLMClient = {
       async chat(): Promise<LLMResponse> {
@@ -145,31 +212,88 @@ describe("applyEnvFixViaTools — error paths", () => {
     expect(r.error).toMatch(/did not emit/);
   });
 
-  it("rejects unknown tool names", async () => {
-    const client = toolCallClient("totally_made_up", {});
+  it("recovers from an unknown tool name on retry (audit gap #4)", async () => {
+    const client = scriptedClient([
+      { name: "totally_made_up", args: {} },
+      // Model sees the tool-error message and corrects:
+      {
+        name: "add_dependency",
+        args: { name: "zod", version: "^3.22.0", which: "runtime" },
+      },
+      { name: "Terminate", args: {} },
+    ]);
     const r = await applyEnvFixViaTools(client, {
       ...baseInput,
       projectDir: outDir,
     });
-    expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/unknown tool/);
+    expect(r.ok).toBe(true);
+    // First trail entry records the rejection.
+    expect(r.trail[0]!.error).toMatch(/unknown tool/);
+    // Second trail entry is the successful retry.
+    expect(r.trail[1]!.tool).toBe("add_dependency");
   });
 
-  it("propagates underlying npm-tool errors (set_script breaking vitest invariant)", async () => {
-    // Tool call attempts to overwrite scripts.test with non-vitest.
-    const client = toolCallClient("set_script", {
-      name: "test",
-      command: "node --test",
-    });
+  it("propagates underlying npm-tool errors via the trail (set_script breaking vitest invariant)", async () => {
+    const client = scriptedClient([
+      { name: "set_script", args: { name: "test", command: "node --test" } },
+      { name: "Terminate", args: { reason: "giving up" } },
+    ]);
     const r = await applyEnvFixViaTools(client, {
       ...baseInput,
       projectDir: outDir,
     });
+    // Trail records the npm-tool refusal; ok stays false because
+    // no real mutation landed.
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/vitest|invalidate/);
+    expect(r.terminatedExplicitly).toBe(true);
+    const setScriptEntry = r.trail.find((e) => e.tool === "set_script");
+    expect(setScriptEntry?.npmResult?.ok).toBe(false);
+    expect(setScriptEntry?.npmResult?.error).toMatch(/vitest|invalidate/);
   });
 
-  it("rejects malformed JSON arguments", async () => {
+  it("recovers from malformed JSON arguments on retry", async () => {
+    const client = scriptedClient([
+      // First: garbage JSON.
+      { name: "add_dependency", args: {}, rawArgs: "{ broken" },
+      // Retry with valid args.
+      {
+        name: "add_dependency",
+        args: { name: "zod", version: "^3.0.0", which: "runtime" },
+      },
+      { name: "Terminate", args: {} },
+    ]);
+    const r = await applyEnvFixViaTools(client, {
+      ...baseInput,
+      projectDir: outDir,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.trail[0]!.error).toMatch(/JSON parse/);
+    expect(r.trail[1]!.npmResult?.ok).toBe(true);
+  });
+
+  it("recovers from bad arg types on retry", async () => {
+    const client = scriptedClient([
+      {
+        name: "add_dependency",
+        args: { name: "zod", version: "^3.0.0", which: "wrong-bucket" },
+      },
+      {
+        name: "add_dependency",
+        args: { name: "zod", version: "^3.0.0", which: "runtime" },
+      },
+      { name: "Terminate", args: {} },
+    ]);
+    const r = await applyEnvFixViaTools(client, {
+      ...baseInput,
+      projectDir: outDir,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.trail[0]!.npmResult?.ok).toBe(false);
+    expect(r.trail[0]!.npmResult?.error).toMatch(/runtime.*dev/);
+  });
+
+  it("exhausts iteration budget when the model never Terminates", async () => {
+    // Fixed client always returns the same dud call.
     const client: LLMClient = {
       async chat(): Promise<LLMResponse> {
         return {
@@ -179,10 +303,7 @@ describe("applyEnvFixViaTools — error paths", () => {
             {
               id: "x",
               type: "function",
-              function: {
-                name: "add_dependency",
-                arguments: "{ broken",
-              },
+              function: { name: "totally_made_up", arguments: "{}" },
             },
           ],
         };
@@ -194,22 +315,10 @@ describe("applyEnvFixViaTools — error paths", () => {
     const r = await applyEnvFixViaTools(client, {
       ...baseInput,
       projectDir: outDir,
+      maxIterations: 3,
     });
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/did not parse/);
-  });
-
-  it("rejects bad arg types", async () => {
-    const client = toolCallClient("add_dependency", {
-      name: "zod",
-      version: "^3.0.0",
-      which: "wrong-bucket",
-    });
-    const r = await applyEnvFixViaTools(client, {
-      ...baseInput,
-      projectDir: outDir,
-    });
-    expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/runtime.*dev/);
+    expect(r.iterations).toBe(3);
+    expect(r.error).toMatch(/exhausted 3 iterations/);
   });
 });

@@ -1,25 +1,29 @@
 /**
- * Stage C of feature #5 — env-fix author.
+ * Stage C of feature #5 — env-fix author (multi-turn).
  *
  * Fires when `diagnoseFailure` returns category=`environment`. The
- * model picks one of four npm-mutation tools, the harness applies
- * it via the npm-tools primitives, and the leaf retry loop re-runs
- * the test against the same body. If the failure was indeed
- * env-related (missing dep, wrong script, etc.), the rerun
- * succeeds without burning body-author retries.
+ * model gets the failure context and a tool surface (the four
+ * npm-mutation primitives + Terminate). It can call tools in
+ * sequence — `add_dependency` THEN `npm_run` to verify, etc. —
+ * until it terminates explicitly or the iteration budget runs out.
  *
- * Mirrors the pattern of editLeafViaTools (feature #3 stage B):
- * single OpenAI tool call per author session, structured args
- * validated against the underlying primitive's schema.
+ * Audit gap #4: previously single-shot. Tool-arg validation errors
+ * (bad JSON, lifecycle-hook script names, path-traversing package
+ * names) returned an EnvFixResult with `ok: false` and the model
+ * never got a chance to retry. Now a tool refusal is sent back as
+ * a tool-error message and the next iteration lets the model
+ * correct itself.
  *
- * Caveat: changes land in `outDir/package.json` + `outDir/node_modules`,
- * but the harness currently runs vitest against a separate workDir
- * that symlinks node_modules from the host repo. So a newly-added
- * dep won't be visible to vitest until the harness's node_modules
- * resolution is reworked. The primitive is still useful for: (a)
- * landing the right deps on disk for the user, (b) `set_script`
- * fixes that don't depend on node_modules, (c) `npm_run` invoking
- * the host's npm scripts (e.g., `npm run typecheck`).
+ * Audit gap #16: previously `npm_run` captured stdout/stderr but
+ * the model never saw them. Now each tool result (including
+ * `npm_run`'s exit code + truncated stdout/stderr tail) lands in
+ * the conversation as a tool message, so the model can decide
+ * what to do next based on actual evidence.
+ *
+ * Mirrors the multi-turn pattern of `localize` (src/architect/
+ * localization.ts): toolChoice "required" forces the model to
+ * either pick a tool or call Terminate; one-call-per-turn enforced;
+ * budget exhausts → return with a graceful error.
  */
 
 import {
@@ -29,7 +33,12 @@ import {
   npmRun,
   type NpmOpResult,
 } from "../architect/npm-tools.js";
-import type { LLMClient, ChatOptions } from "../llm/types.js";
+import type {
+  ChatMessage,
+  ChatOptions,
+  LLMClient,
+  LLMResponse,
+} from "../llm/types.js";
 
 export interface EnvFixInput {
   /** Project directory (outDir) — where package.json + node_modules
@@ -45,6 +54,12 @@ export interface EnvFixInput {
   bodySource: string;
   /** The test source whose run failed. */
   testSource: string;
+  /** Per-call iteration budget. Default 5 — the paper's §5.3 spec
+   *  ("20 remediation attempts for test or environment errors") is
+   *  per-leaf, not per env-fix-session. We aggregate over multiple
+   *  env-fix sessions; each session is bounded smaller so a
+   *  single round doesn't burn the whole budget. */
+  maxIterations?: number;
   /** Override the npm binary (tests). Defaults to "npm". */
   npmBinary?: string;
   /** Skip actual npm install — useful in tests where mocking the
@@ -58,42 +73,74 @@ export type EnvToolName =
   | "add_dependency"
   | "remove_dependency"
   | "set_script"
-  | "npm_run";
+  | "npm_run"
+  | "Terminate";
 
-export interface EnvFixResult {
-  ok: boolean;
-  /** Which tool the model picked. */
-  tool?: EnvToolName;
-  /** Args the model supplied. */
-  args?: Record<string, unknown>;
-  /** The npm op's underlying result. */
+export interface EnvFixTrailEntry {
+  iteration: number;
+  tool: EnvToolName;
+  /** Args the model supplied. May be empty for Terminate. */
+  args: Record<string, unknown>;
+  /** Underlying npm-tool result, when applicable. */
   npmResult?: NpmOpResult & { exitCode?: number | null };
+  /** Tool-validation or apply error, when the call didn't reach
+   *  the underlying primitive cleanly. */
   error?: string;
 }
 
+export interface EnvFixResult {
+  /** True iff at least ONE tool call landed a real disk mutation
+   *  (installRan or set_script). The leaf retry loop uses this to
+   *  decide whether to re-run the test. */
+  ok: boolean;
+  /** Per-iteration trace. Always non-empty when `iterations > 0`. */
+  trail: EnvFixTrailEntry[];
+  iterations: number;
+  /** Whether the agent called Terminate explicitly. */
+  terminatedExplicitly: boolean;
+  /** Convenience: most recent (tool, args, npmResult) — what
+   *  callers most often want to summarize. */
+  lastTool?: EnvToolName;
+  lastArgs?: Record<string, unknown>;
+  lastNpmResult?: NpmOpResult & { exitCode?: number | null };
+  /** Top-level error when the loop exited badly (budget exhausted,
+   *  client threw, etc.). NOT set when individual tool calls
+   *  failed but the agent recovered. */
+  error?: string;
+}
+
+const DEFAULT_MAX_ITERATIONS = 5;
+/** How much of each tool result's stdout/stderr we send back to
+ *  the model as a tool message. Tail-truncated. */
+const TOOL_RESULT_OUTPUT_CAP = 2000;
+
 const SYSTEM_PROMPT = `You are an Implementor agent applying environment-level fixes to a TypeScript project. A failing test was diagnosed as an ENVIRONMENT issue (missing dependency, wrong script, version mismatch, etc.) — NOT an implementation bug — by a 5-round majority-vote LLM judge.
 
-Your job is to fix the project's environment so the SAME body and SAME test produce a passing run. Pick exactly ONE tool:
+Your job is to fix the project's environment so the SAME body and SAME test will produce a passing run. You operate in a multi-turn loop: each turn pick exactly ONE tool. Tools available:
 
   add_dependency
     Add a runtime or dev dependency to package.json + run npm install. Use when the test imports a module that isn't declared.
 
   remove_dependency
-    Strip a package from both buckets + run npm install. Use when a dep is causing a version conflict and the project doesn't actually need it.
+    Strip a package from both buckets + run npm install. Use when a dep is causing a version conflict and the project doesn't actually need it. Useful AFTER a failed install: try a different binding instead.
 
   set_script
-    Add or change an npm script. The harness REFUSES edits that overwrite scripts.test with anything not invoking vitest, so don't try.
+    Add or change an npm script. The harness REFUSES edits that overwrite scripts.test with anything not invoking vitest, and rejects npm lifecycle hook names (preinstall/postinstall/prepare/...).
 
   npm_run
-    Run an existing script (e.g., npm run build, npm run typecheck) to validate the fix. Use when you've already added a dep and want to confirm it resolves before terminating.
+    Run an existing script (e.g., npm run build, npm run typecheck) to validate the fix. Output (stdout, stderr, exit code) comes back to you on the next turn so you can verify your remediation worked.
 
-Rules:
-  - Output exactly ONE tool call. Don't write prose.
-  - Be conservative. The diagnostic vouches that the BODY is plausibly correct; don't restructure the project.
-  - If the hint mentions a specific package name, use that.
-  - For add_dependency: prefer caret-prefixed versions ("^1.2.3") on current major versions.
+  Terminate
+    End the env-fix session. Call this when you believe the environment is fixed and the leaf's test should be re-run. Pass an empty args object or a short reason.
 
-Return only the tool call.`;
+Decision principles:
+  - Be CONSERVATIVE. The diagnostic vouches that the BODY is plausibly correct; don't restructure the project.
+  - When add_dependency fails (install error in stderr), READ THE STDERR. If the dep doesn't compile (V8 API change, gyp failure, etc.), don't keep retrying the same dep — remove it and pick a different binding.
+  - For sqlite specifically: better-sqlite3 requires a native build that breaks on newer node V8 sometimes. Alternatives: the built-in node:sqlite module (node 22+), libsql (pure JS), or sqlite3 (pre-built binaries).
+  - When add_dependency succeeds (installRan: true, exitCode: 0), call Terminate next — there's no point doing more.
+  - When the hint mentions a specific package name AND that package is reasonable, use it. When the hint is vague, propose what fits the failure.
+
+Output exactly ONE tool call per turn. Don't write prose.`;
 
 const TOOL_DEFS = [
   {
@@ -101,7 +148,7 @@ const TOOL_DEFS = [
     function: {
       name: "add_dependency",
       description:
-        "Add a package to package.json (dependencies if which=runtime, devDependencies if which=dev) and re-run npm install.",
+        "Add a package to package.json (dependencies if which=runtime, devDependencies if which=dev) and re-run npm install. Returns ok / installRan / installOk / exitCode / stdout / stderr.",
       parameters: {
         type: "object",
         properties: {
@@ -125,7 +172,7 @@ const TOOL_DEFS = [
     function: {
       name: "remove_dependency",
       description:
-        "Strip a package from both runtime and dev buckets and re-run npm install.",
+        "Strip a package from both runtime and dev buckets and re-run npm install. Use to swap bindings — remove a broken one before adding the alternative.",
       parameters: {
         type: "object",
         properties: {
@@ -140,7 +187,7 @@ const TOOL_DEFS = [
     function: {
       name: "set_script",
       description:
-        "Set an npm script (refuses to break scripts.test invariant).",
+        "Set an npm script. Refuses overwriting scripts.test with anything that doesn't invoke vitest, and rejects npm lifecycle hook names (preinstall, postinstall, prepare, etc.).",
       parameters: {
         type: "object",
         properties: {
@@ -159,7 +206,7 @@ const TOOL_DEFS = [
     function: {
       name: "npm_run",
       description:
-        "Run an existing npm script and report exit code, stdout, stderr.",
+        "Run an existing npm script and report exit code, stdout, stderr. Use to verify a remediation worked before terminating.",
       parameters: {
         type: "object",
         properties: {
@@ -172,53 +219,238 @@ const TOOL_DEFS = [
       },
     },
   },
+  {
+    type: "function" as const,
+    function: {
+      name: "Terminate",
+      description:
+        "End the env-fix session. Call when you believe the environment is fixed (or no further action makes sense).",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: {
+            type: "string",
+            description: "Brief note on why you're terminating.",
+          },
+        },
+      },
+    },
+  },
 ];
 
+/** Multi-turn env-fix. Returns the trail of tool calls + a summary
+ *  of whether at least one mutation landed on disk (the leaf
+ *  retry loop's signal that the test should be re-run). */
 export async function applyEnvFixViaTools(
   client: LLMClient,
   input: EnvFixInput,
 ): Promise<EnvFixResult> {
-  const userPrompt = buildUserPrompt(input);
-  const opts: ChatOptions = {
-    tools: TOOL_DEFS,
-    toolChoice: "required",
-    ...(input.temperature !== undefined
-      ? { temperature: input.temperature }
-      : {}),
-  };
-  const response = await client.chat(
-    [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userPrompt },
-    ],
-    opts,
-  );
-  const calls = response.toolCalls ?? [];
-  if (calls.length === 0) {
-    return { ok: false, error: "agent did not emit a tool call" };
-  }
-  const call = calls[0]!;
-  const toolName = call.function.name as EnvToolName;
-  if (!isEnvToolName(toolName)) {
-    return { ok: false, error: `unknown tool "${call.function.name}"` };
-  }
-  let args: Record<string, unknown>;
-  try {
-    args = JSON.parse(call.function.arguments) as Record<string, unknown>;
-  } catch (e) {
-    return {
-      ok: false,
-      tool: toolName,
-      error: `tool arguments did not parse: ${(e as Error).message}`,
+  const maxIterations = Math.max(1, input.maxIterations ?? DEFAULT_MAX_ITERATIONS);
+  const messages: ChatMessage[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: buildInitialUserPrompt(input) },
+  ];
+  const trail: EnvFixTrailEntry[] = [];
+  let landedRealMutation = false;
+  let lastTool: EnvToolName | undefined;
+  let lastArgs: Record<string, unknown> | undefined;
+  let lastNpmResult:
+    | (NpmOpResult & { exitCode?: number | null })
+    | undefined;
+
+  for (let i = 0; i < maxIterations; i++) {
+    const opts: ChatOptions = {
+      tools: TOOL_DEFS,
+      toolChoice: "required",
+      ...(input.temperature !== undefined
+        ? { temperature: input.temperature }
+        : {}),
     };
+    let response: LLMResponse;
+    try {
+      response = await client.chat(messages, opts);
+    } catch (e) {
+      return {
+        ok: landedRealMutation,
+        trail,
+        iterations: i,
+        terminatedExplicitly: false,
+        error: `env-fix chat failed at iteration ${i + 1}: ${e instanceof Error ? e.message : String(e)}`,
+        ...(lastTool ? { lastTool } : {}),
+        ...(lastArgs ? { lastArgs } : {}),
+        ...(lastNpmResult ? { lastNpmResult } : {}),
+      };
+    }
+    const toolCalls = response.toolCalls ?? [];
+    if (toolCalls.length === 0) {
+      return {
+        ok: landedRealMutation,
+        trail,
+        iterations: i + 1,
+        terminatedExplicitly: false,
+        error: "agent did not emit a tool call (must Terminate or use a tool)",
+        ...(lastTool ? { lastTool } : {}),
+        ...(lastArgs ? { lastArgs } : {}),
+        ...(lastNpmResult ? { lastNpmResult } : {}),
+      };
+    }
+    // Enforce one-call-per-turn. Same rationale as localize.
+    if (toolCalls.length > 1) {
+      messages.push({
+        role: "assistant",
+        content: response.content ?? "",
+        tool_calls: toolCalls,
+      });
+      for (const c of toolCalls) {
+        messages.push({
+          role: "tool",
+          tool_call_id: c.id,
+          content: JSON.stringify({
+            error:
+              "Emit exactly ONE tool call per turn. Pick one, see the result, then decide.",
+          }),
+        });
+      }
+      trail.push({
+        iteration: i + 1,
+        tool: "Terminate",
+        args: {},
+        error: "rejected: multi-tool-call turn",
+      });
+      continue;
+    }
+    const call = toolCalls[0]!;
+    const toolName = call.function.name as EnvToolName;
+    if (!isEnvToolName(toolName)) {
+      // Unknown tool name — surface the rejection back to the
+      // model and let it retry.
+      messages.push({
+        role: "assistant",
+        content: response.content ?? "",
+        tool_calls: toolCalls,
+      });
+      messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify({
+          error: `unknown tool "${call.function.name}". Pick one of: add_dependency, remove_dependency, set_script, npm_run, Terminate.`,
+        }),
+      });
+      trail.push({
+        iteration: i + 1,
+        tool: "Terminate",
+        args: {},
+        error: `unknown tool: ${call.function.name}`,
+      });
+      continue;
+    }
+
+    let parsedArgs: Record<string, unknown>;
+    try {
+      parsedArgs = JSON.parse(call.function.arguments) as Record<string, unknown>;
+    } catch (e) {
+      messages.push({
+        role: "assistant",
+        content: response.content ?? "",
+        tool_calls: toolCalls,
+      });
+      messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify({
+          error: `arguments did not parse as JSON: ${e instanceof Error ? e.message : String(e)}. The arguments field must be a valid JSON object.`,
+        }),
+      });
+      trail.push({
+        iteration: i + 1,
+        tool: toolName,
+        args: {},
+        error: `JSON parse: ${call.function.arguments.slice(0, 200)}`,
+      });
+      continue;
+    }
+
+    if (toolName === "Terminate") {
+      messages.push({
+        role: "assistant",
+        content: response.content ?? "",
+        tool_calls: toolCalls,
+      });
+      // Ack the Terminate so OpenAI doesn't complain about the
+      // unanswered tool_call_id (some clients are strict).
+      messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify({ ok: true }),
+      });
+      trail.push({
+        iteration: i + 1,
+        tool: "Terminate",
+        args: parsedArgs,
+      });
+      lastTool = "Terminate";
+      lastArgs = parsedArgs;
+      return {
+        ok: landedRealMutation,
+        trail,
+        iterations: i + 1,
+        terminatedExplicitly: true,
+        lastTool,
+        lastArgs,
+        ...(lastNpmResult ? { lastNpmResult } : {}),
+      };
+    }
+
+    // Apply the data tool.
+    const npmResult = await runEnvTool(toolName, parsedArgs, input);
+    lastTool = toolName;
+    lastArgs = parsedArgs;
+    lastNpmResult = npmResult;
+    // "Real mutation" = a tool call that mutates package.json. For
+    // add/remove/set_script that's `npmResult.ok`. npm_run is a
+    // probe — never counts. Semantics MUST mirror leaf.ts's
+    // realChange computation exactly.
+    if (
+      (toolName === "add_dependency" ||
+        toolName === "remove_dependency" ||
+        toolName === "set_script") &&
+      npmResult.ok
+    ) {
+      landedRealMutation = true;
+    }
+
+    trail.push({
+      iteration: i + 1,
+      tool: toolName,
+      args: parsedArgs,
+      npmResult,
+      ...(npmResult.error ? { error: npmResult.error } : {}),
+    });
+
+    // Push assistant + tool messages so the model sees the result
+    // on the next turn.
+    messages.push({
+      role: "assistant",
+      content: response.content ?? "",
+      tool_calls: toolCalls,
+    });
+    messages.push({
+      role: "tool",
+      tool_call_id: call.id,
+      content: JSON.stringify(serializeNpmResultForTool(npmResult)),
+    });
   }
-  const npmResult = await runEnvTool(toolName, args, input);
+
+  // Budget exhausted without Terminate.
   return {
-    ok: npmResult.ok,
-    tool: toolName,
-    args,
-    npmResult,
-    ...(npmResult.ok ? {} : { error: npmResult.error ?? "tool failed" }),
+    ok: landedRealMutation,
+    trail,
+    iterations: maxIterations,
+    terminatedExplicitly: false,
+    error: `env-fix exhausted ${maxIterations} iterations without Terminate`,
+    ...(lastTool ? { lastTool } : {}),
+    ...(lastArgs ? { lastArgs } : {}),
+    ...(lastNpmResult ? { lastNpmResult } : {}),
   };
 }
 
@@ -229,12 +461,13 @@ function isEnvToolName(s: string): s is EnvToolName {
     s === "add_dependency" ||
     s === "remove_dependency" ||
     s === "set_script" ||
-    s === "npm_run"
+    s === "npm_run" ||
+    s === "Terminate"
   );
 }
 
 async function runEnvTool(
-  tool: EnvToolName,
+  tool: Exclude<EnvToolName, "Terminate">,
   args: Record<string, unknown>,
   input: EnvFixInput,
 ): Promise<NpmOpResult & { exitCode?: number | null }> {
@@ -299,7 +532,7 @@ async function runEnvTool(
         outDir: input.projectDir,
         name,
         command,
-        skipNpmInstall: true, // scripts don't affect deps
+        skipNpmInstall: true,
       });
     }
     case "npm_run": {
@@ -321,7 +554,33 @@ async function runEnvTool(
   }
 }
 
-function buildUserPrompt(input: EnvFixInput): string {
+function serializeNpmResultForTool(
+  npmResult: NpmOpResult & { exitCode?: number | null },
+): Record<string, unknown> {
+  // Tail-truncate stdout/stderr — the actionable diagnostic is at
+  // the END (npm warnings precede; gyp init noise precedes).
+  const tail = (s: string | undefined, max: number): string | undefined => {
+    if (!s) return s;
+    return s.length > max ? "...[truncated head]\n" + s.slice(s.length - max) : s;
+  };
+  return {
+    ok: npmResult.ok,
+    installRan: npmResult.installRan,
+    installOk: npmResult.installOk,
+    ...(("exitCode" in npmResult)
+      ? { exitCode: (npmResult as { exitCode?: unknown }).exitCode }
+      : {}),
+    ...(npmResult.error ? { error: npmResult.error } : {}),
+    ...(npmResult.installStdout
+      ? { stdout: tail(npmResult.installStdout, TOOL_RESULT_OUTPUT_CAP) }
+      : {}),
+    ...(npmResult.installStderr
+      ? { stderr: tail(npmResult.installStderr, TOOL_RESULT_OUTPUT_CAP) }
+      : {}),
+  };
+}
+
+function buildInitialUserPrompt(input: EnvFixInput): string {
   const lines: string[] = [];
   lines.push("# Diagnostic envPatchHint");
   lines.push("");
@@ -331,7 +590,8 @@ function buildUserPrompt(input: EnvFixInput): string {
   lines.push("");
   const trimmed =
     input.failureMessage.length > 3000
-      ? input.failureMessage.slice(0, 3000) + "\n... [truncated]"
+      ? "...[truncated head]\n" +
+        input.failureMessage.slice(input.failureMessage.length - 3000)
       : input.failureMessage;
   lines.push("```");
   lines.push(trimmed);
@@ -350,7 +610,7 @@ function buildUserPrompt(input: EnvFixInput): string {
   lines.push("```");
   lines.push("");
   lines.push(
-    "Pick one tool to fix the environment. Output the structured tool call only.",
+    "Fix the environment so the same body + test pass. Use the tools — multi-turn is allowed. Terminate when you believe it's fixed.",
   );
   return lines.join("\n");
 }

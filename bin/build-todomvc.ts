@@ -80,6 +80,51 @@ DON'T:
 I want a project where \`git clone … && npm install && npm test && npm start\` produces a working app I can interact with.
 `;
 
+/**
+ * Audit gap #1: prepend a stack-health preamble to the project
+ * description when phase 0's `npm install` failed but
+ * package.json is otherwise valid. Downstream phases see this so
+ * they can plan around an unbuildable dep instead of building on
+ * top of it. Mirror copy in bin/run-task.ts.
+ */
+function augmentDescriptionWithStackHealth(
+  description: string,
+  stack: { ok: boolean; packageJson?: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> }; error?: string },
+): string {
+  if (stack.ok) return description;
+  const deps = Object.keys(stack.packageJson?.dependencies ?? {});
+  const devDeps = Object.keys(stack.packageJson?.devDependencies ?? {});
+  const errTail =
+    stack.error && stack.error.length > 2000
+      ? "...[head truncated]\n" + stack.error.slice(stack.error.length - 2000)
+      : stack.error ?? "(no detail)";
+  const lines: string[] = [];
+  lines.push("[STACK HEALTH WARNING from phase 0]");
+  lines.push("");
+  lines.push(
+    "The package.json was materialized but `npm install` FAILED. Some declared dependencies are not actually available on this host. Plan downstream so importable modules are limited to ones that survived install — if a chosen dep is unbuildable here, propose an alternative when the structure / interface / body author phases reference it.",
+  );
+  lines.push("");
+  if (deps.length > 0) {
+    lines.push(`Declared runtime dependencies: ${deps.join(", ")}`);
+  }
+  if (devDeps.length > 0) {
+    lines.push(`Declared dev dependencies: ${devDeps.join(", ")}`);
+  }
+  lines.push("");
+  lines.push("Install error tail (npm puts the actionable diagnostic LAST):");
+  lines.push("```");
+  lines.push(errTail);
+  lines.push("```");
+  lines.push("");
+  lines.push("[end stack health warning]");
+  lines.push("");
+  lines.push("Original task description follows:");
+  lines.push("");
+  lines.push(description);
+  return lines.join("\n");
+}
+
 async function main(): Promise<number> {
   const startedAt = Date.now();
   const log = (msg: string): void => {
@@ -150,9 +195,17 @@ async function main(): Promise<number> {
     } devDeps; npm install ${stack.installOk ? "ok" : "skipped/failed"}`,
   );
 
+  // Audit gap #1: thread phase-0 install outcome into downstream
+  // phase prompts. See augmentDescriptionWithStackHealth in
+  // bin/run-task.ts for rationale + format.
+  const descriptionWithStackHealth = augmentDescriptionWithStackHealth(
+    DESCRIPTION,
+    stack,
+  );
+
   log("phase 3 — proposal");
   const proposal = await proposeFunctionalityGraph(client, rpg, {
-    description: DESCRIPTION,
+    description: descriptionWithStackHealth,
     maxAttempts: 2,
   });
   if (!proposal.ok) {
@@ -164,7 +217,7 @@ async function main(): Promise<number> {
 
   log("phase 4 — file structure");
   const structure = await encodeFileStructure(client, rpg, {
-    description: DESCRIPTION,
+    description: descriptionWithStackHealth,
     maxAttempts: 2,
   });
   if (!structure.ok) {
@@ -176,7 +229,7 @@ async function main(): Promise<number> {
 
   log("phase 5 — interfaces");
   const interfaces = await designInterfaces(client, rpg, {
-    description: DESCRIPTION,
+    description: descriptionWithStackHealth,
     maxAttempts: 2,
     // Fan out per ancestor group when there's more than one. Keeps
     // each LLM prompt small enough that GLM doesn't stall on
@@ -194,7 +247,7 @@ async function main(): Promise<number> {
 
   log("refactor pass");
   const refactor = await runRefactorPass(client, rpg, {
-    description: DESCRIPTION,
+    description: descriptionWithStackHealth,
     maxAttempts: 2,
   });
   if (!refactor.ok) {

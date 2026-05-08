@@ -116,6 +116,65 @@ async function writeResult(
   await writeFile(resultPath, JSON.stringify(result, null, 2), "utf-8");
 }
 
+/**
+ * Audit gap #1: prepend a "Stack health" preamble to the project
+ * description when the phase 0 install failed. Without this,
+ * downstream architect phases (proposal / structure / interfaces /
+ * refactor) plan files importing a dep that's already known to be
+ * uninstallable on this host (e.g., a native module that doesn't
+ * compile against the current node V8 — better-sqlite3 + node 26
+ * is the canonical case). The model never sees the failure and
+ * keeps building on a broken stack.
+ *
+ * The preamble carries:
+ *   - which deps the model picked
+ *   - that npm install failed
+ *   - the actionable tail of the install error
+ *   - guidance to plan around the broken dep (suggest alternatives
+ *     when picking imports / file structure)
+ */
+function augmentDescriptionWithStackHealth(
+  description: string,
+  stack: { ok: boolean; packageJson?: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> }; error?: string },
+): string {
+  // Happy path: install succeeded. Pass description through.
+  if (stack.ok) return description;
+  // Install failed but package.json is valid (proposeStack
+  // populates packageJson only after JSON validation). Surface
+  // the install error so downstream phases avoid the broken dep.
+  const deps = Object.keys(stack.packageJson?.dependencies ?? {});
+  const devDeps = Object.keys(stack.packageJson?.devDependencies ?? {});
+  const errTail =
+    stack.error && stack.error.length > 2000
+      ? "...[head truncated]\n" + stack.error.slice(stack.error.length - 2000)
+      : stack.error ?? "(no detail)";
+  const lines: string[] = [];
+  lines.push("[STACK HEALTH WARNING from phase 0]");
+  lines.push("");
+  lines.push(
+    "The package.json was materialized but `npm install` FAILED. Some declared dependencies are not actually available on this host. Plan downstream so importable modules are limited to ones that survived install — if a chosen dep is unbuildable here, propose an alternative (a different SQLite binding, a different HTTP framework, etc.) when the structure / interface / body author phases reference it.",
+  );
+  lines.push("");
+  if (deps.length > 0) {
+    lines.push(`Declared runtime dependencies: ${deps.join(", ")}`);
+  }
+  if (devDeps.length > 0) {
+    lines.push(`Declared dev dependencies: ${devDeps.join(", ")}`);
+  }
+  lines.push("");
+  lines.push("Install error tail (npm puts the actionable diagnostic LAST):");
+  lines.push("```");
+  lines.push(errTail);
+  lines.push("```");
+  lines.push("");
+  lines.push("[end stack health warning]");
+  lines.push("");
+  lines.push("Original task description follows:");
+  lines.push("");
+  lines.push(description);
+  return lines.join("\n");
+}
+
 async function run(args: ParsedArgs): Promise<number> {
   const { log } = startedAt();
   const config = await loadConfig();
@@ -243,10 +302,21 @@ async function run(args: ParsedArgs): Promise<number> {
     } devDeps; npm install ${stack.installOk ? "ok" : "skipped/failed"}`,
   );
 
+  // Audit gap #1: thread the stack-install outcome into the
+  // description that downstream phases see. Without this, the
+  // proposal/structure/interfaces phases plan files importing a
+  // dep that's known to be uninstallable (e.g., better-sqlite3 vs
+  // current node V8). The model never sees the failure and keeps
+  // building on a broken stack.
+  const taskWithStackHealth = augmentDescriptionWithStackHealth(
+    args.task,
+    stack,
+  );
+
   // Phase 1: proposal
   log("phase=proposal");
   const proposal = await proposeFunctionalityGraph(client, rpg, {
-    description: args.task,
+    description: taskWithStackHealth,
     maxAttempts: 2,
   });
   if (!proposal.ok) {
@@ -266,7 +336,7 @@ async function run(args: ParsedArgs): Promise<number> {
   // Phase 2: structure
   log("phase=structure");
   const structure = await encodeFileStructure(client, rpg, {
-    description: args.task,
+    description: taskWithStackHealth,
     maxAttempts: 2,
   });
   if (!structure.ok) {
@@ -286,7 +356,7 @@ async function run(args: ParsedArgs): Promise<number> {
   // Phase 3: interfaces
   log("phase=interfaces");
   const interfaces = await designInterfaces(client, rpg, {
-    description: args.task,
+    description: taskWithStackHealth,
     maxAttempts: 2,
     mode: mode === "greenfield" ? "greenfield" : "extend",
     parallelism: 4,
@@ -310,7 +380,7 @@ async function run(args: ParsedArgs): Promise<number> {
   // Phase 4: refactor
   log("phase=refactor");
   const refactor = await runRefactorPass(client, rpg, {
-    description: args.task,
+    description: taskWithStackHealth,
     maxAttempts: 2,
   });
   if (!refactor.ok) {
