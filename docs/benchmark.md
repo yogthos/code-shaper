@@ -65,6 +65,12 @@ All 36 tests **pass** (after the filename fix-up). The tests
 genuinely exercise the surface — no pro-forma assertions; edge
 cases are covered.
 
+The library is also runnable end-to-end. After hand-adding a
+`start` script + small `src/demo.ts` driver, `npm start` exercises
+the full surface (add / toggle / edit / remove / clearCompleted +
+both error paths) and prints a clean trace. The library logic
+itself works; only the metadata files needed touch-up.
+
 ### Failure modes the baseline hit
 
 - **Truncated extensions** on `package.json` and `tsconfig.json`
