@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
-import { mkdtemp, writeFile, rm, readFile } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, readFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -254,17 +254,20 @@ describe("implementLeaf — env-fix on environment verdicts", () => {
             sys.includes("npm-mutation tools")
           ) {
             envToolCalls++;
+            // Vary the package on each call so each is a REAL change
+            // (idempotent no-op calls don't count against the budget
+            // per review fix #6).
             return {
               content: "",
               finishReason: "tool_calls",
               toolCalls: [
                 {
-                  id: "ec",
+                  id: `ec${envToolCalls}`,
                   type: "function",
                   function: {
                     name: "add_dependency",
                     arguments: JSON.stringify({
-                      name: "zod",
+                      name: `dep-${envToolCalls}`,
                       version: "^3.0.0",
                       which: "runtime",
                     }),
@@ -280,23 +283,36 @@ describe("implementLeaf — env-fix on environment verdicts", () => {
         },
       };
 
-      await implementLeaf(client, {
-        leaf: hostFile.interfacePlan!.entries[0]!,
-        hostFile,
-        rpg,
-        bodyByLeafId: new Map(),
-        testsByLeafId: new Map(),
-        workDir,
-        maxAttempts: 5,
-        diagnosis: { enabled: true, rounds: 1, afterFailures: 0 },
-        enableEnvFix: true,
-        maxEnvPatches: 2,
-        projectDir,
-        envFixSkipNpmInstall: true,
-      });
+      // Stub npm so installRan: true on each call — budget only
+      // counts mutations that actually landed on disk (review fix
+      // #6: no-op or skipNpmInstall calls don't burn the budget).
+      const stubDir = await mkdtemp(path.join(tmpdir(), "stub-npm-"));
+      const stub = path.join(stubDir, "stub-npm");
+      await writeFile(stub, `#!/usr/bin/env node\nprocess.exit(0);\n`);
+      await chmod(stub, 0o755);
 
-      // env-fix called at most maxEnvPatches=2 times.
-      expect(envToolCalls).toBeLessThanOrEqual(2);
+      try {
+        await implementLeaf(client, {
+          leaf: hostFile.interfacePlan!.entries[0]!,
+          hostFile,
+          rpg,
+          bodyByLeafId: new Map(),
+          testsByLeafId: new Map(),
+          workDir,
+          maxAttempts: 5,
+          diagnosis: { enabled: true, rounds: 1, afterFailures: 0 },
+          enableEnvFix: true,
+          maxEnvPatches: 2,
+          projectDir,
+          envFixNpmBinary: stub,
+        });
+
+        // env-fix called at most maxEnvPatches=2 times because
+        // each successful (installRan) call counts toward the budget.
+        expect(envToolCalls).toBeLessThanOrEqual(2);
+      } finally {
+        await rm(stubDir, { recursive: true, force: true });
+      }
     },
   );
 

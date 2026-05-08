@@ -463,10 +463,16 @@ export async function implementLeaf(
           "vitest produced no results for this leaf (likely a file-load or compile error)",
         testCount: 0,
       };
+      // Review fix #9: do NOT `continue` here — the diagnostic
+      // block at the bottom of the iteration is the whole point
+      // of the failuresSeen accounting. A suite-level failure
+      // (compile error, import typo, missing dep) is exactly the
+      // case the diagnostic should classify as `environment` or
+      // `test_brittleness`. The previous `continue` jumped over
+      // the diagnostic, leaving file-load failures to burn the
+      // entire body-debug budget without ever firing it.
       failuresSeen++;
-      continue;
-    }
-    if (outcome.ok) {
+    } else if (outcome.ok) {
       return {
         leafId,
         ok: true,
@@ -476,18 +482,19 @@ export async function implementLeaf(
         testRewrites,
         ...(diagnoses.length > 0 ? { diagnoses } : {}),
       };
+    } else {
+      lastFailure = outcome;
+      // When the per-leaf failure message is suite-level and stderr
+      // carries the real diagnostic, blend them so the retry prompt
+      // sees both.
+      if (result.fatal && outcome.failureMessage.includes("suite-level")) {
+        lastFailure = {
+          ...outcome,
+          failureMessage: `${outcome.failureMessage}\nstderr:\n${result.fatal}`,
+        };
+      }
+      failuresSeen++;
     }
-    lastFailure = outcome;
-    // When the per-leaf failure message is suite-level and stderr
-    // carries the real diagnostic, blend them so the retry prompt
-    // sees both.
-    if (result.fatal && outcome.failureMessage.includes("suite-level")) {
-      lastFailure = {
-        ...outcome,
-        failureMessage: `${outcome.failureMessage}\nstderr:\n${result.fatal}`,
-      };
-    }
-    failuresSeen++;
 
     // 5-round MV failure diagnosis (RPG paper §5.3 + Algorithm 4
     // step 5). Skips the first `afterFailures` failures to avoid
@@ -628,8 +635,28 @@ export async function implementLeaf(
             ? { temperature: input.temperature }
             : {}),
         });
-        envPatches++;
-        if (envFix.ok) {
+        // Review fix #6: only count toward `envPatches` when the
+        // tool actually changed disk state. Probes (npm_run) and
+        // no-op idempotent calls (add_dependency at matching
+        // version) shouldn't burn budget.
+        const realChange =
+          envFix.tool !== "npm_run" &&
+          envFix.npmResult !== undefined &&
+          (envFix.npmResult.installRan || envFix.tool === "set_script");
+        if (realChange) envPatches++;
+
+        // Review fix #7: re-run the test even when `envFix.ok` is
+        // false, IF the underlying npm op landed a package.json
+        // mutation (installRan but install exited non-zero, or
+        // set_script). The mutation may already be sufficient given
+        // the host repo's installed deps; a transient network
+        // failure on `npm install` shouldn't gate the rerun.
+        const shouldRerun =
+          envFix.ok ||
+          (envFix.npmResult !== undefined &&
+            (envFix.npmResult.installRan ||
+              envFix.tool === "set_script"));
+        if (shouldRerun) {
           // Re-run the test against the same body. If it now passes,
           // the env was indeed the issue.
           const rerun = await runTests(input.rpg, {

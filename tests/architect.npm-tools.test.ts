@@ -244,6 +244,74 @@ describe("npmRun", () => {
   });
 });
 
+describe("security validators (review fix #1)", () => {
+  it("addDependency rejects path-traversing package names", async () => {
+    const r = await addDependency({
+      outDir,
+      name: "../../etc/passwd",
+      version: "^1.0.0",
+      which: "runtime",
+      skipNpmInstall: true,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/npm package-name format/i);
+  });
+
+  it("addDependency rejects names with shell metachars", async () => {
+    const r = await addDependency({
+      outDir,
+      name: "evil; rm -rf /",
+      version: "^1.0.0",
+      which: "runtime",
+      skipNpmInstall: true,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  it("addDependency accepts scoped names", async () => {
+    const r = await addDependency({
+      outDir,
+      name: "@types/node",
+      version: "^22.0.0",
+      which: "dev",
+      skipNpmInstall: true,
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it("setScript rejects npm lifecycle hook names (RCE prevention)", async () => {
+    for (const hook of ["preinstall", "postinstall", "prepare"]) {
+      const r = await setScript({
+        outDir,
+        name: hook,
+        command: "echo hi",
+        skipNpmInstall: true,
+      });
+      expect(r.ok, `hook=${hook}`).toBe(false);
+      expect(r.error).toMatch(/lifecycle hook/);
+    }
+  });
+
+  it("setScript rejects script names with traversal/special chars", async () => {
+    const r = await setScript({
+      outDir,
+      name: "../weird",
+      command: "x",
+      skipNpmInstall: true,
+    });
+    expect(r.ok).toBe(false);
+  });
+
+  it("npmRun rejects bogus script names before checking package.json", async () => {
+    const r = await npmRun({
+      outDir,
+      script: "preinstall",
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/lifecycle hook/);
+  });
+});
+
 describe("error handling", () => {
   it("addDependency surfaces a clear error when package.json is missing", async () => {
     await rm(path.join(outDir, "package.json"));

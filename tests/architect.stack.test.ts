@@ -67,11 +67,38 @@ describe("parsePackageJson", () => {
     }
   });
 
-  it("requires kebab-case name", () => {
+  it("requires npm package-name format (rejects PascalCase)", () => {
     const bad = { ...VALID_PKG, name: "TodoMVC" };
     const r = parsePackageJson(JSON.stringify(bad));
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toMatch(/kebab-case/);
+    if (!r.ok) expect(r.error).toMatch(/npm package-name format/);
+  });
+
+  it("accepts scoped names like @org/pkg (review fix #2)", () => {
+    const r = parsePackageJson(
+      JSON.stringify({ ...VALID_PKG, name: "@org/pkg" }),
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it("rejects names exceeding the 214-char npm cap (review fix #2)", () => {
+    const long = "a".repeat(215);
+    const r = parsePackageJson(JSON.stringify({ ...VALID_PKG, name: long }));
+    expect(r.ok).toBe(false);
+  });
+
+  it("rejects unanchored versions like '0.1.0junk' (review fix #3)", () => {
+    const r = parsePackageJson(
+      JSON.stringify({ ...VALID_PKG, version: "0.1.0junk" }),
+    );
+    expect(r.ok).toBe(false);
+  });
+
+  it("accepts pre-release versions like 1.0.0-rc.1 (review fix #3)", () => {
+    const r = parsePackageJson(
+      JSON.stringify({ ...VALID_PKG, version: "1.0.0-rc.1" }),
+    );
+    expect(r.ok).toBe(true);
   });
 
   it("requires type: module", () => {

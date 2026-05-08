@@ -212,14 +212,27 @@ export function parsePackageJson(raw: string): ParseOk | ParseErr {
   }
   const obj = parsed;
   const name = obj["name"];
-  if (typeof name !== "string" || !/^[a-z][a-z0-9-]*$/.test(name)) {
+  // Review fix #2: use npm's actual package-name format (allows
+  // scoped names @org/pkg, names with `.` and `_`, digit-leading
+  // segments). Length-capped at 214 per npm spec.
+  if (
+    typeof name !== "string" ||
+    name.length === 0 ||
+    name.length > 214 ||
+    !/^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/.test(name)
+  ) {
     return {
       ok: false,
-      error: `name: required kebab-case identifier (got ${JSON.stringify(name)})`,
+      error: `name: must match npm package-name format (got ${JSON.stringify(name)})`,
     };
   }
   const version = obj["version"];
-  if (typeof version !== "string" || !/^\d+\.\d+\.\d+/.test(version)) {
+  // Review fix #3: anchor the regex so "0.1.0junk" is rejected;
+  // accept pre-release + build metadata per semver.
+  if (
+    typeof version !== "string" ||
+    !/^\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?$/.test(version)
+  ) {
     return {
       ok: false,
       error: `version: required semver string (got ${JSON.stringify(version)})`,
