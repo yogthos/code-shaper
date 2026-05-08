@@ -9,6 +9,7 @@ export {
   leafToTestFilename,
   linkHostNodeModules,
   outcomeForLeaf,
+  resolveNodeModulesSource,
   runTests,
 } from "./test-harness.js";
 export type {

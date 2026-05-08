@@ -34,6 +34,7 @@ import { implementLeaf, type LeafImplementResult } from "./leaf.js";
 import {
   createHarnessDir,
   linkHostNodeModules,
+  resolveNodeModulesSource,
   runTests,
   type TestRunResult,
 } from "./test-harness.js";
@@ -54,8 +55,12 @@ export interface BuildInput {
   /** When true, leaves the harness work directory in place after the
    *  run for debugging. Defaults to false. */
   preserveHarness?: boolean;
-  /** Host repo whose node_modules vitest needs. Defaults to
-   *  process.cwd(). */
+  /** Host whose node_modules the harness symlinks for vitest +
+   *  the model's deps. Default resolution (`resolveNodeModulesSource`):
+   *  prefer outDir/node_modules when it has vitest installed
+   *  (post phase-0 happy path — env-fix changes propagate); fall
+   *  back to `process.cwd()` otherwise (dev / unit-test path).
+   *  Pass an explicit value here only when neither default fits. */
   hostRepo?: string;
   /** Wall-clock timeout for the FINAL cross-file test run (after every
    *  leaf has attempted). Larger than the per-leaf timeout because the
@@ -119,7 +124,10 @@ export async function buildImplementations(
   }
 
   const workDir = await createHarnessDir();
-  await linkHostNodeModules(workDir, input.hostRepo ?? process.cwd());
+  await linkHostNodeModules(
+    workDir,
+    resolveNodeModulesSource(input.outDir, input.hostRepo),
+  );
 
   const bodyByLeafId = new Map<string, string>();
   const testsByLeafId = new Map<string, string>();

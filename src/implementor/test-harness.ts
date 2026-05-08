@@ -17,6 +17,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile, rm, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -185,9 +186,16 @@ export async function createHarnessDir(): Promise<string> {
   return dir;
 }
 
-/** Symlink the host repo's node_modules into the harness dir so
- *  vitest + tsx + tree-sitter are reachable. Cheaper than `npm
- *  install` per run. */
+/** Symlink a host's node_modules into the harness dir so vitest +
+ *  tsx + tree-sitter (and the model's deps, when hostRepo is the
+ *  outDir) are reachable from the harness. Cheaper than `npm
+ *  install` per run.
+ *
+ *  Threat-model note: the symlink target is whatever the caller
+ *  passes. The orchestrator's `resolveNodeModulesSource` picks
+ *  between outDir and process.cwd(); a malicious value here would
+ *  expose the harness to whatever's at that path. The MCP server
+ *  layer's filesystem sandbox bounds this at the OS level. */
 export async function linkHostNodeModules(
   harnessDir: string,
   hostRepo: string,
@@ -203,6 +211,36 @@ export async function linkHostNodeModules(
     const err = e as NodeJS.ErrnoException;
     if (err.code !== "EEXIST") throw err;
   }
+}
+
+/**
+ * Pick the right host for `linkHostNodeModules` so the model's
+ * dependency edits (env-fix path, feature #5 stage C) are visible
+ * to vitest at test time.
+ *
+ *   - When `outDir` has its own node_modules WITH vitest installed
+ *     (the post-phase-0 happy path), use it. Newly added deps land
+ *     here, and vitest resolves both its own internals and the
+ *     model's deps from one tree.
+ *   - Otherwise fall back to `requestedHostRepo` (caller's
+ *     override) or `process.cwd()`. This is the dev-tools / test-
+ *     suite path: code-graph-agent's own node_modules has vitest
+ *     so the harness still works.
+ *
+ *  The detection is best-effort (existsSync of `outDir/node_modules/
+ *  vitest`); if both paths are unusable the harness will simply
+ *  fail at vitest spawn time with a clear "vitest not found"
+ *  error from the spawnCollect path.
+ */
+export function resolveNodeModulesSource(
+  outDir: string | undefined,
+  requestedHostRepo: string | undefined,
+): string {
+  if (outDir) {
+    const outDirVitest = path.join(outDir, "node_modules", "vitest");
+    if (existsSync(outDirVitest)) return outDir;
+  }
+  return requestedHostRepo ?? process.cwd();
 }
 
 /** Write the rendered source files + per-leaf test files into the
