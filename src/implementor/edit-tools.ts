@@ -400,6 +400,19 @@ function extractBodyContent(blockText: string): string {
   return s.trim();
 }
 
+/** Public syntax check used by `editFileTool` (string-replace edits)
+ *  — re-uses the same tree-sitter parse + positional-error helper
+ *  the §D.2 edit tools use. Keeps the parse-error format consistent
+ *  across all edit paths so the model sees the same shape regardless
+ *  of which tool produced the failure. */
+export function checkTypescriptSyntax(
+  source: string,
+): { ok: true } | { ok: false; error: string } {
+  const parsed = parseTs(source);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  return { ok: true };
+}
+
 // ── Internals ────────────────────────────────────────────────────────
 
 function parseTs(source: string): ParseSuccess | ParseFailure {
