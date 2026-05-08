@@ -128,15 +128,9 @@ describe("mcp — submit + lifecycle", () => {
           if (Date.now() - start > 25_000) break;
         }
         const status = handleTaskStatus(ctx, { taskId });
-        expect(
-          status.phase,
-          `phase=${status.phase}; error=${status.error ?? "none"}`,
-        ).toBe("done");
+        expect(status.phase).toBe("done");
         const result = await handleTaskResult(ctx, { taskId });
-        expect(
-          result.ok,
-          `result.ok=${result.ok}; error=${result.error ?? "none"}`,
-        ).toBe(true);
+        expect(result.ok).toBe(true);
         expect(result.summary).toBe("mock");
       } finally {
         delete process.env.CODE_SHAPER_RUN_TASK_ENTRY;

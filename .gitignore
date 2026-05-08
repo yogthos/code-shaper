@@ -6,3 +6,4 @@ dist/
 .env.local
 models/
 .claude/
+demo/
