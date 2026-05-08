@@ -38,7 +38,14 @@
  * is surfaced to the caller.
  */
 
+import { createRequire } from "node:module";
 import { getAdapterByLanguage } from "../rpg/adapters/index.js";
+
+// `require` is unavailable in pure ESM contexts (which our project
+// is when running via tsx/node directly). Tests happen to provide
+// it via vitest's environment, which masked this bug. Match the
+// pattern already used in src/rpg/adapters/typescript.ts.
+const require = createRequire(import.meta.url);
 
 export interface EditResult {
   ok: boolean;
