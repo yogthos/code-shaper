@@ -91,9 +91,11 @@ async function main(): Promise<number> {
   const client = createClient(providerName, cfg);
   log(`provider=${providerName} model=${cfg.model}`);
 
-  // 2. Pipeline
+  // 2. Pipeline. demo/todomvc-harness/ is the harness side of the
+  //    baseline-vs-harness comparison; demo/todomvc-baseline/
+  //    holds the one-shot baseline output from bin/baseline-todomvc.ts.
   const rpg = emptyRPG();
-  const outDir = path.resolve("demo");
+  const outDir = path.resolve("demo/todomvc-harness");
   await rm(outDir, { recursive: true, force: true });
 
   /** Render plan-bearing files + materialize the RPG to outDir.
