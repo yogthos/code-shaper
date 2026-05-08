@@ -43,6 +43,50 @@ function toolCallClient(
   return { client, calls };
 }
 
+interface ScriptedCall {
+  toolName: string;
+  args: Record<string, unknown>;
+  /** Override JSON.stringify(args) for malformed-JSON tests. */
+  rawArgs?: string;
+}
+
+/** Multi-turn (audit issue #4): script a sequence of tool calls
+ *  the model will return on consecutive turns. After the script
+ *  runs out the client returns prose (forces termination). */
+function scriptedClient(
+  calls: ScriptedCall[],
+): { client: LLMClient; calls: unknown[] } {
+  const recorded: unknown[] = [];
+  let i = 0;
+  const client: LLMClient = {
+    async chat(messages, opts): Promise<LLMResponse> {
+      recorded.push({ messages, opts });
+      const c = calls[i++];
+      if (!c) {
+        return { content: "no more script", finishReason: "stop" };
+      }
+      return {
+        content: "",
+        finishReason: "tool_calls",
+        toolCalls: [
+          {
+            id: `call_${i}`,
+            type: "function",
+            function: {
+              name: c.toolName,
+              arguments: c.rawArgs ?? JSON.stringify(c.args),
+            },
+          },
+        ],
+      };
+    },
+    async listModels() {
+      return ["mock"];
+    },
+  };
+  return { client, calls: recorded };
+}
+
 const sampleFile = `function add(a: number, b: number): number {
   throw new Error("not implemented");
 }
@@ -195,7 +239,40 @@ describe("editLeafViaTools — agent error paths", () => {
     });
     const r = await editLeafViaTools(client, baseInput);
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/must be strings/);
+    expect(r.error).toMatch(/new_source/);
+    expect(r.error).toMatch(/must be a string/);
+  });
+
+  // Audit issue #13: type-error messages must echo the offending
+  // arg's actual type and a snippet of the value, otherwise the
+  // model can't see what it sent and tends to repeat the same
+  // mistake. "function_name and new_source must be strings"
+  // doesn't tell the model whether function_name was the offender
+  // or new_source.
+  it("type-error message names the offending arg, its type, and a value snippet", async () => {
+    const { client } = toolCallClient("edit_function_in_file", {
+      // function_name is null — must be string
+      function_name: null,
+      new_source: `function add() { return 1; }`,
+    });
+    const r = await editLeafViaTools(client, baseInput);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/function_name/);
+    expect(r.error).toMatch(/object|null/i);
+  });
+
+  it("type-error message handles object args by showing the offending JSON", async () => {
+    const { client } = toolCallClient("edit_function_in_file", {
+      // function_name is an object — must be string
+      function_name: { name: "add" },
+      new_source: `function add() { return 1; }`,
+    });
+    const r = await editLeafViaTools(client, baseInput);
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/function_name/);
+    // The JSON body should appear in some form so the model can
+    // see what it sent.
+    expect(r.error).toMatch(/"add"/);
   });
 
   it("propagates underlying edit-tool errors (e.g., wrong function name)", async () => {
@@ -229,6 +306,123 @@ describe("editLeafViaTools — agent error paths", () => {
   });
 });
 
+// Audit issue #4: editLeafViaTools is now multi-turn. When
+// tree-sitter or arg-validation rejects an edit, the rejection is
+// pushed back to the model as a tool message and the loop
+// continues — the model can correct itself within the same chat
+// session instead of waiting for the next body-author attempt
+// (which is a fresh chat with no record of what was tried).
+describe("editLeafViaTools — multi-turn recovery (audit issue #4)", () => {
+  it("recovers from a wrong-name rejection on the second turn", async () => {
+    const goodSrc = `function add(a: number, b: number): number { return a + b; }`;
+    const { client, calls } = scriptedClient([
+      // First turn: wrong function name → tree-sitter rejects.
+      {
+        toolName: "edit_function_in_file",
+        args: {
+          function_name: "add",
+          new_source: `function notAdd(): void {}`,
+        },
+      },
+      // Second turn: correct name.
+      {
+        toolName: "edit_function_in_file",
+        args: { function_name: "add", new_source: goodSrc },
+      },
+    ]);
+    const r = await editLeafViaTools(client, baseInput);
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    expect(r.source).toContain("return a + b");
+    // Two chat calls = the loop ran twice.
+    expect(calls).toHaveLength(2);
+  });
+
+  it("sends the underlying tool error back as a tool message", async () => {
+    const goodSrc = `function add(a: number, b: number): number { return a + b; }`;
+    const { client, calls } = scriptedClient([
+      // First turn: wrong name.
+      {
+        toolName: "edit_function_in_file",
+        args: {
+          function_name: "add",
+          new_source: `function notAdd(): void {}`,
+        },
+      },
+      {
+        toolName: "edit_function_in_file",
+        args: { function_name: "add", new_source: goodSrc },
+      },
+    ]);
+    await editLeafViaTools(client, baseInput);
+    // The second turn's messages must contain a tool message with
+    // the rejection reason — that's the proof the model got
+    // actionable feedback within the session.
+    const secondTurn = calls[1] as { messages: Array<{ role: string; content: string }> };
+    const toolMsg = secondTurn.messages.find((m) => m.role === "tool");
+    expect(toolMsg, "expected a tool message on turn 2").toBeDefined();
+    expect(toolMsg!.content).toMatch(/must declare a function named/);
+  });
+
+  it("recovers from malformed JSON args on the second turn", async () => {
+    const goodSrc = `function add(a: number, b: number): number { return a + b; }`;
+    const { client } = scriptedClient([
+      {
+        toolName: "edit_function_in_file",
+        args: {},
+        rawArgs: "{ broken json",
+      },
+      {
+        toolName: "edit_function_in_file",
+        args: { function_name: "add", new_source: goodSrc },
+      },
+    ]);
+    const r = await editLeafViaTools(client, baseInput);
+    expect(r.ok).toBe(true);
+    expect(r.source).toContain("return a + b");
+  });
+
+  it("recovers from a disallowed tool pick", async () => {
+    const goodSrc = `function add(a: number, b: number): number { return a + b; }`;
+    const { client } = scriptedClient([
+      {
+        toolName: "edit_whole_class_in_file",
+        args: { class_name: "Foo", new_source: "class Foo {}" },
+      },
+      {
+        toolName: "edit_function_in_file",
+        args: { function_name: "add", new_source: goodSrc },
+      },
+    ]);
+    const r = await editLeafViaTools(client, {
+      ...baseInput,
+      allowedTools: ["edit_function_in_file"],
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  it("returns failure with full trail when budget exhausted", async () => {
+    // Always wrong name → never recovers within the budget.
+    const { client } = scriptedClient([
+      {
+        toolName: "edit_function_in_file",
+        args: { function_name: "add", new_source: "function bad() {}" },
+      },
+      {
+        toolName: "edit_function_in_file",
+        args: { function_name: "add", new_source: "function bad2() {}" },
+      },
+    ]);
+    const r = await editLeafViaTools(client, {
+      ...baseInput,
+      maxIterations: 2,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.iterations).toBe(2);
+    // Last error reflects the most recent rejection.
+    expect(r.error).toMatch(/declare a function named/);
+  });
+});
+
 describe("editLeafViaTools — request shape", () => {
   it("sends only the allowed tools to the LLM", async () => {
     const { client, calls } = toolCallClient("edit_function_in_file", {
@@ -244,6 +438,47 @@ describe("editLeafViaTools — request shape", () => {
     };
     expect(opts.tools).toHaveLength(1);
     expect(opts.tools[0]!.function.name).toBe("edit_function_in_file");
+  });
+
+  // Audit issue #7: when the caller narrows allowedTools, the
+  // system prompt must reflect that narrowing. Otherwise the
+  // model reads a description of all four tools, picks one that's
+  // blocked, and burns an iteration on the rejection.
+  it("narrows the system prompt to describe ONLY the allowed tools", async () => {
+    const { client, calls } = toolCallClient("edit_function_in_file", {
+      function_name: "add",
+      new_source: `function add(a: number, b: number): number { return a + b; }`,
+    });
+    await editLeafViaTools(client, {
+      ...baseInput,
+      allowedTools: ["edit_function_in_file"],
+    });
+    const { messages } = calls[0]! as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    const sys = messages[0]!.content;
+    expect(sys).toContain("edit_function_in_file");
+    // Other three tools must NOT appear in the prompt — otherwise
+    // the model will sometimes pick them and get refused.
+    expect(sys).not.toContain("edit_whole_class_in_file");
+    expect(sys).not.toContain("edit_method_of_class_in_file");
+    expect(sys).not.toContain("edit_imports_and_assignments_in_file");
+  });
+
+  it("includes all four tool descriptions when allowedTools is unset", async () => {
+    const { client, calls } = toolCallClient("edit_function_in_file", {
+      function_name: "add",
+      new_source: `function add(a: number, b: number): number { return a + b; }`,
+    });
+    await editLeafViaTools(client, baseInput);
+    const { messages } = calls[0]! as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    const sys = messages[0]!.content;
+    expect(sys).toContain("edit_function_in_file");
+    expect(sys).toContain("edit_whole_class_in_file");
+    expect(sys).toContain("edit_method_of_class_in_file");
+    expect(sys).toContain("edit_imports_and_assignments_in_file");
   });
 
   it("sets toolChoice=required so models don't return prose", async () => {

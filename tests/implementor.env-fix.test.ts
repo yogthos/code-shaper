@@ -289,7 +289,31 @@ describe("applyEnvFixViaTools — error paths (recovery via tool messages)", () 
     });
     expect(r.ok).toBe(true);
     expect(r.trail[0]!.npmResult?.ok).toBe(false);
-    expect(r.trail[0]!.npmResult?.error).toMatch(/runtime.*dev/);
+    expect(r.trail[0]!.npmResult?.error).toMatch(/which/);
+    // Audit issue #13: error names the offending arg AND its
+    // actual value so the model can see what it sent.
+    expect(r.trail[0]!.npmResult?.error).toMatch(/wrong-bucket/);
+  });
+
+  // Audit issue #13: arg-type errors must echo the offending
+  // value's type and a snippet, not a generic "must be strings".
+  it("echoes the offending arg name and value snippet on type errors", async () => {
+    const client = scriptedClient([
+      // version is null instead of a string.
+      {
+        name: "add_dependency",
+        args: { name: "zod", version: null, which: "runtime" },
+      },
+      { name: "Terminate", args: { reason: "bailing" } },
+    ]);
+    const r = await applyEnvFixViaTools(client, {
+      ...baseInput,
+      projectDir: outDir,
+    });
+    const trail0 = r.trail[0]!;
+    expect(trail0.npmResult?.ok).toBe(false);
+    expect(trail0.npmResult?.error).toMatch(/version/);
+    expect(trail0.npmResult?.error).toMatch(/null|object/i);
   });
 
   it("exhausts iteration budget when the model never Terminates", async () => {

@@ -406,15 +406,18 @@ export async function applyEnvFixViaTools(
     lastTool = toolName;
     lastArgs = parsedArgs;
     lastNpmResult = npmResult;
-    // "Real mutation" = a tool call that mutates package.json. For
-    // add/remove/set_script that's `npmResult.ok`. npm_run is a
-    // probe — never counts. Semantics MUST mirror leaf.ts's
-    // realChange computation exactly.
+    // "Real mutation" = a tool call that ACTUALLY changed
+    // package.json on disk. Audit issue #9: rely on the npm
+    // primitives' `changed` flag — false on idempotent re-pin,
+    // missing-package removal, or set_script with the same
+    // command. npm_run is a probe — never counts. Semantics
+    // MUST mirror leaf.ts's realChange computation exactly.
     if (
       (toolName === "add_dependency" ||
         toolName === "remove_dependency" ||
         toolName === "set_script") &&
-      npmResult.ok
+      npmResult.ok &&
+      npmResult.changed === true
     ) {
       landedRealMutation = true;
     }
@@ -466,6 +469,45 @@ function isEnvToolName(s: string): s is EnvToolName {
   );
 }
 
+/** Audit issue #13: arg-type errors must name the offending arg
+ *  and echo its actual type + value snippet so the model can see
+ *  what it sent. Generic "must be strings" gives the model
+ *  nothing to anchor on; it tends to repeat the same mistake. */
+function describeOffendingArg(name: string, value: unknown): string {
+  if (value === undefined) return `${name}: missing (must be a string)`;
+  if (value === null) return `${name}: must be a string, got null`;
+  const t = typeof value;
+  if (t === "string") return "";
+  let snippet: string;
+  try {
+    const j = JSON.stringify(value);
+    snippet = j.length > 120 ? j.slice(0, 120) + "…" : j;
+  } catch {
+    snippet = String(value).slice(0, 120);
+  }
+  return `${name}: must be a string, got ${t} ${snippet}`;
+}
+
+function validateStringArgs(
+  prefix: string,
+  args: Record<string, unknown>,
+  required: string[],
+): string | null {
+  const problems = required
+    .map((k) => describeOffendingArg(k, args[k]))
+    .filter((s) => s.length > 0);
+  return problems.length === 0 ? null : `${prefix}: ${problems.join("; ")}`;
+}
+
+function argTypeError(prefix: string, msg: string): NpmOpResult {
+  return {
+    ok: false,
+    installOk: false,
+    installRan: false,
+    error: `${prefix}: ${msg}`,
+  };
+}
+
 async function runEnvTool(
   tool: Exclude<EnvToolName, "Terminate">,
   args: Record<string, unknown>,
@@ -475,79 +517,62 @@ async function runEnvTool(
   const skipNpmInstall = input.skipNpmInstall ?? false;
   switch (tool) {
     case "add_dependency": {
-      const name = args["name"];
-      const version = args["version"];
+      const stringErr = validateStringArgs("add_dependency", args, [
+        "name",
+        "version",
+      ]);
+      if (stringErr) {
+        return { ok: false, installOk: false, installRan: false, error: stringErr };
+      }
       const which = args["which"];
-      if (
-        typeof name !== "string" ||
-        typeof version !== "string" ||
-        (which !== "runtime" && which !== "dev")
-      ) {
-        return {
-          ok: false,
-          installOk: false,
-          installRan: false,
-          error:
-            "add_dependency: name/version must be strings, which must be 'runtime' or 'dev'",
-        };
+      if (which !== "runtime" && which !== "dev") {
+        const j = which === undefined ? "missing" : JSON.stringify(which);
+        return argTypeError(
+          "add_dependency",
+          `which must be "runtime" or "dev", got ${j}`,
+        );
       }
       return await addDependency({
         outDir: input.projectDir,
-        name,
-        version,
+        name: args["name"] as string,
+        version: args["version"] as string,
         which,
         npmBinary,
         skipNpmInstall,
       });
     }
     case "remove_dependency": {
-      const name = args["name"];
-      if (typeof name !== "string") {
-        return {
-          ok: false,
-          installOk: false,
-          installRan: false,
-          error: "remove_dependency: name must be a string",
-        };
+      const err = validateStringArgs("remove_dependency", args, ["name"]);
+      if (err) {
+        return { ok: false, installOk: false, installRan: false, error: err };
       }
       return await removeDependency({
         outDir: input.projectDir,
-        name,
+        name: args["name"] as string,
         npmBinary,
         skipNpmInstall,
       });
     }
     case "set_script": {
-      const name = args["name"];
-      const command = args["command"];
-      if (typeof name !== "string" || typeof command !== "string") {
-        return {
-          ok: false,
-          installOk: false,
-          installRan: false,
-          error: "set_script: name and command must be strings",
-        };
+      const err = validateStringArgs("set_script", args, ["name", "command"]);
+      if (err) {
+        return { ok: false, installOk: false, installRan: false, error: err };
       }
       return await setScript({
         outDir: input.projectDir,
-        name,
-        command,
+        name: args["name"] as string,
+        command: args["command"] as string,
         skipNpmInstall: true,
       });
     }
     case "npm_run": {
-      const script = args["script"];
-      if (typeof script !== "string") {
-        return {
-          ok: false,
-          installOk: false,
-          installRan: false,
-          error: "npm_run: script must be a string",
-        };
+      const err = validateStringArgs("npm_run", args, ["script"]);
+      if (err) {
+        return { ok: false, installOk: false, installRan: false, error: err };
       }
       return await npmRun({
         outDir: input.projectDir,
-        script,
+        script: args["script"] as string,
         npmBinary,
       });
     }
@@ -567,6 +592,13 @@ function serializeNpmResultForTool(
     ok: npmResult.ok,
     installRan: npmResult.installRan,
     installOk: npmResult.installOk,
+    // Audit issue #9: tell the model whether the call actually
+    // mutated package.json. `changed: false` after `add_dependency`
+    // means "already at this version" — useful signal for the
+    // model to pick a different binding instead of re-trying.
+    ...(npmResult.changed !== undefined
+      ? { changed: npmResult.changed }
+      : {}),
     ...(("exitCode" in npmResult)
       ? { exitCode: (npmResult as { exitCode?: unknown }).exitCode }
       : {}),

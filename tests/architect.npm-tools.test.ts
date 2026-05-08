@@ -126,6 +126,41 @@ describe("addDependency", () => {
     });
     expect(r.ok).toBe(true);
     expect(r.installRan).toBe(false);
+    // Audit issue #9: no-op path must report `changed: false` so
+    // the env-fix budget machinery doesn't burn a slot on an
+    // idempotent re-pin.
+    expect(r.changed).toBe(false);
+  });
+
+  it("reports changed=true when the version was added", async () => {
+    const r = await addDependency({
+      outDir,
+      name: "zod",
+      version: "^3.22.0",
+      which: "runtime",
+      skipNpmInstall: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.changed).toBe(true);
+  });
+
+  it("reports changed=true when the version was bumped", async () => {
+    await addDependency({
+      outDir,
+      name: "zod",
+      version: "^3.22.0",
+      which: "runtime",
+      skipNpmInstall: true,
+    });
+    const r = await addDependency({
+      outDir,
+      name: "zod",
+      version: "^3.23.0",
+      which: "runtime",
+      skipNpmInstall: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.changed).toBe(true);
   });
 
   it("reports failure when npm install exits non-zero", async () => {
@@ -167,6 +202,16 @@ describe("removeDependency", () => {
     expect(after.dependencies?.lodash).toBeUndefined();
   });
 
+  it("removeDependency reports changed=false when the package isn't present", async () => {
+    const r = await removeDependency({
+      outDir,
+      name: "not-installed",
+      skipNpmInstall: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.changed).toBe(false);
+  });
+
   it("is a no-op when the package isn't present", async () => {
     const r = await removeDependency({
       outDir,
@@ -179,6 +224,36 @@ describe("removeDependency", () => {
 });
 
 describe("setScript", () => {
+  it("reports changed=false when the script value didn't change", async () => {
+    // First call sets it.
+    await setScript({
+      outDir,
+      name: "build",
+      command: "tsc -p .",
+      skipNpmInstall: true,
+    });
+    // Second call with the same command should be a no-op.
+    const r = await setScript({
+      outDir,
+      name: "build",
+      command: "tsc -p .",
+      skipNpmInstall: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.changed).toBe(false);
+  });
+
+  it("reports changed=true on first set", async () => {
+    const r = await setScript({
+      outDir,
+      name: "build",
+      command: "tsc -p .",
+      skipNpmInstall: true,
+    });
+    expect(r.ok).toBe(true);
+    expect(r.changed).toBe(true);
+  });
+
   it("sets a new script without re-running install", async () => {
     const r = await setScript({
       outDir,

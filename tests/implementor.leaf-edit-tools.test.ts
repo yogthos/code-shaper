@@ -291,8 +291,16 @@ describe("add", () => {
         useEditTools: true,
       });
       expect(result.ok, JSON.stringify(result)).toBe(true);
-      // Two attempts: the rejected one + the successful one.
-      expect(result.attempts).toBeGreaterThanOrEqual(2);
+      // Audit issue #4 changed where recovery happens. Previously
+      // edit-author was single-shot — a wrong-name rejection
+      // bubbled up to the outer leaf loop, which retried on a
+      // fresh chat (attempts >= 2). Now edit-author is multi-turn
+      // and self-corrects within ONE leaf attempt by sending the
+      // tree-sitter rejection back as a tool message. The mock's
+      // call counter is what proves the recovery happened — both
+      // tool calls were issued, one rejected and one accepted.
+      expect(result.ok).toBe(true);
+      expect(calls).toBeGreaterThanOrEqual(2);
     },
   );
 });

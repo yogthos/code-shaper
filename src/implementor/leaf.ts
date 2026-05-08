@@ -697,7 +697,8 @@ export async function implementLeaf(
             (e.tool === "add_dependency" ||
               e.tool === "remove_dependency" ||
               e.tool === "set_script") &&
-            e.npmResult?.ok === true,
+            e.npmResult?.ok === true &&
+            e.npmResult.changed === true,
         );
         if (realChange) envPatches++;
 

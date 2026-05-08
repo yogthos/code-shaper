@@ -52,6 +52,13 @@ export interface NpmOpResult {
   installStdout?: string;
   installStderr?: string;
   error?: string;
+  /** Audit issue #9: did this call actually mutate package.json?
+   *  False on idempotent re-pin (addDependency at the same
+   *  version), missing-package removal, or set_script with the
+   *  same command. The env-fix budget machinery uses this to
+   *  avoid burning slots on no-op calls. Unset for `npmRun` (it
+   *  never mutates). */
+  changed?: boolean;
 }
 
 // ── Name + script validators ─────────────────────────────────────────
@@ -204,11 +211,16 @@ export async function addDependency(
       packageJson: pkg,
       installOk: true,
       installRan: false,
+      changed: false,
     };
   }
   bucket[input.name] = input.version;
   pkg[bucketName] = bucket;
-  return await persistAndInstall(pkg, pkgPath, input);
+  // persistAndInstall always writes package.json (then optionally
+  // re-installs). Reaching this branch means the file mutated,
+  // even if install later failed — `changed: true` regardless.
+  const r = await persistAndInstall(pkg, pkgPath, input);
+  return { ...r, changed: true };
 }
 
 /**
@@ -242,9 +254,11 @@ export async function removeDependency(
       packageJson: pkg,
       installOk: true,
       installRan: false,
+      changed: false,
     };
   }
-  return await persistAndInstall(pkg, pkgPath, input);
+  const r = await persistAndInstall(pkg, pkgPath, input);
+  return { ...r, changed: true };
 }
 
 /**
@@ -271,6 +285,11 @@ export async function setScript(
   const loaded = await loadPkg(pkgPath);
   if (!loaded.ok) return { ok: false, installOk: false, installRan: false, error: loaded.error };
   const pkg = loaded.value;
+  // Audit issue #9: detect no-op (same name AND same command)
+  // before writing. Idempotent re-set of an already-correct script
+  // shouldn't burn a slot of the env-fix budget.
+  const priorCommand = pkg.scripts[input.name];
+  const isNoOp = priorCommand === input.command;
   pkg.scripts[input.name] = input.command;
   // Re-validate via parsePackageJson — guards against breaking the
   // scripts.test invariant by overwriting it with something that
@@ -284,12 +303,22 @@ export async function setScript(
       error: `set_script would invalidate package.json: ${reparsed.error}`,
     };
   }
+  if (isNoOp) {
+    return {
+      ok: true,
+      packageJson: pkg,
+      installOk: true,
+      installRan: false,
+      changed: false,
+    };
+  }
   await writePkg(pkgPath, pkg);
   return {
     ok: true,
     packageJson: pkg,
     installOk: true,
     installRan: false,
+    changed: true,
   };
 }
 
