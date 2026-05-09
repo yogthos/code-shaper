@@ -42,6 +42,12 @@ import {
   typecheckTool,
   runTestTool,
 } from "./dev-loop-tools.js";
+import {
+  addDependency,
+  removeDependency,
+  setScript,
+  npmRun,
+} from "../architect/npm-tools.js";
 import type {
   ChatMessage,
   ChatOptions,
@@ -58,9 +64,17 @@ export interface DevLoopInput {
   testsByLeafId: Map<string, string>;
   /** Harness work directory for run_test. */
   workDir: string;
-  /** Project directory for typecheck. When omitted, typecheck
-   *  short-circuits to ran:false. */
+  /** Project directory for typecheck + npm tools. When omitted,
+   *  typecheck short-circuits to ran:false and npm tools return a
+   *  clean error pointing the model at the missing config. */
   outDir?: string;
+  /** Override the npm binary used by add_dependency / npm_run.
+   *  Defaults to "npm". Tests use a stub. */
+  npmBinary?: string;
+  /** Skip the npm install re-run inside add_dependency /
+   *  remove_dependency (tests). Has no effect on set_script,
+   *  which never installs. */
+  skipNpmInstall?: boolean;
   /** Optional failure context from a prior leaf attempt — when
    *  set, the user prompt's "Previous failure" block surfaces
    *  it. */
@@ -431,15 +445,194 @@ async function applyTool(
     case "edit_imports_and_assignments_in_file": {
       return applySurgicalEdit(toolName, args, input);
     }
+    case "add_dependency":
+    case "remove_dependency":
+    case "set_script":
+    case "npm_run": {
+      return applyNpmTool(toolName, args, input);
+    }
     default:
       return {
         ok: false,
         toolResult: {
-          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, edit_file, typecheck, run_test, edit_function_in_file, edit_whole_class_in_file, edit_method_of_class_in_file, edit_imports_and_assignments_in_file, Terminate.`,
+          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, edit_file, typecheck, run_test, edit_function_in_file, edit_whole_class_in_file, edit_method_of_class_in_file, edit_imports_and_assignments_in_file, add_dependency, remove_dependency, set_script, npm_run, Terminate.`,
         },
         error: `unknown tool: ${toolName}`,
       };
   }
+}
+
+async function applyNpmTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  input: DevLoopInput,
+): Promise<AppliedTool> {
+  if (!input.outDir) {
+    return {
+      ok: false,
+      toolResult: {
+        error: `${toolName} requires the project directory (outDir). The harness was started without one — npm tools are unavailable for this leaf. Edit code only.`,
+      },
+      error: `${toolName}: outDir not configured`,
+    };
+  }
+  const npmBinary = input.npmBinary ?? "npm";
+  const skipNpmInstall = input.skipNpmInstall ?? false;
+  switch (toolName) {
+    case "add_dependency": {
+      const name = args["name"];
+      const version = args["version"];
+      const which = args["which"];
+      if (
+        typeof name !== "string" ||
+        typeof version !== "string" ||
+        (which !== "runtime" && which !== "dev")
+      ) {
+        return {
+          ok: false,
+          toolResult: {
+            error:
+              "add_dependency: name and version must be strings; which must be \"runtime\" or \"dev\"",
+          },
+          error: "arg validation failed",
+        };
+      }
+      const r = await addDependency({
+        outDir: input.outDir,
+        name,
+        version,
+        which,
+        npmBinary,
+        skipNpmInstall,
+      });
+      return {
+        ok: r.ok,
+        toolResult: serializeNpmResult(r, "add_dependency"),
+        ...(r.error ? { error: r.error } : {}),
+        summary: r.ok
+          ? r.changed
+            ? `add_dependency ${name}@${version} (${which})`
+            : `add_dependency ${name} already at ${version}`
+          : `add_dependency ${name} failed`,
+      };
+    }
+    case "remove_dependency": {
+      const name = args["name"];
+      if (typeof name !== "string") {
+        return {
+          ok: false,
+          toolResult: { error: "remove_dependency: name must be a string" },
+          error: "arg validation failed",
+        };
+      }
+      const r = await removeDependency({
+        outDir: input.outDir,
+        name,
+        npmBinary,
+        skipNpmInstall,
+      });
+      return {
+        ok: r.ok,
+        toolResult: serializeNpmResult(r, "remove_dependency"),
+        ...(r.error ? { error: r.error } : {}),
+        summary: r.ok
+          ? r.changed
+            ? `remove_dependency ${name}`
+            : `remove_dependency ${name} (already absent)`
+          : `remove_dependency ${name} failed`,
+      };
+    }
+    case "set_script": {
+      const name = args["name"];
+      const command = args["command"];
+      if (typeof name !== "string" || typeof command !== "string") {
+        return {
+          ok: false,
+          toolResult: {
+            error: "set_script: name and command must be strings",
+          },
+          error: "arg validation failed",
+        };
+      }
+      const r = await setScript({
+        outDir: input.outDir,
+        name,
+        command,
+        skipNpmInstall: true,
+      });
+      return {
+        ok: r.ok,
+        toolResult: serializeNpmResult(r, "set_script"),
+        ...(r.error ? { error: r.error } : {}),
+        summary: r.ok
+          ? r.changed
+            ? `set_script ${name}`
+            : `set_script ${name} (unchanged)`
+          : `set_script ${name} failed`,
+      };
+    }
+    case "npm_run": {
+      const script = args["script"];
+      if (typeof script !== "string") {
+        return {
+          ok: false,
+          toolResult: { error: "npm_run: script must be a string" },
+          error: "arg validation failed",
+        };
+      }
+      const r = await npmRun({
+        outDir: input.outDir,
+        script,
+        npmBinary,
+      });
+      return {
+        ok: r.ok,
+        toolResult: serializeNpmResult(r, "npm_run"),
+        ...(r.error ? { error: r.error } : {}),
+        summary: r.ok ? `npm_run ${script} passed` : `npm_run ${script} failed`,
+      };
+    }
+    default:
+      return {
+        ok: false,
+        toolResult: { error: `unknown npm tool ${toolName}` },
+        error: "unreachable",
+      };
+  }
+}
+
+/** Tail-truncated, install-flag-pruned-for-probes serialization
+ *  used by the npm-tool branches. Mirrors env-fix's serializer
+ *  shape so the model sees a consistent format whether the tool
+ *  was driven from the dev loop or the standalone env-fix
+ *  session. */
+function serializeNpmResult(
+  npmResult: import("../architect/npm-tools.js").NpmOpResult & { exitCode?: number | null },
+  toolName: string,
+): Record<string, unknown> {
+  const isProbe = toolName === "npm_run";
+  const tail = (s: string | undefined, max: number): string | undefined =>
+    s ? (s.length > max ? "...[truncated head]\n" + s.slice(s.length - max) : s) : s;
+  return {
+    ok: npmResult.ok,
+    ...(isProbe
+      ? {}
+      : {
+          installRan: npmResult.installRan,
+          installOk: npmResult.installOk,
+        }),
+    ...(npmResult.changed !== undefined ? { changed: npmResult.changed } : {}),
+    ...(("exitCode" in npmResult)
+      ? { exitCode: (npmResult as { exitCode?: unknown }).exitCode }
+      : {}),
+    ...(npmResult.error ? { error: npmResult.error } : {}),
+    ...(npmResult.installStdout
+      ? { stdout: tail(npmResult.installStdout, TOOL_RESULT_OUTPUT_CAP) }
+      : {}),
+    ...(npmResult.installStderr
+      ? { stderr: tail(npmResult.installStderr, TOOL_RESULT_OUTPUT_CAP) }
+      : {}),
+  };
 }
 
 function applySurgicalEdit(
@@ -635,6 +828,12 @@ Tools:
                                   AST-aware: replace an entire class.
   edit_imports_and_assignments_in_file(new_source)
                                   AST-aware: replace the file's imports + top-level assignments region.
+  add_dependency(name, version, which)
+                                  Install a runtime ("which":"runtime") or dev ("which":"dev") dependency. Use when run_test fails with "Cannot find module X" — pick a working binding. If a chosen binding doesn't compile (gyp / node-gyp errors), use remove_dependency + add_dependency to swap to an alternative.
+  remove_dependency(name)
+                                  Strip a package from package.json + re-install. Useful before swapping bindings.
+  set_script(name, command)       Add or update an npm script. Cannot overwrite scripts.test with a non-vitest command.
+  npm_run(script)                 Run an existing npm script (npm run <name>). Returns exit code + stdout/stderr. Use to verify a remediation worked before terminating.
   Terminate(reason)               End the session. Call when you believe the active leaf is done. The orchestrator will run the test once more to verify.
 
 Pick exactly ONE tool per turn.`;
@@ -795,6 +994,62 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
         type: "object",
         properties: { new_source: { type: "string" } },
         required: ["new_source"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "add_dependency",
+      description:
+        'Install a runtime or dev dependency. Use when "Cannot find module X" appears — pick a working binding. If a chosen native dep fails to compile (gyp errors), remove + add an alternative (e.g. better-sqlite3 → libsql or node:sqlite).',
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          version: { type: "string", description: 'e.g. "^3.22.0"' },
+          which: { type: "string", enum: ["runtime", "dev"] },
+        },
+        required: ["name", "version", "which"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "remove_dependency",
+      description: "Remove a package from both runtime and dev buckets and re-install. Useful before swapping bindings.",
+      parameters: {
+        type: "object",
+        properties: { name: { type: "string" } },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_script",
+      description: "Add or update an npm script. Cannot overwrite scripts.test with a non-vitest command.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          command: { type: "string" },
+        },
+        required: ["name", "command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "npm_run",
+      description: "Run an existing npm script. Returns exit code + stdout/stderr. Use to verify a remediation before terminating.",
+      parameters: {
+        type: "object",
+        properties: { script: { type: "string" } },
+        required: ["script"],
       },
     },
   },

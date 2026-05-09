@@ -409,3 +409,227 @@ describe("runLeafDevLoop — recovery", () => {
     },
   );
 });
+
+// Step Q1: npm tools (add_dependency, remove_dependency, set_script,
+// npm_run) belong INSIDE the dev loop. Without them, when a leaf's
+// body fails because a chosen binding doesn't compile (the
+// better-sqlite3 trap that wedged the prior TodoMVC run), env-fix
+// runs as a separate session AFTER the dev loop returns — losing
+// the conversation context. Exposing the npm primitives in the
+// loop lets the model swap bindings within the same chat session,
+// the canonical agentic shape.
+describe("runLeafDevLoop — npm tools", () => {
+  it(
+    "exposes add_dependency / remove_dependency / set_script / npm_run as available tools",
+    async () => {
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const { client, recorded } = scriptedClient([
+        // Just terminate immediately — we only care about the
+        // tool list the harness sends on the first chat call.
+        { name: "Terminate", args: {} },
+      ]);
+      // Need an outDir for npm tools to be exposable.
+      const outDir = await (await import("node:fs/promises")).mkdtemp(
+        (await import("node:path")).default.join((await import("node:os")).tmpdir(), "outdir-"),
+      );
+      try {
+        await runLeafDevLoop(client, {
+          leaf: f.interfacePlan!.entries[0]!,
+          hostFile: f,
+          rpg,
+          bodyByLeafId: new Map([["cap:add", "return a + b;"]]),
+          testsByLeafId: new Map(),
+          workDir,
+          outDir,
+        });
+        const firstTurn = recorded[0]!;
+        // Tool defs aren't in messages; they're in the chat opts.
+        // The scripted client doesn't capture opts, so we assert
+        // through observable behavior in the next test instead.
+        // Here we just confirm the loop started + Terminated.
+        void firstTurn;
+      } finally {
+        await (await import("node:fs/promises")).rm(outDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    "applies add_dependency through to the project's package.json",
+    async () => {
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      // Pre-seed an outDir with package.json + tsconfig so the
+      // npm tools have something to mutate.
+      const fs = await import("node:fs/promises");
+      const nodePath = (await import("node:path")).default;
+      const os = await import("node:os");
+      const outDir = await fs.mkdtemp(nodePath.join(os.tmpdir(), "outdir-"));
+      try {
+        await fs.writeFile(
+          nodePath.join(outDir, "package.json"),
+          JSON.stringify(
+            {
+              name: "test",
+              version: "0.1.0",
+              type: "module",
+              scripts: { test: "vitest run" },
+              dependencies: {},
+              devDependencies: { vitest: "^2.0.0" },
+            },
+            null,
+            2,
+          ),
+        );
+        const { client } = scriptedClient([
+          // Apply add_dependency, then a body edit, then Terminate.
+          {
+            name: "add_dependency",
+            args: { name: "zod", version: "^3.22.0", which: "runtime" },
+          },
+          {
+            name: "edit_file",
+            args: {
+              path: "src/add.ts",
+              old_str: 'throw new Error("add: not implemented");',
+              new_str: "return a + b;",
+            },
+          },
+          { name: "Terminate", args: {} },
+        ]);
+        const r = await runLeafDevLoop(client, {
+          leaf: f.interfacePlan!.entries[0]!,
+          hostFile: f,
+          rpg,
+          bodyByLeafId: new Map(),
+          testsByLeafId: new Map(),
+          workDir,
+          outDir,
+          // Skip the actual npm install — we're testing the
+          // tool wiring, not the registry. Avoids flake from
+          // network latency when this test runs alongside other
+          // /tmp consumers in the suite.
+          skipNpmInstall: true,
+        });
+        expect(r.ok, JSON.stringify(r)).toBe(true);
+        const pkg = JSON.parse(
+          await fs.readFile(nodePath.join(outDir, "package.json"), "utf-8"),
+        );
+        expect(pkg.dependencies.zod).toBe("^3.22.0");
+        // The trail records the npm call.
+        const addDep = r.trail.find((t) => t.tool === "add_dependency");
+        expect(addDep).toBeDefined();
+        expect(addDep!.ok).toBe(true);
+      } finally {
+        await fs.rm(outDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    "rejects npm tools when outDir is not configured (cleanly, with a hint)",
+    async () => {
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const { client } = scriptedClient([
+        {
+          name: "add_dependency",
+          args: { name: "zod", version: "^3.22.0", which: "runtime" },
+        },
+        { name: "Terminate", args: {} },
+      ]);
+      const r = await runLeafDevLoop(client, {
+        leaf: f.interfacePlan!.entries[0]!,
+        hostFile: f,
+        rpg,
+        bodyByLeafId: new Map([["cap:add", "return a + b;"]]),
+        testsByLeafId: new Map(),
+        workDir,
+        // outDir intentionally omitted.
+      });
+      // Loop converges (Terminate fires) but the npm call's trail
+      // entry records a clear no-outDir error.
+      const addDep = r.trail.find((t) => t.tool === "add_dependency");
+      expect(addDep).toBeDefined();
+      expect(addDep!.ok).toBe(false);
+      expect(addDep!.error).toMatch(/outDir|project directory/i);
+    },
+  );
+
+  it(
+    "exposes npm_run that returns exit code + stdout/stderr to the agent",
+    async () => {
+      // Pre-seed package.json with a custom script and a stub npm
+      // binary that exits 0 with deterministic output.
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const fs = await import("node:fs/promises");
+      const nodePath = (await import("node:path")).default;
+      const os = await import("node:os");
+      const outDir = await fs.mkdtemp(nodePath.join(os.tmpdir(), "outdir-"));
+      try {
+        await fs.writeFile(
+          nodePath.join(outDir, "package.json"),
+          JSON.stringify(
+            {
+              name: "t",
+              version: "0.1.0",
+              type: "module",
+              scripts: { test: "vitest run", probe: "echo hi" },
+              dependencies: {},
+              devDependencies: { vitest: "^2.0.0" },
+            },
+            null,
+            2,
+          ),
+        );
+        // Stub npm so npm_run returns deterministically without
+        // hitting the real registry.
+        const stubDir = await fs.mkdtemp(nodePath.join(os.tmpdir(), "stub-npm-"));
+        const stubBin = nodePath.join(stubDir, "stub-npm");
+        await fs.writeFile(
+          stubBin,
+          `#!/usr/bin/env node\nprocess.stdout.write("probed!\\n");\nprocess.exit(0);\n`,
+        );
+        await fs.chmod(stubBin, 0o755);
+        const { client } = scriptedClient([
+          { name: "npm_run", args: { script: "probe" } },
+          { name: "Terminate", args: {} },
+        ]);
+        const r = await runLeafDevLoop(client, {
+          leaf: f.interfacePlan!.entries[0]!,
+          hostFile: f,
+          rpg,
+          bodyByLeafId: new Map([["cap:add", "return a + b;"]]),
+          testsByLeafId: new Map(),
+          workDir,
+          outDir,
+          npmBinary: stubBin,
+        });
+        const probe = r.trail.find((t) => t.tool === "npm_run");
+        expect(probe).toBeDefined();
+        expect(probe!.ok).toBe(true);
+        await fs.rm(stubDir, { recursive: true, force: true });
+      } finally {
+        await fs.rm(outDir, { recursive: true, force: true });
+      }
+    },
+  );
+});

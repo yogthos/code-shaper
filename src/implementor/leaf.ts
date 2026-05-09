@@ -391,6 +391,12 @@ export async function implementLeaf(
         ...(input.testTimeoutMs !== undefined
           ? { testTimeoutMs: input.testTimeoutMs }
           : {}),
+        ...(input.envFixNpmBinary !== undefined
+          ? { npmBinary: input.envFixNpmBinary }
+          : {}),
+        ...(input.envFixSkipNpmInstall !== undefined
+          ? { skipNpmInstall: input.envFixSkipNpmInstall }
+          : {}),
         ...(input.temperature !== undefined
           ? { temperature: input.temperature }
           : {}),
