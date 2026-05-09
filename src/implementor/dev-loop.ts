@@ -6,10 +6,9 @@
  * with the canonical Claude-Code-style toolset:
  *
  *   read   list_files, read_file
- *   edit   edit_file (string-replace), edit_function_in_file,
- *          edit_method_of_class_in_file, edit_whole_class_in_file,
- *          edit_imports_and_assignments_in_file
+ *   edit   edit_file (string-replace anywhere)
  *   probe  typecheck, run_test
+ *   npm    add_dependency, remove_dependency, npm_run
  *   end    Terminate
  *
  * Why all of these and not just three: ampcode's canonical agent
@@ -25,17 +24,7 @@
  * tool message; the model gets a chance to correct itself.
  */
 
-import {
-  editFunctionInFile,
-  editMethodOfClassInFile,
-  editWholeClassInFile,
-  editImportsAndAssignmentsInFile,
-  extractFunctionBody,
-  extractMethodBody,
-  extractTopLevelImports,
-  checkTypescriptSyntax,
-  type EditResult,
-} from "./edit-tools.js";
+import { extractTopLevelImports } from "./edit-tools.js";
 import {
   listFilesTool,
   readFileTool,
@@ -46,7 +35,6 @@ import {
 import {
   addDependency,
   removeDependency,
-  setScript,
   npmRun,
 } from "../architect/npm-tools.js";
 import type {
@@ -81,13 +69,6 @@ export interface DevLoopInput {
    *  it. */
   failureMessage?: string;
   maxIterations?: number;
-  /** Step S5: per-loop budget for rewrite_test calls. The
-   *  test contract is mutable but bounded — without a cap, the
-   *  model could trivially game its way to "passing" by
-   *  rewriting the test until it matches its (broken) body.
-   *  Default 3. The body still has to satisfy whatever rewrite
-   *  the model authors. */
-  maxRewriteTests?: number;
   /** Wall-clock cap forwarded to runTestTool. */
   testTimeoutMs?: number;
   temperature?: number;
@@ -142,10 +123,6 @@ export async function runLeafDevLoop(
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
   };
   const trail: DevLoopTrailEntry[] = [];
-  // Step S5: rewrite_test budget. Tracks count locally; the
-  // applyTool dispatch enforces the cap.
-  const maxRewriteTests = input.maxRewriteTests ?? 3;
-  const rewriteTestCounter = { count: 0, max: maxRewriteTests };
 
   for (let i = 0; i < maxIterations; i++) {
     let response: LLMResponse;
@@ -283,7 +260,7 @@ export async function runLeafDevLoop(
     // Apply the tool. Each branch returns { result: object, ok:
     // bool, summary?: string }, then we both push the result back
     // to the model and record on the trail.
-    const applied = await applyTool(toolName, args, input, rewriteTestCounter);
+    const applied = await applyTool(toolName, args, input);
     trail.push({
       iteration: i + 1,
       tool: toolName,
@@ -325,16 +302,10 @@ interface AppliedTool {
   summary?: string;
 }
 
-interface RewriteTestCounter {
-  count: number;
-  max: number;
-}
-
 async function applyTool(
   toolName: string,
   args: Record<string, unknown>,
   input: DevLoopInput,
-  rewriteTestCounter: RewriteTestCounter,
 ): Promise<AppliedTool> {
   switch (toolName) {
     case "list_files": {
@@ -465,103 +436,8 @@ async function applyTool(
         summary: r.ok ? "test passed" : "test failed",
       };
     }
-    case "rewrite_test": {
-      // Step S5: the model can rewrite the active leaf's test
-      // when the existing test contract is unwinnable (jsdom-
-      // only browser code, async WASM init, etc.). Bounded by a
-      // budget so the model can't trivially game its way to
-      // passing.
-      if (rewriteTestCounter.count >= rewriteTestCounter.max) {
-        return {
-          ok: false,
-          toolResult: {
-            error: `rewrite_test budget exhausted (${rewriteTestCounter.max} rewrites used). Either make the body satisfy the current test, or call Terminate / skip_with_smoke_test.`,
-          },
-          error: "rewrite_test budget exhausted",
-        };
-      }
-      const newSource = args["new_source"];
-      if (typeof newSource !== "string" || newSource.length === 0) {
-        return {
-          ok: false,
-          toolResult: { error: "rewrite_test: new_source must be a non-empty string" },
-          error: "arg validation failed",
-        };
-      }
-      const parse = checkTypescriptSyntax(newSource);
-      if (!parse.ok) {
-        return {
-          ok: false,
-          toolResult: {
-            error: `rewrite_test: new_source does not parse as TypeScript. ${parse.error}`,
-          },
-          error: "rewrite_test: parse failure",
-        };
-      }
-      // Commit: replace the leaf's test in testsByLeafId.
-      // bodyByLeafId is unchanged — the model still has to
-      // satisfy whatever the new test asserts.
-      input.testsByLeafId.set(input.leaf.leafCapabilityId, newSource);
-      rewriteTestCounter.count++;
-      return {
-        ok: true,
-        toolResult: {
-          ok: true,
-          rewrites_used: rewriteTestCounter.count,
-          rewrites_remaining: rewriteTestCounter.max - rewriteTestCounter.count,
-        },
-        summary: `rewrite_test (${rewriteTestCounter.count}/${rewriteTestCounter.max})`,
-      };
-    }
-    case "skip_with_smoke_test": {
-      // Step S6: shorthand for rewrite_test that generates a
-      // trivial shape-check test for the active leaf. Use when
-      // the original test contract is genuinely unwinnable
-      // (browser-only code with no jsdom, async WASM init that
-      // can't be mocked cheaply, env-dependent classes).
-      // Consumes one slot of the rewrite_test budget — the
-      // model can't run away with skips.
-      if (rewriteTestCounter.count >= rewriteTestCounter.max) {
-        return {
-          ok: false,
-          toolResult: {
-            error: `skip_with_smoke_test: rewrite budget exhausted (${rewriteTestCounter.max} used). The leaf must satisfy its current test.`,
-          },
-          error: "skip budget exhausted",
-        };
-      }
-      const reason = args["reason"];
-      if (typeof reason !== "string" || reason.trim().length === 0) {
-        const msg = "skip_with_smoke_test: reason must be a non-empty string explaining why the leaf is genuinely untestable in isolation";
-        return {
-          ok: false,
-          toolResult: { error: msg },
-          error: msg,
-        };
-      }
-      const smokeSource = buildSmokeTest(input.leaf, input.hostFile, reason);
-      input.testsByLeafId.set(input.leaf.leafCapabilityId, smokeSource);
-      rewriteTestCounter.count++;
-      return {
-        ok: true,
-        toolResult: {
-          ok: true,
-          smoke_test_installed: true,
-          rewrites_used: rewriteTestCounter.count,
-          rewrites_remaining: rewriteTestCounter.max - rewriteTestCounter.count,
-        },
-        summary: `skip_with_smoke_test (${rewriteTestCounter.count}/${rewriteTestCounter.max}): ${reason.slice(0, 80)}`,
-      };
-    }
-    case "edit_function_in_file":
-    case "edit_whole_class_in_file":
-    case "edit_method_of_class_in_file":
-    case "edit_imports_and_assignments_in_file": {
-      return applySurgicalEdit(toolName, args, input);
-    }
     case "add_dependency":
     case "remove_dependency":
-    case "set_script":
     case "npm_run": {
       return applyNpmTool(toolName, args, input);
     }
@@ -569,7 +445,7 @@ async function applyTool(
       return {
         ok: false,
         toolResult: {
-          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, edit_file, rewrite_test, skip_with_smoke_test, typecheck, run_test, edit_function_in_file, edit_whole_class_in_file, edit_method_of_class_in_file, edit_imports_and_assignments_in_file, add_dependency, remove_dependency, set_script, npm_run, Terminate.`,
+          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, edit_file, typecheck, run_test, add_dependency, remove_dependency, npm_run, Terminate.`,
         },
         error: `unknown tool: ${toolName}`,
       };
@@ -656,35 +532,6 @@ async function applyNpmTool(
           : `remove_dependency ${name} failed`,
       };
     }
-    case "set_script": {
-      const name = args["name"];
-      const command = args["command"];
-      if (typeof name !== "string" || typeof command !== "string") {
-        return {
-          ok: false,
-          toolResult: {
-            error: "set_script: name and command must be strings",
-          },
-          error: "arg validation failed",
-        };
-      }
-      const r = await setScript({
-        outDir: input.outDir,
-        name,
-        command,
-        skipNpmInstall: true,
-      });
-      return {
-        ok: r.ok,
-        toolResult: serializeNpmResult(r, "set_script"),
-        ...(r.error ? { error: r.error } : {}),
-        summary: r.ok
-          ? r.changed
-            ? `set_script ${name}`
-            : `set_script ${name} (unchanged)`
-          : `set_script ${name} failed`,
-      };
-    }
     case "npm_run": {
       const script = args["script"];
       if (typeof script !== "string") {
@@ -749,157 +596,6 @@ function serializeNpmResult(
   };
 }
 
-function applySurgicalEdit(
-  toolName: string,
-  args: Record<string, unknown>,
-  input: DevLoopInput,
-): AppliedTool {
-  // Render the host file with the current body map so we apply
-  // the §D.2 edit to the SAME view the model is reasoning over.
-  const currentSource = renderHost(input);
-  let result: EditResult;
-  switch (toolName) {
-    case "edit_function_in_file": {
-      const name = args["function_name"];
-      const src = args["new_source"];
-      if (typeof name !== "string" || typeof src !== "string") {
-        return {
-          ok: false,
-          toolResult: {
-            error:
-              "edit_function_in_file: function_name and new_source must be strings",
-          },
-          error: "arg validation failed",
-        };
-      }
-      result = editFunctionInFile(currentSource, name, src);
-      break;
-    }
-    case "edit_whole_class_in_file": {
-      const name = args["class_name"];
-      const src = args["new_source"];
-      if (typeof name !== "string" || typeof src !== "string") {
-        return {
-          ok: false,
-          toolResult: {
-            error: "edit_whole_class_in_file: class_name and new_source must be strings",
-          },
-          error: "arg validation failed",
-        };
-      }
-      result = editWholeClassInFile(currentSource, name, src);
-      break;
-    }
-    case "edit_method_of_class_in_file": {
-      const className = args["class_name"];
-      const methodName = args["method_name"];
-      const src = args["new_source"];
-      if (
-        typeof className !== "string" ||
-        typeof methodName !== "string" ||
-        typeof src !== "string"
-      ) {
-        return {
-          ok: false,
-          toolResult: {
-            error:
-              "edit_method_of_class_in_file: class_name, method_name, new_source must be strings",
-          },
-          error: "arg validation failed",
-        };
-      }
-      result = editMethodOfClassInFile(currentSource, className, methodName, src);
-      break;
-    }
-    case "edit_imports_and_assignments_in_file": {
-      const src = args["new_source"];
-      if (typeof src !== "string") {
-        return {
-          ok: false,
-          toolResult: {
-            error: "edit_imports_and_assignments_in_file: new_source must be a string",
-          },
-          error: "arg validation failed",
-        };
-      }
-      result = editImportsAndAssignmentsInFile(currentSource, src);
-      break;
-    }
-    default:
-      // Unreachable — applyTool already filtered.
-      return {
-        ok: false,
-        toolResult: { error: `unknown surgical tool ${toolName}` },
-      };
-  }
-  if (!result.ok) {
-    return {
-      ok: false,
-      toolResult: { error: result.error ?? "(no error)" },
-      error: result.error,
-    };
-  }
-  // Re-extract the leaf body from the edited source. If the
-  // model's edit broke the body extractor's invariant (renamed
-  // the function, removed the method), surface that explicitly
-  // instead of silently advancing.
-  const body = extractBodyForActiveLeaf(result.source!, input.leaf);
-  if (body === null) {
-    return {
-      ok: false,
-      toolResult: {
-        error: `edit succeeded but the body for ${input.leaf.kind === "method" ? `${input.leaf.ownerClassName}.${input.leaf.name}` : input.leaf.name} could not be re-extracted from the resulting source. Don't rename or remove the active leaf's declaration.`,
-      },
-      error: "body extraction failed after edit",
-    };
-  }
-  input.bodyByLeafId.set(input.leaf.leafCapabilityId, body);
-  // Step U2: snapshot the full post-edit source on the
-  // FileNode overlay. Without this, non-leaf edits made via
-  // §D.2 surgical tools (e.g. edit_whole_class_in_file on a
-  // class without method leaves) would be wiped by the next
-  // render.
-  input.hostFile.userEditedSource = result.source!;
-  // Mirror imports — the §D.2 edit_imports_and_assignments_in_file
-  // path most obviously needs this; the function/class/method
-  // edits leave imports unchanged but syncing is idempotent and
-  // keeps the rule consistent.
-  syncImportsFromSource(input, result.source!);
-  return {
-    ok: true,
-    toolResult: { ok: true },
-    summary: `${toolName} applied`,
-  };
-}
-
-function renderHost(input: DevLoopInput): string {
-  // Use the read tool's rendering path to keep a single source
-  // of truth. The active leaf's body comes from bodyByLeafId
-  // (or renders as a stub when absent).
-  const r = readFileTool({
-    rpg: input.rpg,
-    bodyByLeafId: input.bodyByLeafId,
-    testsByLeafId: input.testsByLeafId,
-    path: input.hostFile.path,
-  });
-  if (!r.ok) {
-    // Shouldn't happen — input.hostFile.path comes from the RPG.
-    return input.hostFile.content;
-  }
-  return r.content!;
-}
-
-function extractBodyForActiveLeaf(
-  source: string,
-  leaf: PlannedInterface,
-): string | null {
-  if (leaf.kind === "method") {
-    if (!leaf.ownerClassName) return null;
-    return extractMethodBody(source, leaf.ownerClassName, leaf.name);
-  }
-  return extractFunctionBody(source, leaf.name);
-}
-
 /** Mirror imports the model added during this edit back into
  *  `hostFile.rawImports`. The renderer emits imports from
  *  rawImports, so without this every render after the edit
@@ -909,56 +605,6 @@ function extractBodyForActiveLeaf(
  *  because removing an obsolete import is a legitimate edit;
  *  the model controls the import set as long as the dev loop
  *  is active. */
-/** Step S6: synthesize a trivial shape-check test for the
- *  active leaf. The shape varies by leaf kind:
- *    - function: `expect(typeof <name>).toBe("function")`
- *    - method:   `expect(<Class>.prototype.<method>).toBeDefined()`
- *  The test imports from the host file using the same
- *  relative-import convention the test author uses. */
-function buildSmokeTest(
-  leaf: PlannedInterface,
-  hostFile: FileNode,
-  reason: string,
-): string {
-  // Test files live at tests/leaves/<slug>.test.ts. Their
-  // imports use ../../<src-relative path> with .js extension.
-  const relPath = `../../${stripExt(hostFile.path)}.js`;
-  const lines: string[] = [];
-  lines.push(`// Smoke test — leaf marked unwinnable for full unit test.`);
-  lines.push(`// Reason: ${reason.replace(/\n/g, " ").slice(0, 200)}`);
-  lines.push(`import { describe, it, expect } from "vitest";`);
-  if (leaf.kind === "function") {
-    lines.push(`import { ${leaf.name} } from ${JSON.stringify(relPath)};`);
-    lines.push(``);
-    lines.push(`describe(${JSON.stringify(leaf.name + " (smoke)")}, () => {`);
-    lines.push(`  it("is callable", () => {`);
-    lines.push(`    expect(typeof ${leaf.name}).toBe("function");`);
-    lines.push(`  });`);
-    lines.push(`});`);
-  } else {
-    // method: assert prototype carries the method.
-    const cls = leaf.ownerClassName ?? "AnonClass";
-    lines.push(`import { ${cls} } from ${JSON.stringify(relPath)};`);
-    lines.push(``);
-    lines.push(`describe(${JSON.stringify(`${cls}.${leaf.name} (smoke)`)}, () => {`);
-    lines.push(`  it("exists on the prototype", () => {`);
-    lines.push(`    expect(typeof (${cls}.prototype as Record<string, unknown>)[${JSON.stringify(leaf.name)}]).toBe("function");`);
-    lines.push(`  });`);
-    lines.push(`});`);
-  }
-  return lines.join("\n") + "\n";
-}
-
-/** Strip the file extension from a POSIX-style path. The dot
- *  must be in the BASENAME (after the last "/") — otherwise a
- *  path like ".gitkeep/host" or "foo.bar/baz" would be wrongly
- *  truncated at the directory dot. */
-function stripExt(p: string): string {
-  const slash = p.lastIndexOf("/");
-  const dot = p.lastIndexOf(".");
-  if (dot < 0 || dot < slash) return p;
-  return p.slice(0, dot);
-}
 
 function syncImportsFromSource(input: DevLoopInput, newSource: string): void {
   input.hostFile.rawImports = extractTopLevelImports(newSource).map((i) => ({
@@ -988,25 +634,13 @@ Tools:
   list_files                      List every file in the project. No args. Use first to see what exists.
   read_file(path)                 Read one file's current source. Use to inspect siblings before importing or referencing them.
   edit_file(path, old_str, new_str)
-                                  String replacement on the active file. old_str must match exactly once. Use the file's CURRENT content (re-read after each edit). You can ONLY edit the active leaf's file; other files are read-only.
+                                  String replacement. Works on ANY file in the project (source, tests, package.json, vitest.config.ts, tsconfig.json, etc.). old_str must match the file's CURRENT content exactly once. Use read_file to refresh your view after edits.
   typecheck                       Run tsc --noEmit on the project. Returns diagnostics scoped to the active file. Useful after a non-trivial edit before running tests.
   run_test                        Run the active leaf's test. Returns ok=true or the failing assertion.
-  rewrite_test(new_source)        Replace the leaf's test source. Use when the existing test contract is unwinnable (e.g. browser-only code that needs jsdom, async WASM init, environment-dependent classes) — write a smoke test or restructure the assertions. Bounded by a small budget; the body still has to satisfy whatever the rewrite asserts.
-  skip_with_smoke_test(reason)    Replace the leaf's test with a harness-generated trivial shape check (e.g. expect(typeof fn).toBe("function")). For leaves that genuinely have no meaningful unit test (Preact hooks, WASM init, env-dependent singletons). Consumes ONE rewrite_test budget slot. Provide a clear reason string; that goes into the test as a comment for traceability.
-  edit_function_in_file(function_name, new_source)
-                                  AST-aware: replace a top-level function. Stricter than edit_file but reliable for whole-function rewrites.
-  edit_method_of_class_in_file(class_name, method_name, new_source)
-                                  AST-aware: replace ONE method of a class. new_source must be a class block containing only the target method.
-  edit_whole_class_in_file(class_name, new_source)
-                                  AST-aware: replace an entire class.
-  edit_imports_and_assignments_in_file(new_source)
-                                  AST-aware: replace the file's imports + top-level assignments region.
   add_dependency(name, version, which)
-                                  Install a runtime ("which":"runtime") or dev ("which":"dev") dependency. Use when run_test fails with "Cannot find module X" — pick a working binding. If a chosen binding doesn't compile (gyp / node-gyp errors), use remove_dependency + add_dependency to swap to an alternative.
-  remove_dependency(name)
-                                  Strip a package from package.json + re-install. Useful before swapping bindings.
-  set_script(name, command)       Add or update an npm script. Cannot overwrite scripts.test with a non-vitest command.
-  npm_run(script)                 Run an existing npm script (npm run <name>). Returns exit code + stdout/stderr. Use to verify a remediation worked before terminating.
+                                  Install a runtime ("which":"runtime") or dev ("which":"dev") dependency. Use when run_test fails with "Cannot find module X". If a chosen binding doesn't compile (gyp / node-gyp errors), use remove_dependency + add_dependency to swap.
+  remove_dependency(name)         Strip a package from package.json + re-install.
+  npm_run(script)                 Run an existing npm script. Returns exit code + stdout/stderr. Use to verify a remediation worked before terminating.
   Terminate(reason)               End the session. Call when you believe the active leaf is done. The orchestrator will run the test once more to verify.
 
 Pick exactly ONE tool per turn.`;
@@ -1115,101 +749,6 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
   {
     type: "function",
     function: {
-      name: "rewrite_test",
-      description:
-        "Replace the active leaf's test source. Use when the existing test contract is unwinnable (browser-only code needing jsdom, async WASM init, env-dependent classes) — author a smoke test or restructure the assertions. Bounded by a small budget. The body still has to satisfy whatever the rewrite asserts.",
-      parameters: {
-        type: "object",
-        properties: {
-          new_source: {
-            type: "string",
-            description: "Full TypeScript source for the replacement test file.",
-          },
-        },
-        required: ["new_source"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "skip_with_smoke_test",
-      description:
-        'Replace the leaf\'s test with a harness-generated shape check (e.g. expect(typeof fn).toBe("function")). For leaves that genuinely have no meaningful unit test (Preact hooks, WASM init, env-dependent singletons). Consumes ONE rewrite_test budget slot. Provide a clear reason string explaining why the leaf is untestable in isolation — gets logged in the smoke test as a comment.',
-      parameters: {
-        type: "object",
-        properties: {
-          reason: {
-            type: "string",
-            description: "Why this leaf is genuinely untestable in isolation.",
-          },
-        },
-        required: ["reason"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "edit_function_in_file",
-      description: "AST-aware: replace a top-level function. Output the FULL function definition.",
-      parameters: {
-        type: "object",
-        properties: {
-          function_name: { type: "string" },
-          new_source: { type: "string" },
-        },
-        required: ["function_name", "new_source"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "edit_whole_class_in_file",
-      description: "AST-aware: replace an entire class declaration.",
-      parameters: {
-        type: "object",
-        properties: {
-          class_name: { type: "string" },
-          new_source: { type: "string" },
-        },
-        required: ["class_name", "new_source"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "edit_method_of_class_in_file",
-      description:
-        "AST-aware: replace ONE method on a class. new_source must be a class block containing ONLY the target method.",
-      parameters: {
-        type: "object",
-        properties: {
-          class_name: { type: "string" },
-          method_name: { type: "string" },
-          new_source: { type: "string" },
-        },
-        required: ["class_name", "method_name", "new_source"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "edit_imports_and_assignments_in_file",
-      description: "AST-aware: replace the file's imports + top-level assignments region.",
-      parameters: {
-        type: "object",
-        properties: { new_source: { type: "string" } },
-        required: ["new_source"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
       name: "add_dependency",
       description:
         'Install a runtime or dev dependency. Use when "Cannot find module X" appears — pick a working binding. If a chosen native dep fails to compile (gyp errors), remove + add an alternative (e.g. better-sqlite3 → libsql or node:sqlite).',
@@ -1233,21 +772,6 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
         type: "object",
         properties: { name: { type: "string" } },
         required: ["name"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "set_script",
-      description: "Add or update an npm script. Cannot overwrite scripts.test with a non-vitest command.",
-      parameters: {
-        type: "object",
-        properties: {
-          name: { type: "string" },
-          command: { type: "string" },
-        },
-        required: ["name", "command"],
       },
     },
   },

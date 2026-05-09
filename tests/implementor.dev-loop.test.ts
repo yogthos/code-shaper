@@ -238,20 +238,17 @@ describe("runLeafDevLoop — read tools", () => {
         { name: "list_files", args: {} },
         // Step 2: read errors.ts to learn the constructor.
         { name: "read_file", args: { path: "src/errors.ts" } },
-        // Step 3: add the import via edit_imports_and_assignments_in_file.
+        // Step 3: a single edit_file that adds the import AND
+        // writes the body. The model now has one edit shape; no
+        // §D.2 specialty tools.
         {
-          name: "edit_imports_and_assignments_in_file",
+          name: "edit_file",
           args: {
-            new_source: 'import { TodoValidationError } from "./errors.js";',
-          },
-        },
-        // Step 4: write the body.
-        {
-          name: "edit_function_in_file",
-          args: {
-            function_name: "validateText",
-            new_source:
-              'export function validateText(text: string): void {\n  if (text.length === 0) throw new TodoValidationError("text cannot be empty");\n}',
+            path: "src/validation.ts",
+            old_str:
+              'export function validateText(text: string): void {\n  throw new Error("validateText: not implemented");\n}',
+            new_str:
+              'import { TodoValidationError } from "./errors.js";\n\nexport function validateText(text: string): void {\n  if (text.length === 0) throw new TodoValidationError("text cannot be empty");\n}',
           },
         },
         { name: "Terminate", args: { reason: "done" } },
@@ -269,8 +266,7 @@ describe("runLeafDevLoop — read tools", () => {
       expect(r.trail.map((t) => t.tool)).toEqual([
         "list_files",
         "read_file",
-        "edit_imports_and_assignments_in_file",
-        "edit_function_in_file",
+        "edit_file",
         "Terminate",
       ]);
       // The model should have seen the rendered errors.ts.
@@ -632,264 +628,4 @@ describe("runLeafDevLoop — npm tools", () => {
       }
     },
   );
-});
-
-// Step S5: rewrite_test gives the model agency over the test
-// contract when the existing one is unwinnable. Bounded by a
-// budget so the model can't trivially game its way to passing.
-describe("runLeafDevLoop — rewrite_test (S5)", () => {
-  it(
-    "replaces the leaf's test source via rewrite_test",
-    { timeout: 60_000 },
-    async () => {
-      const f = mkFile({
-        id: "file:add",
-        path: "src/add.ts",
-        interfacePlan: ADD_PLAN,
-      });
-      const rpg = rpgWithFiles([f]);
-      const tests = new Map([
-        [
-          "cap:add",
-          `import { describe, it, expect } from "vitest";\nimport { add } from "../../src/add.js";\ndescribe("add", () => { it("strict", () => { expect(add(2,3)).toBe(5); }); });\n`,
-        ],
-      ]);
-      const NEW_TEST = `import { describe, it, expect } from "vitest";\nimport { add } from "../../src/add.js";\ndescribe("add (smoke)", () => { it("exists", () => { expect(typeof add).toBe("function"); }); });\n`;
-      const { client } = scriptedClient([
-        // Edit body so it produces SOMETHING; the rewrite_test
-        // shifts the test to a smoke check.
-        {
-          name: "edit_file",
-          args: {
-            path: "src/add.ts",
-            old_str: 'throw new Error("add: not implemented");',
-            new_str: "return 0;",
-          },
-        },
-        { name: "rewrite_test", args: { new_source: NEW_TEST } },
-        { name: "Terminate", args: {} },
-      ]);
-      const r = await runLeafDevLoop(client, {
-        leaf: f.interfacePlan!.entries[0]!,
-        hostFile: f,
-        rpg,
-        bodyByLeafId: new Map(),
-        testsByLeafId: tests,
-        workDir,
-      });
-      expect(r.ok, JSON.stringify(r)).toBe(true);
-      // The map now holds the rewritten test.
-      expect(tests.get("cap:add")).toContain('describe("add (smoke)"');
-      // Trail records the rewrite.
-      const rewrite = r.trail.find((t) => t.tool === "rewrite_test");
-      expect(rewrite).toBeDefined();
-      expect(rewrite!.ok).toBe(true);
-    },
-  );
-
-  it(
-    "rejects rewrite_test once the budget is exhausted",
-    async () => {
-      const f = mkFile({
-        id: "file:add",
-        path: "src/add.ts",
-        interfacePlan: ADD_PLAN,
-      });
-      const rpg = rpgWithFiles([f]);
-      const tests = new Map([
-        ["cap:add", `import { describe, it } from "vitest";\ndescribe("x", () => { it("ok", () => {}); });\n`],
-      ]);
-      const ANY_TEST = `import { describe, it } from "vitest";\ndescribe("y", () => { it("ok", () => {}); });\n`;
-      const { client } = scriptedClient([
-        { name: "rewrite_test", args: { new_source: ANY_TEST } },
-        { name: "rewrite_test", args: { new_source: ANY_TEST } },
-        { name: "rewrite_test", args: { new_source: ANY_TEST } },
-        // Budget = 3 (default). Fourth must fail.
-        { name: "rewrite_test", args: { new_source: ANY_TEST } },
-        { name: "Terminate", args: {} },
-      ]);
-      const r = await runLeafDevLoop(client, {
-        leaf: f.interfacePlan!.entries[0]!,
-        hostFile: f,
-        rpg,
-        bodyByLeafId: new Map([["cap:add", "return 0;"]]),
-        testsByLeafId: tests,
-        workDir,
-      });
-      const rewrites = r.trail.filter((t) => t.tool === "rewrite_test");
-      expect(rewrites).toHaveLength(4);
-      const last = rewrites[3]!;
-      expect(last.ok).toBe(false);
-      expect(last.error).toMatch(/budget exhausted/);
-    },
-  );
-
-  // Step S6: skip_with_smoke_test generates a trivial shape
-  // check for the leaf when no meaningful unit test exists.
-  // Consumes one rewrite_test budget slot.
-  it(
-    "skip_with_smoke_test installs a generated shape-check test (S6)",
-    { timeout: 60_000 },
-    async () => {
-      const f = mkFile({
-        id: "file:add",
-        path: "src/add.ts",
-        interfacePlan: ADD_PLAN,
-      });
-      const rpg = rpgWithFiles([f]);
-      const tests = new Map([
-        [
-          "cap:add",
-          `import { describe, it, expect } from "vitest";\nimport { add } from "../../src/add.js";\ndescribe("add", () => { it("strict", () => { expect(add(2,3)).toBe(5); }); });\n`,
-        ],
-      ]);
-      const { client } = scriptedClient([
-        // Edit body to a wrong value first.
-        {
-          name: "edit_file",
-          args: {
-            path: "src/add.ts",
-            old_str: 'throw new Error("add: not implemented");',
-            new_str: "return 0;",
-          },
-        },
-        {
-          name: "skip_with_smoke_test",
-          args: {
-            reason:
-              "test is browser-only and needs jsdom; smoke check is the right granularity here",
-          },
-        },
-        { name: "Terminate", args: {} },
-      ]);
-      const r = await runLeafDevLoop(client, {
-        leaf: f.interfacePlan!.entries[0]!,
-        hostFile: f,
-        rpg,
-        bodyByLeafId: new Map(),
-        testsByLeafId: tests,
-        workDir,
-      });
-      expect(r.ok, JSON.stringify(r)).toBe(true);
-      const newTest = tests.get("cap:add")!;
-      expect(newTest).toContain("(smoke)");
-      expect(newTest).toContain('expect(typeof add).toBe("function")');
-      expect(newTest).toContain("Reason: test is browser-only");
-      const skip = r.trail.find((t) => t.tool === "skip_with_smoke_test");
-      expect(skip).toBeDefined();
-      expect(skip!.ok).toBe(true);
-    },
-  );
-
-  it("skip_with_smoke_test rejects empty reason", async () => {
-    const f = mkFile({
-      id: "file:add",
-      path: "src/add.ts",
-      interfacePlan: ADD_PLAN,
-    });
-    const rpg = rpgWithFiles([f]);
-    const tests = new Map([
-      ["cap:add", `import { describe, it } from "vitest";\ndescribe("x", () => { it("ok", () => {}); });\n`],
-    ]);
-    const { client } = scriptedClient([
-      { name: "skip_with_smoke_test", args: { reason: "" } },
-      { name: "Terminate", args: {} },
-    ]);
-    const r = await runLeafDevLoop(client, {
-      leaf: f.interfacePlan!.entries[0]!,
-      hostFile: f,
-      rpg,
-      bodyByLeafId: new Map([["cap:add", "return 0;"]]),
-      testsByLeafId: tests,
-      workDir,
-    });
-    const skip = r.trail.find((t) => t.tool === "skip_with_smoke_test");
-    expect(skip).toBeDefined();
-    expect(skip!.ok).toBe(false);
-    expect(skip!.error).toMatch(/non-empty string|reason/);
-  });
-
-  it(
-    "rejects rewrite_test when new_source doesn't parse as TypeScript",
-    async () => {
-      const f = mkFile({
-        id: "file:add",
-        path: "src/add.ts",
-        interfacePlan: ADD_PLAN,
-      });
-      const rpg = rpgWithFiles([f]);
-      const tests = new Map([
-        ["cap:add", `import { describe, it } from "vitest";\ndescribe("x", () => { it("ok", () => {}); });\n`],
-      ]);
-      const { client } = scriptedClient([
-        {
-          name: "rewrite_test",
-          args: { new_source: "this is not typescript {{{ broken" },
-        },
-        { name: "Terminate", args: {} },
-      ]);
-      const r = await runLeafDevLoop(client, {
-        leaf: f.interfacePlan!.entries[0]!,
-        hostFile: f,
-        rpg,
-        bodyByLeafId: new Map([["cap:add", "return 0;"]]),
-        testsByLeafId: tests,
-        workDir,
-      });
-      const rewrite = r.trail.find((t) => t.tool === "rewrite_test");
-      expect(rewrite).toBeDefined();
-      expect(rewrite!.ok).toBe(false);
-      expect(rewrite!.error).toMatch(/parse/i);
-    },
-  );
-
-  // Audit fix: stripExt must only strip when the dot is in the
-  // basename. Previously a path like "src/.config/host.ts" would
-  // be wrongly truncated at the directory dot.
-  it("smoke test imports preserve dirnames containing dots", async () => {
-    const f = mkFile({
-      id: "file:weird",
-      path: "src/.config/host.ts",
-      interfacePlan: {
-        entries: [
-          {
-            leafCapabilityId: "cap:fn",
-            kind: "function",
-            name: "fn",
-            ownerClassName: null,
-            description: "",
-            signature: { params: [], returnType: "void", isAsync: false },
-            exported: true,
-            isStatic: false,
-          },
-        ],
-        classes: [],
-      },
-    });
-    const rpg = rpgWithFiles([f]);
-    const tests = new Map([
-      [
-        "cap:fn",
-        `import { describe, it, expect } from "vitest";\nimport { fn } from "../../src/.config/host.js";\ndescribe("fn", () => { it("ok", () => { expect(fn()).toBeUndefined(); }); });\n`,
-      ],
-    ]);
-    const { client } = scriptedClient([
-      {
-        name: "skip_with_smoke_test",
-        args: { reason: "test environment unavailable" },
-      },
-      { name: "Terminate", args: {} },
-    ]);
-    await runLeafDevLoop(client, {
-      leaf: f.interfacePlan!.entries[0]!,
-      hostFile: f,
-      rpg,
-      bodyByLeafId: new Map([["cap:fn", "return;"]]),
-      testsByLeafId: tests,
-      workDir,
-    });
-    const generated = tests.get("cap:fn")!;
-    expect(generated).toContain('"../../src/.config/host.js"');
-    expect(generated).not.toMatch(/from\s+"\.\.\/\.\.\/src\/host\./);
-  });
 });
