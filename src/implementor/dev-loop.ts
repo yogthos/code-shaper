@@ -341,6 +341,7 @@ async function applyTool(
         bodyByLeafId: input.bodyByLeafId,
         testsByLeafId: input.testsByLeafId,
         path: p,
+        ...(input.outDir !== undefined ? { outDir: input.outDir } : {}),
       });
       return {
         ok: r.ok,
@@ -897,7 +898,8 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read the current rendered source of one file.",
+      description:
+        "Read a file's content. Tries the RPG first (rendered with current bodies); falls back to a disk read under outDir for project files outside the planned graph (vitest.config.ts, tsconfig.json, .env, node_modules/<dep>/...).",
       parameters: {
         type: "object",
         properties: { path: { type: "string", description: "Repo-relative path." } },

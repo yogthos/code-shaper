@@ -264,4 +264,95 @@ describe("readFileTool", () => {
     });
     expect(r.ok).toBe(false);
   });
+
+  // Step S2: when a path isn't in the RPG, try a disk read
+  // under outDir. Lets the model inspect project files outside
+  // the planned graph (vitest.config.ts, tsconfig.json, etc.).
+  it("falls back to a disk read under outDir when the path isn't in the RPG (S2)", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = (await import("node:path")).default;
+    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "rfs2-"));
+    try {
+      await fs.writeFile(
+        path.join(outDir, "vitest.config.ts"),
+        'import { defineConfig } from "vitest/config";\nexport default defineConfig({});\n',
+      );
+      const rpg = rpgWithFiles([mkFile({ id: "file:a", path: "src/a.ts" })]);
+      const r = readFileTool({
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        path: "vitest.config.ts",
+        outDir,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      expect(r.source).toBe("disk");
+      expect(r.content).toContain("defineConfig");
+    } finally {
+      await fs.rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects with a useful error when neither RPG nor disk has the path", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = (await import("node:path")).default;
+    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "rfs2-"));
+    try {
+      const rpg = rpgWithFiles([mkFile({ id: "file:a", path: "src/a.ts" })]);
+      const r = readFileTool({
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        path: "missing.txt",
+        outDir,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/not in the project/);
+      expect(r.error).toMatch(/Available in RPG/);
+    } finally {
+      await fs.rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("truncates very large files with a marker", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = (await import("node:path")).default;
+    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "rfs2-"));
+    try {
+      // Slightly above the 256KB cap so truncation kicks in.
+      const big = "x".repeat(300 * 1024);
+      await fs.writeFile(path.join(outDir, "big.txt"), big);
+      const rpg = rpgWithFiles([mkFile({ id: "file:a", path: "src/a.ts" })]);
+      const r = readFileTool({
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        path: "big.txt",
+        outDir,
+      });
+      expect(r.ok).toBe(true);
+      expect(r.content).toMatch(/truncated/);
+      expect((r.content ?? "").length).toBeLessThan(big.length);
+    } finally {
+      await fs.rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("disk fallback respects path-traversal sandbox", async () => {
+    // Even with outDir set, ../etc/passwd type paths must reject
+    // before reaching disk.
+    const rpg = rpgWithFiles([mkFile({ id: "file:a", path: "src/a.ts" })]);
+    const r = readFileTool({
+      rpg,
+      bodyByLeafId: new Map(),
+      testsByLeafId: new Map(),
+      path: "../etc/passwd",
+      outDir: "/tmp",
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/repo-relative/);
+  });
 });

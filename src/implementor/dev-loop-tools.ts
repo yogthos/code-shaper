@@ -24,6 +24,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import * as nodeFs from "node:fs";
 import { createRequire } from "node:module";
 import nodePath from "node:path";
 
@@ -157,16 +158,27 @@ export interface ReadFileInput {
   bodyByLeafId: Map<string, string>;
   testsByLeafId: Map<string, string>;
   path: string;
+  /** Step S2: when set, paths not in the RPG fall back to a
+   *  read of `outDir/<path>`. Lets the model inspect project
+   *  files outside the planned graph (vitest.config.ts,
+   *  tsconfig.json, node_modules/<dep>/index.d.ts, etc.) which
+   *  is critical for diagnosing test-environment issues. */
+  outDir?: string;
 }
 
 export interface ReadFileResult {
   ok: boolean;
-  /** Set on success — the rendered (or raw, for extend-mode files)
-   *  content of the requested path. */
+  /** Set on success — the rendered (or raw) content of the
+   *  requested path. */
   content?: string;
   /** Set on failure — explanation including, when relevant, the
    *  list of available paths so the model can correct its query. */
   error?: string;
+  /** Set on success — where the content came from. "rpg" means
+   *  the read went through the renderer (bodyByLeafId-aware);
+   *  "disk" means a raw read from outDir. Lets callers (and
+   *  tests) tell the two paths apart. */
+  source?: "rpg" | "disk";
 }
 
 export function readFileTool(input: ReadFileInput): ReadFileResult {
@@ -182,30 +194,82 @@ export function readFileTool(input: ReadFileInput): ReadFileResult {
       error: `path must be a repo-relative path (no leading "/" or ".." segments). Got ${JSON.stringify(input.path)}`,
     };
   }
+  // Try the RPG first. If the file is planned, the renderer
+  // gives us the latest in-memory state (including any unwritten
+  // body edits the dev loop has made).
   const file = findFileByPath(input.rpg, input.path);
-  if (!file) {
-    const available = listAvailablePaths(input.rpg);
-    const suggestion =
-      available.length > 0
-        ? ` Available: ${available.slice(0, 20).join(", ")}${available.length > 20 ? ", …" : ""}.`
-        : "";
-    return {
-      ok: false,
-      error: `path ${JSON.stringify(input.path)} is not in the project (no such file in the RPG).${suggestion}`,
-    };
+  if (file) {
+    if (file.interfacePlan) {
+      const content = renderTypeScriptFile({
+        file,
+        bodyByLeafId: input.bodyByLeafId,
+        rpg: input.rpg,
+      });
+      return { ok: true, content, source: "rpg" };
+    }
+    return { ok: true, content: file.content, source: "rpg" };
   }
-  // Files with an interfacePlan render through the
-  // bodyByLeafId-aware renderer. Files without (extend-mode) just
-  // return their existing content verbatim.
-  if (file.interfacePlan) {
-    const content = renderTypeScriptFile({
-      file,
-      bodyByLeafId: input.bodyByLeafId,
-      rpg: input.rpg,
-    });
-    return { ok: true, content };
+  // Step S2: fall back to a disk read under outDir. Useful for
+  // project files outside the RPG (vitest.config.ts,
+  // tsconfig.json, .env, node_modules/<dep>/index.d.ts).
+  if (input.outDir) {
+    try {
+      const fs = nodeFsSyncReadFile(input.outDir, input.path);
+      if (fs.ok) return { ok: true, content: fs.content, source: "disk" };
+      // Fall through to the RPG-not-found error below; include
+      // the disk attempt's reason for clarity.
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return {
+        ok: false,
+        error: `disk read of ${JSON.stringify(input.path)} (under outDir) failed: ${msg}`,
+      };
+    }
   }
-  return { ok: true, content: file.content };
+  const available = listAvailablePaths(input.rpg);
+  const suggestion =
+    available.length > 0
+      ? ` Available in RPG: ${available.slice(0, 20).join(", ")}${available.length > 20 ? ", …" : ""}.`
+      : "";
+  return {
+    ok: false,
+    error: `path ${JSON.stringify(input.path)} is not in the project (no such file in the RPG${input.outDir ? " or on disk under outDir" : ""}).${suggestion}`,
+  };
+}
+
+/** Read a file relative to `outDir` synchronously. Returns
+ *  {ok:false} when the file doesn't exist; throws only on other
+ *  IO errors (permission denied, etc.) so the caller can return
+ *  a clean error to the model. */
+function nodeFsSyncReadFile(
+  outDir: string,
+  relPath: string,
+): { ok: true; content: string } | { ok: false } {
+  const fs = nodeFs;
+  const full = nodePath.join(outDir, relPath);
+  if (!fs.existsSync(full)) return { ok: false };
+  const stat = fs.statSync(full);
+  if (!stat.isFile()) return { ok: false };
+  // Cap the read at 256 KB so the model doesn't accidentally
+  // pull a huge .map file or fixture into the conversation.
+  const READ_CAP = 256 * 1024;
+  if (stat.size > READ_CAP) {
+    // Read just the head + a marker so the model knows the file
+    // was truncated.
+    const fd = fs.openSync(full, "r");
+    try {
+      const buf = Buffer.alloc(READ_CAP);
+      const bytesRead = fs.readSync(fd, buf, 0, READ_CAP, 0);
+      const head = buf.subarray(0, bytesRead).toString("utf-8");
+      return {
+        ok: true,
+        content: head + `\n\n…[truncated; full file is ${stat.size} bytes, read first ${READ_CAP}]`,
+      };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+  return { ok: true, content: fs.readFileSync(full, "utf-8") };
 }
 
 function findFileByPath(rpg: RPG, target: string): FileNode | null {
