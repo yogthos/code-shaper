@@ -38,15 +38,17 @@ export const STRUCTURE_SYSTEM_PROMPT = `You are an Architect agent in the file-s
 
 Your input is a tree of capability nodes (each with an id, name, and description). Your job is to assign every NON-LEAF capability still in status "planned" to a path on disk:
 
-  - Capabilities directly under the project root (depth 1) become FOLDERS.
+  - Capabilities directly under the project root (depth 1) become FOLDERS UNDER src/.
   - Non-leaf capabilities below depth 1 become FILES inside their ancestor's folder.
   - Leaf capabilities are intentionally NOT mapped at this stage — they cluster into their parent's file as functions/classes in the next stage.
 
 Rules:
+  - **All source code lives under src/.** Top-level folders for functional areas go under src/, not at the project root. e.g. src/api/, src/storage/, src/ui/ — NOT api/, storage/, ui/. The project root is reserved for package.json, tsconfig.json, vitest.config.ts, README, and the conventional src/ + tests/ directories.
   - Paths are repository-relative; no leading slash, no "..", no absolute paths.
   - Use forward slashes only.
   - Folder paths have no extension. File paths end with one of the allowed file extensions you'll be told.
   - Names are lower-case, hyphenated where helpful (e.g. data-loader.ts, not DataLoader.ts).
+  - Folder names should be CONCISE common terms — e.g. \`src/api/\` not \`src/http-api-implementation/\`, \`src/storage/\` not \`src/database-storage/\`. Don't append "-implementation" or "-logic" suffixes. The folder's purpose is implicit from its sibling structure.
   - Every file lives under one of the folders you also map. If a deep file requires intermediate folders that aren't separate capabilities, you may omit those — they'll be created implicitly. But intermediate sub-folders for capabilities that ARE non-leaf nodes should be mapped explicitly.
   - Cohesion: each folder owns one functional area; each file owns a coherent set of leaf capabilities.
 
