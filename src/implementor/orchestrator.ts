@@ -241,6 +241,14 @@ export async function buildImplementations(
     if (input.outDir) {
       renderPlannedFiles(rpg, bodyByLeafId);
       await materializeRPG(rpg, input.outDir);
+      // Step S1: synthesize a default tsconfig.json when one
+      // doesn't exist. The architect's stack phase writes
+      // package.json but not tsconfig — so typecheck would
+      // silently no-op (it short-circuits on missing tsconfig).
+      // The synthesized config is conservative: strict on,
+      // ES2022, bundler resolution. The model can edit it later
+      // via edit_file once S4 lands.
+      await ensureDefaultTsconfig(input.outDir);
     }
 
     // Step Q4-A/B — Phase 5b: pre-author every leaf's test in
@@ -1083,6 +1091,44 @@ function tryBlameDep(
 
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Step S1: ensure a tsconfig.json exists at outDir. Without it,
+ *  typecheckTool short-circuits (`ran: false`) — the model never
+ *  gets type errors back from the dev loop. The architect doesn't
+ *  produce one, so we synthesize a sensible default. The model
+ *  can edit it later (S4) when the project's environment needs
+ *  customization (jsdom, paths aliases, etc.). */
+async function ensureDefaultTsconfig(outDir: string): Promise<void> {
+  const fs = await import("node:fs/promises");
+  const nodePath = (await import("node:path")).default;
+  const tsconfigPath = nodePath.join(outDir, "tsconfig.json");
+  try {
+    await fs.access(tsconfigPath);
+    return; // Already exists.
+  } catch {
+    // Doesn't exist — write a default below.
+  }
+  const defaultTsconfig = {
+    compilerOptions: {
+      target: "ES2022",
+      module: "ESNext",
+      moduleResolution: "bundler",
+      strict: true,
+      noEmit: true,
+      esModuleInterop: true,
+      allowSyntheticDefaultImports: true,
+      skipLibCheck: true,
+      resolveJsonModule: true,
+      forceConsistentCasingInFileNames: true,
+    },
+    include: ["src/**/*.ts", "tests/**/*.ts"],
+  };
+  await fs.writeFile(
+    tsconfigPath,
+    JSON.stringify(defaultTsconfig, null, 2) + "\n",
+    "utf-8",
+  );
 }
 
 /** Cap on dep-blame rounds per leaf. Counts against the same
