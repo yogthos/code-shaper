@@ -314,6 +314,12 @@ async function main(): Promise<number> {
     // file-independent leaves. Bump on local models or higher
     // rate-limit tiers.
     maxConcurrentLeaves: 3,
+    // Q4-A/B/C: pre-author every leaf's test in parallel before
+    // phase 6, build a dep graph from test imports, gate
+    // dispatch on dep landing. Fixes the "integration leaf
+    // scheduled before its components" failure mode that wedged
+    // the prior run.
+    preAuthorTestsAndGateOnDeps: true,
     // Stage C: when the diagnostic says environment, the model can
     // call add_dependency / remove_dependency / set_script /
     // npm_run via a structured tool call. The harness applies the

@@ -32,6 +32,19 @@ import {
 } from "./decompose.js";
 import { implementLeaf, type LeafImplementResult } from "./leaf.js";
 import {
+  authorAllLeafTests,
+  type TestAuthorProgressEvent,
+} from "./test-author.js";
+import {
+  buildLeafDependencyGraph,
+  type LeafDependencyGraph,
+} from "./dep-graph.js";
+
+// Re-export so callers of buildImplementations can type their
+// onTestAuthorProgress handler without depending on test-author
+// directly.
+export type { TestAuthorProgressEvent } from "./test-author.js";
+import {
   createHarnessDir,
   linkHostNodeModules,
   resolveNodeModulesSource,
@@ -100,6 +113,18 @@ export interface BuildInput {
    *  GLM and other rate-limited providers should keep this small
    *  (2-4); local models can go higher. */
   maxConcurrentLeaves?: number;
+  /** Step Q4-A/B/C: pre-author every leaf's test in parallel
+   *  before the work queue starts (phase 5b), build a dep graph
+   *  from the test imports, and gate dispatch on deps having
+   *  landed. Without this, "integration" leaves (whose tests
+   *  exercise many sibling-leaf surfaces) get scheduled before
+   *  their components and burn the dev-loop budget against stubs.
+   *  Default false for backward compat; production drivers opt
+   *  in. */
+  preAuthorTestsAndGateOnDeps?: boolean;
+  /** Optional progress callback for phase 5b. Same shape as
+   *  onLeafProgress for phase 6. */
+  onTestAuthorProgress?: (event: TestAuthorProgressEvent) => void;
   /** Enable env-fix on `environment` diagnostic verdicts. Forwarded
    *  to implementLeaf as `enableEnvFix`. Requires `outDir` (which
    *  the orchestrator passes through as `projectDir` to leaf). */
@@ -193,6 +218,29 @@ export async function buildImplementations(
       await materializeRPG(rpg, input.outDir);
     }
 
+    // Step Q4-A/B — Phase 5b: pre-author every leaf's test in
+    // parallel, then build a dep graph from the test imports. The
+    // dep graph gates the scheduler in pickNextEntry below.
+    let depGraph: LeafDependencyGraph | undefined;
+    if (input.preAuthorTestsAndGateOnDeps) {
+      const authorRes = await authorAllLeafTests(client, rpg, {
+        bodyByLeafId,
+        testsByLeafId,
+        ...(input.onTestAuthorProgress
+          ? { onProgress: input.onTestAuthorProgress }
+          : {}),
+        ...(input.temperature !== undefined
+          ? { temperature: input.temperature }
+          : {}),
+      });
+      // Even if some leaves' tests failed to author, continue —
+      // their failures will surface naturally in phase 6 (the leaf
+      // can't run without a test, and the implementLeaf path
+      // still tries to author it inline as a fallback).
+      void authorRes;
+      depGraph = buildLeafDependencyGraph(rpg, testsByLeafId);
+    }
+
     // Work queue. Decompose-recovery prepends sub-leaves AND re-queues
     // the original leaf so it implements after its children. Each
     // entry tracks an `attemptCount` so we don't re-run a leaf
@@ -236,17 +284,34 @@ export async function buildImplementations(
     const maxConcurrent = Math.max(1, input.maxConcurrentLeaves ?? 1);
     const lockedFiles = new Set<string>();
     let materializing = false;
+    /** Set of leaf capability ids whose implementation succeeded.
+     *  Used by pickNextEntry to gate dispatch on a leaf's deps
+     *  having all landed (Q4-C). */
+    const landedLeaves = new Set<string>();
 
-    /** Pick the next queue entry whose host file isn't locked by
-     *  another worker. Returns null when the queue is empty OR
-     *  every remaining entry is locked. */
+    /** Returns true iff every dep of `leafId` has landed (or the
+     *  dep graph is unset, i.e., dep-gating is disabled). */
+    function depsSatisfied(leafId: string): boolean {
+      if (!depGraph) return true;
+      const deps = depGraph.get(leafId);
+      if (!deps || deps.size === 0) return true;
+      for (const d of deps) {
+        if (!landedLeaves.has(d)) return false;
+      }
+      return true;
+    }
+
+    /** Pick the next queue entry that is (a) not on a locked file
+     *  and (b) has all its dependencies landed. Returns null when
+     *  every remaining entry is blocked by a lock OR an unlanded
+     *  dep — the worker polls in that case. */
     function pickNextEntry(): QueueEntry | null {
       for (let i = 0; i < queue.length; i++) {
         const e = queue[i]!;
-        if (!lockedFiles.has(e.hostFile.path)) {
-          queue.splice(i, 1);
-          return e;
-        }
+        if (lockedFiles.has(e.hostFile.path)) continue;
+        if (!depsSatisfied(e.leaf.leafCapabilityId)) continue;
+        queue.splice(i, 1);
+        return e;
       }
       return null;
     }
@@ -385,7 +450,13 @@ export async function buildImplementations(
         await materializeWithLock();
       }
 
-      if (result.ok) return;
+      if (result.ok) {
+        // Step Q4-C: record the landed leaf so dependent leaves'
+        // dep-satisfied check passes and they become dispatchable
+        // by the scheduler.
+        landedLeaves.add(leaf.leafCapabilityId);
+        return;
+      }
 
       // Failed leaf — try to recover via decomposition or fresh
       // approach. Hard-fail when the recovery itself fails.
@@ -485,11 +556,36 @@ export async function buildImplementations(
         //   (a) queue is empty AND no other worker is running →
         //       we're done.
         //   (b) queue is non-empty but every remaining entry is
-        //       locked → another worker will release a lock
-        //       eventually; poll briefly.
+        //       blocked (lock or unlanded dep) → another worker
+        //       will release a lock or land a dep eventually;
+        //       poll briefly.
         //   (c) queue is empty but other workers are running →
-        //       they may push decompose sub-leaves; poll briefly.
+        //       they may push decompose sub-leaves OR land deps
+        //       that unblock queue entries; poll briefly.
+        //   (d) DEADLOCK: queue is non-empty, no workers in
+        //       flight, but every entry is blocked by an
+        //       unlanded dep that will never land. Detect this
+        //       and surface the entries with a synthesized
+        //       "deps never landed" failure instead of spinning.
         if (queue.length === 0 && lockedFiles.size === 0) return;
+        if (queue.length > 0 && lockedFiles.size === 0 && depGraph) {
+          // No one is making progress. Identify orphaned entries
+          // (deps reference leaves that never appeared in the
+          // initial plan, or whose source leaf failed) and force
+          // them through with a one-shot dispatch; the leaf will
+          // either succeed against partial context or fail
+          // cleanly.
+          const stuck = queue.shift()!;
+          lockedFiles.add(stuck.hostFile.path);
+          try {
+            await processOneEntry(stuck);
+            // If this leaf landed it might unblock siblings;
+            // recurse into the loop normally.
+          } finally {
+            lockedFiles.delete(stuck.hostFile.path);
+          }
+          continue;
+        }
         await new Promise((r) => setTimeout(r, 50));
       }
     }

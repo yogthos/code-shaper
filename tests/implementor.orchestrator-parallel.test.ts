@@ -232,6 +232,142 @@ describe("buildImplementations — maxConcurrentLeaves", () => {
     },
   );
 
+  // Step Q4-C: when preAuthorTestsAndGateOnDeps is on, leaves
+  // whose tests import a sibling leaf's symbol must wait for
+  // that sibling to land. Without this, integration-style leaves
+  // get scheduled before their components and fail against
+  // stubs.
+  it(
+    "gates dispatch on leaf dependencies from test imports (Q4-C)",
+    { timeout: 60_000 },
+    async () => {
+      // Three leaves: a, b are independent. c's test imports a
+      // and b — so c should run AFTER both a and b have landed.
+      const a = mkFileNode({
+        id: "file:a",
+        path: "src/a.ts",
+        entries: [plannedFn("a", "cap:a")],
+      });
+      const b = mkFileNode({
+        id: "file:b",
+        path: "src/b.ts",
+        entries: [plannedFn("b", "cap:b")],
+      });
+      const c = mkFileNode({
+        id: "file:c",
+        path: "src/c.ts",
+        entries: [plannedFn("c", "cap:c")],
+      });
+      const rpg = rpgWithLeaves([a, b, c], ["cap:a", "cap:b", "cap:c"]);
+
+      const completionOrder: string[] = [];
+      let cStartedAt: number | null = null;
+      let aLandedAt: number | null = null;
+      let bLandedAt: number | null = null;
+
+      const client: LLMClient = {
+        async chat(messages, opts): Promise<LLMResponse> {
+          const sys = messages[0]!.content;
+          await new Promise((r) => setTimeout(r, 30));
+          if (
+            sys.includes("producing a vitest test file") &&
+            !opts?.tools
+          ) {
+            const userPrompt = messages[1]!.content;
+            // The leaf's name appears in backticks in the
+            // test-author user prompt (e.g. "Implement function
+            // `add`"). For this test we infer from a different
+            // marker.
+            const m = /\b(a|b|c)\b/.exec(userPrompt);
+            const name = m?.[1] ?? "fn";
+            // c's test imports a and b — making c depend on both.
+            const importLines =
+              name === "c"
+                ? `import { a } from "../../src/a.js";\nimport { b } from "../../src/b.js";\n`
+                : "";
+            return {
+              content: `import { describe, it, expect } from "vitest";\n${importLines}import { ${name} } from "../../src/${name}.js";\ndescribe("${name}", () => { it("ok", () => { ${name === "c" ? "a(); b(); " : ""}${name}(); expect(true).toBe(true); }); });\n`,
+              finishReason: "stop",
+            };
+          }
+          if (sys.includes("Implementor agent") && opts?.tools) {
+            const userPrompt = messages[1]!.content;
+            const nameMatch = /Implement function `(\w+)`/.exec(userPrompt);
+            const name = nameMatch?.[1] ?? "fn";
+            if (name === "c" && cStartedAt === null) {
+              cStartedAt = Date.now();
+            }
+            const toolMsgCount = messages.filter((m) => m.role === "tool").length;
+            if (toolMsgCount === 0) {
+              return {
+                content: "",
+                finishReason: "tool_calls",
+                toolCalls: [
+                  {
+                    id: `c1-${name}`,
+                    type: "function",
+                    function: {
+                      name: "edit_file",
+                      arguments: JSON.stringify({
+                        path: `src/${name}.ts`,
+                        old_str: `throw new Error("${name}: not implemented");`,
+                        new_str: "return a + b;",
+                      }),
+                    },
+                  },
+                ],
+              };
+            }
+            return {
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: `c2-${name}`,
+                  type: "function",
+                  function: {
+                    name: "Terminate",
+                    arguments: JSON.stringify({}),
+                  },
+                },
+              ],
+            };
+          }
+          return { content: "", finishReason: "stop" };
+        },
+        async listModels() {
+          return ["mock"];
+        },
+      };
+
+      const result = await buildImplementations(client, rpg, {
+        useDevLoop: true,
+        devLoopMaxIterations: 3,
+        maxAttemptsPerLeaf: 1,
+        maxConcurrentLeaves: 3,
+        preAuthorTestsAndGateOnDeps: true,
+        onLeafProgress: (e) => {
+          if (e.phase === "done" && e.ok) {
+            const t = Date.now();
+            completionOrder.push(e.leafCapabilityId);
+            if (e.leafCapabilityId === "cap:a") aLandedAt = t;
+            if (e.leafCapabilityId === "cap:b") bLandedAt = t;
+          }
+        },
+      });
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      // c must complete LAST.
+      expect(completionOrder[completionOrder.length - 1]).toBe("cap:c");
+      // c must START only after a AND b landed.
+      expect(cStartedAt).not.toBeNull();
+      expect(aLandedAt).not.toBeNull();
+      expect(bLandedAt).not.toBeNull();
+      expect(cStartedAt!).toBeGreaterThanOrEqual(
+        Math.max(aLandedAt!, bLandedAt!),
+      );
+    },
+  );
+
   it(
     "serializes leaves on the SAME file via the file-level lock",
     { timeout: 60_000 },
