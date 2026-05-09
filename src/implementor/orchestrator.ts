@@ -281,12 +281,22 @@ export async function buildImplementations(
         const initialIdx = initialLeafIds.indexOf(leaf.leafCapabilityId);
         const index =
           initialIdx >= 0 ? initialIdx + 1 : initialLeafIds.length + seenLeafIds.size - initialLeafIds.length;
-        // One-line failure summary — first 200 chars of the
-        // failure message + the leaf-level error if present.
+        // One-line failure summary. Sources, in order:
+        //   1. The last failing TEST outcome (set when a test ran
+        //      and failed — most informative when it exists).
+        //   2. The leaf-level fatal (harness error, dev-loop trail
+        //      tail when the loop never produced a body).
+        //   3. As a last resort, "test never ran (no body
+        //      produced)" — at least tells the user the model
+        //      didn't reach a tested state.
         let failureSummary: string | undefined;
         if (!result.ok) {
-          const fm = result.lastFailure?.failureMessage ?? "(no failure detail)";
-          failureSummary = fm.split("\n")[0]?.slice(0, 200) ?? fm.slice(0, 200);
+          const source =
+            result.lastFailure?.failureMessage ??
+            result.fatal ??
+            "(no failure detail — test never ran, no body produced)";
+          failureSummary =
+            source.split("\n")[0]?.slice(0, 200) ?? source.slice(0, 200);
         }
         input.onLeafProgress({
           phase: "done",
