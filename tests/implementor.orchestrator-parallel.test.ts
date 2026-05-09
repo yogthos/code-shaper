@@ -148,10 +148,13 @@ describe("buildImplementations — maxConcurrentLeaves", () => {
       const rpg = rpgWithLeaves([f1, f2, f3], ["cap:a", "cap:b", "cap:c"]);
 
       // Track concurrency: how many test-author / dev-loop chat
-      // calls are simultaneously in flight at peak.
+      // calls are simultaneously in flight at peak. SLOW_MS is
+      // generous enough that even under heavy CI load (where
+      // setTimeout fires get serialized by event-loop pressure)
+      // the overlap window is observable.
       let inflight = 0;
       let peakInflight = 0;
-      const SLOW_MS = 200;
+      const SLOW_MS = 500;
 
       const client: LLMClient = {
         async chat(messages, opts): Promise<LLMResponse> {

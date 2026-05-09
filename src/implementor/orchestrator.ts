@@ -125,6 +125,13 @@ export interface BuildInput {
   /** Optional progress callback for phase 5b. Same shape as
    *  onLeafProgress for phase 6. */
   onTestAuthorProgress?: (event: TestAuthorProgressEvent) => void;
+  /** Step Q4-D: per-leaf wall-clock cap. When implementLeaf
+   *  exceeds this many ms (a stuck leaf burning the dev-loop
+   *  budget × all its retries × the test runs), the orchestrator
+   *  records it as failed and moves on. Default unset = no cap.
+   *  Production drivers set this to bound a single bad leaf from
+   *  holding a worker for >15 minutes. */
+  maxLeafWallMs?: number;
   /** Enable env-fix on `environment` diagnostic verdicts. Forwarded
    *  to implementLeaf as `enableEnvFix`. Requires `outDir` (which
    *  the orchestrator passes through as `projectDir` to leaf). */
@@ -349,7 +356,7 @@ export async function buildImplementations(
         });
       }
 
-      const result = await implementLeaf(client, {
+      const leafCall = implementLeaf(client, {
         leaf,
         hostFile,
         rpg,
@@ -390,6 +397,31 @@ export async function buildImplementations(
             }
           : {}),
       });
+      // Step Q4-D: wall-clock cap. When set, race implementLeaf
+      // against a timeout and synthesize a failed result on
+      // expiry so a stuck leaf can't hold a worker indefinitely.
+      // The leaf's body+test (if anything was authored) lives on
+      // in bodyByLeafId/testsByLeafId — recovery may still pick
+      // up where we left off.
+      let result: LeafImplementResult;
+      if (input.maxLeafWallMs !== undefined && input.maxLeafWallMs > 0) {
+        const wallCap = input.maxLeafWallMs;
+        const timeoutPromise = new Promise<LeafImplementResult>((resolve) =>
+          setTimeout(() => {
+            resolve({
+              leafId: leaf.leafCapabilityId,
+              ok: false,
+              body: bodyByLeafId.get(leaf.leafCapabilityId) ?? "",
+              testSource: testsByLeafId.get(leaf.leafCapabilityId) ?? "",
+              attempts: 0,
+              fatal: `wall-clock cap (${wallCap}ms) exceeded — leaf abandoned, recovery may pick it up`,
+            });
+          }, wallCap),
+        );
+        result = await Promise.race([leafCall, timeoutPromise]);
+      } else {
+        result = await leafCall;
+      }
       leafResults.push(result);
 
       if (input.onLeafProgress) {

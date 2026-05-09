@@ -301,6 +301,14 @@ export async function implementLeaf(
   let priorBodyEmpty = false;
   let lastFailure: LeafTestOutcome | undefined;
   let lastFatal: string | undefined;
+  /** Step Q4-D: count consecutive dev-loop exhaustions. When the
+   *  dev loop runs to its iteration budget without calling
+   *  Terminate, more retries on the same leaf rarely help — each
+   *  retry burns ~15 LLM calls. Cap at 2 such exhaustions before
+   *  giving up so we don't burn 8 × 15 = 120 calls per stuck
+   *  leaf. */
+  let devLoopExhaustedCount = 0;
+  const MAX_DEV_LOOP_EXHAUSTIONS = 2;
 
   // Diagnosis + test-rewrite state. Per the RPG paper §5.3:
   //   - 5-round MV diagnosis attributes each failure
@@ -415,11 +423,26 @@ export async function implementLeaf(
           .join(" | ");
         lastFatal = `dev loop failed: ${r.error ?? "no body produced"}${tail ? ` [trail: ${tail}]` : ""}`;
         priorBodyEmpty = true;
+        // Step Q4-D: detect "exhausted without Terminate" — when
+        // the dev loop hit its iteration budget without the
+        // model committing, retries rarely help. Bail out early
+        // after MAX_DEV_LOOP_EXHAUSTIONS to avoid burning the
+        // full leaf retry budget on the same stuck state.
+        if (r.error && /exhausted/.test(r.error)) {
+          devLoopExhaustedCount++;
+          if (devLoopExhaustedCount >= MAX_DEV_LOOP_EXHAUSTIONS) {
+            lastFatal = `${lastFatal} [bailing after ${devLoopExhaustedCount} dev-loop exhaustions; further retries unlikely to help]`;
+            break;
+          }
+        }
         continue;
       }
       body = r.body;
       priorBodyEmpty = false;
       lastFatal = undefined;
+      // Reset the exhaustion counter on a successful dev-loop
+      // termination — different leaf state, different odds.
+      devLoopExhaustedCount = 0;
       // bodyByLeafId is already updated by the dev loop's edit
       // tools; nothing more to do here.
     } else if (input.useEditTools) {

@@ -320,6 +320,11 @@ async function main(): Promise<number> {
     // scheduled before its components" failure mode that wedged
     // the prior run.
     preAuthorTestsAndGateOnDeps: true,
+    // Q4-D: per-leaf wall-clock cap. Cap a single leaf at 8 min
+    // — well past a normal 60-90s leaf, but bounded so a
+    // pathological one (stuck dev loop, network stall) can't
+    // hold a worker for 19 min like in the prior run.
+    maxLeafWallMs: 8 * 60 * 1000,
     // Stage C: when the diagnostic says environment, the model can
     // call add_dependency / remove_dependency / set_script /
     // npm_run via a structured tool call. The harness applies the
