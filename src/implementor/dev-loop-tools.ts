@@ -446,9 +446,16 @@ export async function editFileTool(input: EditFileInput): Promise<EditFileResult
         : `resulting source no longer has a function named ${JSON.stringify(leaf.name)} that the body extractor can find. Don't rename or remove the function when editing — only modify its body.`,
     };
   }
-  // Commit: write the extracted body back into bodyByLeafId so the
-  // next render + test run sees the model's edit.
+  // Commit: write the extracted body back into bodyByLeafId so
+  // the next render + test run sees the model's edit. Step U2:
+  // ALSO snapshot the FULL post-edit source on the FileNode
+  // overlay. The renderer returns that verbatim on subsequent
+  // calls, preserving non-leaf edits (class declarations whose
+  // constructors weren't planned as leaves, top-level
+  // constants, etc.) that the regenerate path would otherwise
+  // wipe.
   input.bodyByLeafId.set(input.activeLeafId, extractedBody);
+  file.userEditedSource = newContent;
   return { ok: true, newContent, extractedBody };
 }
 

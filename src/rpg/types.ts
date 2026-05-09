@@ -95,6 +95,18 @@ export interface FileNode extends BaseNode {
    *  traceability + tests). Undefined when the file pre-existed on
    *  disk or hasn't been planned yet. */
   interfacePlan?: InterfacePlan;
+  /** Step U2: when the dev loop edits a file, the FULL post-edit
+   *  source is stored here. The renderer returns it verbatim
+   *  instead of regenerating from interfacePlan + bodyByLeafId.
+   *  This persists model edits to NON-leaf scopes (class
+   *  declarations without method leaves, top-level constants,
+   *  etc.) which the regenerate model would otherwise wipe on
+   *  the next render.
+   *
+   *  Cleared by the orchestrator only at scaffold time (when
+   *  spawning a fresh project). Subsequent edits append; final
+   *  materialize writes this verbatim. */
+  userEditedSource?: string;
 }
 
 /** Per-file plan for the interfaces the implementor must produce.

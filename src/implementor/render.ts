@@ -46,6 +46,14 @@ export interface RenderInput {
 
 export function renderTypeScriptFile(input: RenderInput): string {
   const { file } = input;
+  // Step U2: if the dev loop has edited this file, return the
+  // overlay verbatim instead of regenerating from
+  // interfacePlan + bodyByLeafId. Without this, edits to non-
+  // leaf scopes (e.g. class declarations whose constructor
+  // wasn't planned as a leaf) get wiped on every render.
+  if (file.userEditedSource !== undefined) {
+    return file.userEditedSource;
+  }
   const plan = file.interfacePlan ?? { entries: [], classes: [] };
   const importLines = renderImports(file, plan);
   const blocks: string[] = [];

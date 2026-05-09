@@ -854,6 +854,12 @@ function applySurgicalEdit(
     };
   }
   input.bodyByLeafId.set(input.leaf.leafCapabilityId, body);
+  // Step U2: snapshot the full post-edit source on the
+  // FileNode overlay. Without this, non-leaf edits made via
+  // §D.2 surgical tools (e.g. edit_whole_class_in_file on a
+  // class without method leaves) would be wiped by the next
+  // render.
+  input.hostFile.userEditedSource = result.source!;
   // Mirror imports — the §D.2 edit_imports_and_assignments_in_file
   // path most obviously needs this; the function/class/method
   // edits leave imports unchanged but syncing is idempotent and

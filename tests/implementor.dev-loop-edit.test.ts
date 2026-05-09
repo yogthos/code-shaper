@@ -269,6 +269,76 @@ describe("editFileTool — rejections", () => {
     expect(r.error).toMatch(/leaf|extract|named/i);
   });
 
+  // Step U2: edits to NON-leaf scopes must persist across
+  // re-renders. Previously the renderer regenerated from
+  // interfacePlan + bodyByLeafId, wiping any edit to a class
+  // declaration whose constructor wasn't a leaf. The overlay
+  // makes the post-edit source authoritative.
+  it("an edit to a non-leaf class persists across re-render (U2)", async () => {
+    // File has TWO things: leaf `add` (function) AND a non-leaf
+    // class `Helper`. Model edits Helper to add a constructor +
+    // field. The next render must include those.
+    const f = mkFile({
+      id: "file:add",
+      path: "src/add.ts",
+      interfacePlan: {
+        entries: [
+          {
+            leafCapabilityId: "cap:add",
+            kind: "function",
+            name: "add",
+            ownerClassName: null,
+            description: "",
+            signature: {
+              params: [
+                { name: "a", type: "number" },
+                { name: "b", type: "number" },
+              ],
+              returnType: "number",
+              isAsync: false,
+            },
+            exported: true,
+            isStatic: false,
+          },
+        ],
+        // Helper class declared but with NO planned methods —
+        // the renderer would emit `class Helper {}`.
+        classes: [
+          {
+            name: "Helper",
+            description: "",
+            extendsName: null,
+            extendsFromFile: null,
+            exported: true,
+          },
+        ],
+      },
+    });
+    const rpg = rpgWithFiles([f]);
+    // Step 1: the model edits add's body. Setting userEditedSource
+    // captures the full source at that point.
+    const r = await editFileTool({
+      rpg,
+      bodyByLeafId: new Map(),
+      testsByLeafId: new Map(),
+      activeFilePath: "src/add.ts",
+      activeLeafId: "cap:add",
+      path: "src/add.ts",
+      old_str: 'throw new Error("add: not implemented");',
+      new_str: "return a + b;",
+    });
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    // Re-render: the overlay must be returned verbatim.
+    const rendered2 = await import("../src/implementor/render.js").then(
+      (m) =>
+        m.renderTypeScriptFile({ file: f, bodyByLeafId: new Map(), rpg }),
+    );
+    expect(rendered2).toContain("return a + b");
+    // The overlay was set.
+    expect(f.userEditedSource).toBeDefined();
+    expect(f.userEditedSource).toContain("return a + b");
+  });
+
   it("rejects unknown path with a helpful message", async () => {
     const f = mkFile({
       id: "file:add",
