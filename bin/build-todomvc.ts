@@ -309,6 +309,11 @@ async function main(): Promise<number> {
     // that wedged previous runs.
     useDevLoop: true,
     devLoopMaxIterations: 15,
+    // Parallel worker pool. 3 keeps GLM rate limits comfortable
+    // while still cutting wall-clock time roughly in half on
+    // file-independent leaves. Bump on local models or higher
+    // rate-limit tiers.
+    maxConcurrentLeaves: 3,
     // Stage C: when the diagnostic says environment, the model can
     // call add_dependency / remove_dependency / set_script /
     // npm_run via a structured tool call. The harness applies the

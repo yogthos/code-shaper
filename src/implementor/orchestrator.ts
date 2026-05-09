@@ -93,6 +93,13 @@ export interface BuildInput {
   useDevLoop?: boolean;
   /** Per-dev-loop iteration budget. Forwarded to implementLeaf. */
   devLoopMaxIterations?: number;
+  /** Maximum number of leaves to implement concurrently. Default 1
+   *  (sequential, current behavior). Higher values run multiple
+   *  dev-loop sessions in parallel, with file-level locking to
+   *  ensure no two workers edit the same host file simultaneously.
+   *  GLM and other rate-limited providers should keep this small
+   *  (2-4); local models can go higher. */
+  maxConcurrentLeaves?: number;
   /** Enable env-fix on `environment` diagnostic verdicts. Forwarded
    *  to implementLeaf as `enableEnvFix`. Requires `outDir` (which
    *  the orchestrator passes through as `projectDir` to leaf). */
@@ -213,8 +220,51 @@ export async function buildImplementations(
     const initialLeafIds = leaves.map((l) => l.leaf.leafCapabilityId);
     const seenLeafIds = new Set<string>();
 
-    while (queue.length > 0) {
-      const entry = queue.shift()!;
+    // Step Q3 — worker pool with file-level locks. Default
+    // maxConcurrent=1 reproduces the prior sequential behavior
+    // exactly; higher values dispatch leaves whose host files
+    // aren't already locked by another worker.
+    //
+    // File-level locks (not leaf-level) because the dev loop's
+    // edits all target the active leaf's hostFile (renderer +
+    // §D.2 + edit_file are all scoped). Two workers on different
+    // files don't conflict on bodyByLeafId (per-leaf keys), on
+    // hostFile.rawImports (each agent owns its own file), or on
+    // materialize (we serialize that separately). Two workers on
+    // the SAME file would race on rendering + body extraction —
+    // hence the lock.
+    const maxConcurrent = Math.max(1, input.maxConcurrentLeaves ?? 1);
+    const lockedFiles = new Set<string>();
+    let materializing = false;
+
+    /** Pick the next queue entry whose host file isn't locked by
+     *  another worker. Returns null when the queue is empty OR
+     *  every remaining entry is locked. */
+    function pickNextEntry(): QueueEntry | null {
+      for (let i = 0; i < queue.length; i++) {
+        const e = queue[i]!;
+        if (!lockedFiles.has(e.hostFile.path)) {
+          queue.splice(i, 1);
+          return e;
+        }
+      }
+      return null;
+    }
+
+    /** Serialize materializeRPG calls across workers. Two
+     *  concurrent writes to the same outDir would race; the
+     *  renderer also wants to read hostFile.content stably. */
+    async function materializeWithLock(): Promise<void> {
+      while (materializing) await new Promise((r) => setTimeout(r, 10));
+      materializing = true;
+      try {
+        await materializeRPG(rpg, input.outDir!);
+      } finally {
+        materializing = false;
+      }
+    }
+
+    async function processOneEntry(entry: QueueEntry): Promise<void> {
       const { leaf, hostFile, approachHint } = entry;
 
       if (input.onLeafProgress) {
@@ -332,10 +382,10 @@ export async function buildImplementations(
           bodyByLeafId,
           rpg,
         });
-        await materializeRPG(rpg, input.outDir);
+        await materializeWithLock();
       }
 
-      if (result.ok) continue;
+      if (result.ok) return;
 
       // Failed leaf — try to recover via decomposition or fresh
       // approach. Hard-fail when the recovery itself fails.
@@ -355,16 +405,17 @@ export async function buildImplementations(
       if (!recovery.ok || !recovery.decision) {
         // Architect couldn't produce a decision — leave the build
         // marked failed; the surrounding pipeline reports it.
-        continue;
+        return;
       }
+      const decision = recovery.decision;
       decomposeDecisions.push({
         originLeafId: leaf.leafCapabilityId,
-        decision: recovery.decision,
+        decision,
       });
-      if (recovery.decision.kind === "depth_exhausted") {
-        continue;
+      if (decision.kind === "depth_exhausted") {
+        return;
       }
-      if (recovery.decision.kind === "fresh_approach") {
+      if (decision.kind === "fresh_approach") {
         // Discard ONLY the prior body. The test source IS the
         // contract — fresh_approach is about the implementation
         // strategy, not the contract; re-authoring the test would
@@ -382,14 +433,14 @@ export async function buildImplementations(
         queue.unshift({
           leaf,
           hostFile,
-          approachHint: recovery.decision.approachHint,
+          approachHint: decision.approachHint,
         });
-        continue;
+        return;
       }
       // decompose: enqueue the new sub-leaves first (so they
       // implement before the assembly), then re-queue the original.
       const subLeaves: QueueEntry[] = [];
-      for (const id of recovery.decision.newCapabilityIds) {
+      for (const id of decision.newCapabilityIds) {
         const newLeafEntry = hostFile.interfacePlan?.entries.find(
           (e) => e.leafCapabilityId === id,
         );
@@ -412,6 +463,40 @@ export async function buildImplementations(
       queue.unshift({ leaf, hostFile });
       queue.unshift(...subLeaves);
     }
+
+    // Worker driver. Spawns up to `maxConcurrent` workers that
+    // pull from the shared queue, respecting file-level locks.
+    // Each worker self-loops until the queue is empty AND no
+    // other worker is in-flight (whose completion might add new
+    // entries via decompose recovery).
+    async function worker(): Promise<void> {
+      while (true) {
+        const entry = pickNextEntry();
+        if (entry) {
+          lockedFiles.add(entry.hostFile.path);
+          try {
+            await processOneEntry(entry);
+          } finally {
+            lockedFiles.delete(entry.hostFile.path);
+          }
+          continue;
+        }
+        // No entry available. Either:
+        //   (a) queue is empty AND no other worker is running →
+        //       we're done.
+        //   (b) queue is non-empty but every remaining entry is
+        //       locked → another worker will release a lock
+        //       eventually; poll briefly.
+        //   (c) queue is empty but other workers are running →
+        //       they may push decompose sub-leaves; poll briefly.
+        if (queue.length === 0 && lockedFiles.size === 0) return;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: maxConcurrent }, () => worker()),
+    );
 
     // Final pass: render each file's content into the in-memory RPG so
     // `materializeRPG` writes the same source the harness saw. Dedup
