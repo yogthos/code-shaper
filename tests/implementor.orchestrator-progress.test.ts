@@ -99,6 +99,117 @@ afterEach(async () => {
   if (outDir) await rm(outDir, { recursive: true, force: true });
 });
 
+// Audit fix (HIGH): outDir must propagate as projectDir to
+// implementLeaf even when enableEnvFix is off. Otherwise the dev
+// loop's typecheck / read_file disk fallback / edit_file infra
+// branch / npm tools all silently no-op because input.outDir is
+// undefined inside runLeafDevLoop.
+describe("buildImplementations — outDir propagation", () => {
+  it("forwards outDir as projectDir to implementLeaf even when enableEnvFix is off", async () => {
+    const fs = await import("node:fs/promises");
+    const path = (await import("node:path")).default;
+    const { tmpdir } = await import("node:os");
+    const outDir = await fs.mkdtemp(path.join(tmpdir(), "outdir-prop-"));
+    try {
+      // Pre-seed package.json + tsconfig so the dev loop's
+      // outDir-dependent tools have something to work with.
+      await fs.writeFile(
+        path.join(outDir, "package.json"),
+        JSON.stringify(
+          {
+            name: "p",
+            version: "0.1.0",
+            type: "module",
+            scripts: { test: "vitest run" },
+            dependencies: {},
+            devDependencies: { vitest: "^2.0.0" },
+          },
+          null,
+          2,
+        ),
+      );
+      const { rpg } = rpgWithOneLeaf();
+
+      // Mock that emits a single typecheck call then Terminate.
+      // Without the fix, typecheck would receive outDir undefined
+      // and report "skipped (no outDir)".
+      let typecheckSummary = "";
+      const client: LLMClient = {
+        async chat(messages, opts): Promise<LLMResponse> {
+          const sys = messages[0]!.content;
+          if (
+            sys.includes("producing a vitest test file") &&
+            !opts?.tools
+          ) {
+            return {
+              content: `import { describe, it, expect } from "vitest";\nimport { add } from "../../src/add.js";\ndescribe("add", () => { it("ok", () => { expect(add(2,3)).toBe(5); }); });\n`,
+              finishReason: "stop",
+            };
+          }
+          if (sys.includes("Implementor agent") && opts?.tools) {
+            const toolMsgs = messages.filter((m) => m.role === "tool");
+            if (toolMsgs.length === 0) {
+              return {
+                content: "",
+                finishReason: "tool_calls",
+                toolCalls: [
+                  {
+                    id: "tc1",
+                    type: "function",
+                    function: { name: "typecheck", arguments: "{}" },
+                  },
+                ],
+              };
+            }
+            // Capture the typecheck result the model received.
+            const lastTool = toolMsgs[toolMsgs.length - 1]!;
+            typecheckSummary = lastTool.content;
+            return {
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: "tc2",
+                  type: "function",
+                  function: {
+                    name: "edit_file",
+                    arguments: JSON.stringify({
+                      path: "src/add.ts",
+                      old_str: 'throw new Error("add: not implemented");',
+                      new_str: "return a + b;",
+                    }),
+                  },
+                },
+              ],
+            };
+          }
+          return { content: "", finishReason: "stop" };
+        },
+        async listModels() {
+          return ["mock"];
+        },
+      };
+      const result = await buildImplementations(client, rpg, {
+        useDevLoop: true,
+        devLoopMaxIterations: 5,
+        maxAttemptsPerLeaf: 1,
+        outDir,
+        // enableEnvFix INTENTIONALLY OFF — pre-fix this would
+        // disable typecheck visibility for the dev loop.
+        enableEnvFix: false,
+      });
+      void result;
+      // The typecheck tool result must NOT say "outDir not
+      // configured" — that would mean projectDir didn't reach
+      // the dev loop. With the fix, ran:true (or at minimum
+      // ran was attempted with outDir set).
+      expect(typecheckSummary).not.toMatch(/outDir not configured/);
+    } finally {
+      await fs.rm(outDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("buildImplementations — onLeafProgress failureSummary", () => {
   it(
     "surfaces the dev-loop trail tail when the loop never produced a body (Q2)",

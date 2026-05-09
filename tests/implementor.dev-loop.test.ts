@@ -842,4 +842,54 @@ describe("runLeafDevLoop — rewrite_test (S5)", () => {
       expect(rewrite!.error).toMatch(/parse/i);
     },
   );
+
+  // Audit fix: stripExt must only strip when the dot is in the
+  // basename. Previously a path like "src/.config/host.ts" would
+  // be wrongly truncated at the directory dot.
+  it("smoke test imports preserve dirnames containing dots", async () => {
+    const f = mkFile({
+      id: "file:weird",
+      path: "src/.config/host.ts",
+      interfacePlan: {
+        entries: [
+          {
+            leafCapabilityId: "cap:fn",
+            kind: "function",
+            name: "fn",
+            ownerClassName: null,
+            description: "",
+            signature: { params: [], returnType: "void", isAsync: false },
+            exported: true,
+            isStatic: false,
+          },
+        ],
+        classes: [],
+      },
+    });
+    const rpg = rpgWithFiles([f]);
+    const tests = new Map([
+      [
+        "cap:fn",
+        `import { describe, it, expect } from "vitest";\nimport { fn } from "../../src/.config/host.js";\ndescribe("fn", () => { it("ok", () => { expect(fn()).toBeUndefined(); }); });\n`,
+      ],
+    ]);
+    const { client } = scriptedClient([
+      {
+        name: "skip_with_smoke_test",
+        args: { reason: "test environment unavailable" },
+      },
+      { name: "Terminate", args: {} },
+    ]);
+    await runLeafDevLoop(client, {
+      leaf: f.interfacePlan!.entries[0]!,
+      hostFile: f,
+      rpg,
+      bodyByLeafId: new Map([["cap:fn", "return;"]]),
+      testsByLeafId: tests,
+      workDir,
+    });
+    const generated = tests.get("cap:fn")!;
+    expect(generated).toContain('"../../src/.config/host.js"');
+    expect(generated).not.toMatch(/from\s+"\.\.\/\.\.\/src\/host\./);
+  });
 });

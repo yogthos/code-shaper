@@ -416,10 +416,19 @@ export async function buildImplementations(
         ...(input.useEditTools !== undefined
           ? { useEditTools: input.useEditTools }
           : {}),
+        // Forward outDir as projectDir UNCONDITIONALLY when set.
+        // The dev loop's typecheck / read_file disk fallback /
+        // edit_file infra branch / npm tools all need it,
+        // independent of whether env-fix is enabled. Previously
+        // these tools silently no-op'd when enableEnvFix was
+        // off because projectDir was gated on the enableEnvFix
+        // conditional.
+        ...(input.outDir !== undefined
+          ? { projectDir: input.outDir }
+          : {}),
         ...(input.enableEnvFix && input.outDir
           ? {
               enableEnvFix: true,
-              projectDir: input.outDir,
               ...(input.maxEnvPatches !== undefined
                 ? { maxEnvPatches: input.maxEnvPatches }
                 : {}),

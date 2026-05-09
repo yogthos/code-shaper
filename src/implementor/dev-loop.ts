@@ -943,10 +943,15 @@ function buildSmokeTest(
   return lines.join("\n") + "\n";
 }
 
+/** Strip the file extension from a POSIX-style path. The dot
+ *  must be in the BASENAME (after the last "/") — otherwise a
+ *  path like ".gitkeep/host" or "foo.bar/baz" would be wrongly
+ *  truncated at the directory dot. */
 function stripExt(p: string): string {
-  const idx = p.lastIndexOf(".");
-  if (idx < 0) return p;
-  return p.slice(0, idx);
+  const slash = p.lastIndexOf("/");
+  const dot = p.lastIndexOf(".");
+  if (dot < 0 || dot < slash) return p;
+  return p.slice(0, dot);
 }
 
 function syncImportsFromSource(input: DevLoopInput, newSource: string): void {
