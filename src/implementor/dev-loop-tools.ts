@@ -37,7 +37,8 @@ import {
   extractMethodBody,
 } from "./edit-tools.js";
 import { runTests, leafToTestFilename } from "./test-harness.js";
-import { isInfraPath, withInfraLock } from "../architect/infra-mutex.js";
+import { isInfraPath } from "../architect/infra-mutex.js";
+import { withFileLock } from "../architect/file-lock.js";
 
 // ── listFilesTool ────────────────────────────────────────────────────
 
@@ -471,8 +472,11 @@ async function editInfraFile(input: EditFileInput): Promise<EditFileResult> {
       error: "old_str and new_str are identical — edit would be a no-op. They must differ.",
     };
   }
-  return await withInfraLock(async () => {
-    const fullPath = nodePath.join(input.outDir!, input.path);
+  // U1: per-file lock keyed by repo-relative path. Concurrent
+  // workers editing different files are unblocked; same-file
+  // edits serialize.
+  const fullPath = nodePath.join(input.outDir!, input.path);
+  return await withFileLock(fullPath, async () => {
     let currentSource: string;
     try {
       currentSource = nodeFs.readFileSync(fullPath, "utf-8");

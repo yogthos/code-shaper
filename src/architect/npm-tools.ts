@@ -554,14 +554,18 @@ function tailTruncate(s: string, max: number): string {
   return "...[truncated head]\n" + s.slice(s.length - max);
 }
 
-// ── S3: serialize all package.json mutations through the infra
-//   mutex. Multiple workers running add_dependency / set_script
-//   concurrently would lose updates (load → modify → write
-//   pattern, with the second write clobbering the first).
-//   npmRun also serializes — it loads package.json to check the
-//   script list, and a concurrent set_script would race.
+// ── U1: serialize all package.json mutations through a
+//   per-file lock keyed by the package.json path. Workers
+//   editing DIFFERENT files (e.g. package.json vs vitest.config.ts)
+//   no longer block each other; concurrent same-file edits
+//   serialize so the load-modify-write pattern doesn't lose
+//   updates.
 
-import { withInfraLock } from "./infra-mutex.js";
+import { withFileLock } from "./file-lock.js";
+
+function pkgJsonLockKey(input: NpmOpInput): string {
+  return path.join(input.outDir, "package.json");
+}
 
 export async function addDependency(
   input: NpmOpInput & {
@@ -570,23 +574,25 @@ export async function addDependency(
     which: "runtime" | "dev";
   },
 ): Promise<NpmOpResult> {
-  return withInfraLock(() => addDependencyUnsafe(input));
+  return withFileLock(pkgJsonLockKey(input), () => addDependencyUnsafe(input));
 }
 
 export async function removeDependency(
   input: NpmOpInput & { name: string },
 ): Promise<NpmOpResult> {
-  return withInfraLock(() => removeDependencyUnsafe(input));
+  return withFileLock(pkgJsonLockKey(input), () =>
+    removeDependencyUnsafe(input),
+  );
 }
 
 export async function setScript(
   input: NpmOpInput & { name: string; command: string },
 ): Promise<NpmOpResult> {
-  return withInfraLock(() => setScriptUnsafe(input));
+  return withFileLock(pkgJsonLockKey(input), () => setScriptUnsafe(input));
 }
 
 export async function npmRun(
   input: NpmOpInput & { script: string; timeoutMs?: number },
 ): Promise<NpmOpResult & { exitCode: number | null }> {
-  return withInfraLock(() => npmRunUnsafe(input));
+  return withFileLock(pkgJsonLockKey(input), () => npmRunUnsafe(input));
 }
