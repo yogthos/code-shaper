@@ -132,6 +132,17 @@ export interface BuildInput {
    *  Production drivers set this to bound a single bad leaf from
    *  holding a worker for >15 minutes. */
   maxLeafWallMs?: number;
+  /** Pre-populate the test map. Useful for resumption (already-
+   *  authored tests survive across runs) and for unit tests that
+   *  inject specific test sources. Pre-existing entries are
+   *  preserved — phase 5b's authorAllLeafTests skips leaves
+   *  whose tests are already set. */
+  initialTestsByLeafId?: Map<string, string>;
+  /** Pre-populate the body map. Same pattern as
+   *  `initialTestsByLeafId` — a leaf with a body already set
+   *  gets re-rendered through the renderer, but the body
+   *  author / dev loop won't re-implement it. */
+  initialBodyByLeafId?: Map<string, string>;
   /** Enable env-fix on `environment` diagnostic verdicts. Forwarded
    *  to implementLeaf as `enableEnvFix`. Requires `outDir` (which
    *  the orchestrator passes through as `projectDir` to leaf). */
@@ -202,8 +213,8 @@ export async function buildImplementations(
     resolveNodeModulesSource(input.outDir, input.hostRepo),
   );
 
-  const bodyByLeafId = new Map<string, string>();
-  const testsByLeafId = new Map<string, string>();
+  const bodyByLeafId = new Map<string, string>(input.initialBodyByLeafId ?? []);
+  const testsByLeafId = new Map<string, string>(input.initialTestsByLeafId ?? []);
   // Snapshot of the original test source for each leaf, populated
   // by `implementLeaf` the first time the diagnostic rewrites a
   // brittle test. Used by the recovery paths below to restore the
@@ -487,6 +498,65 @@ export async function buildImplementations(
         // dep-satisfied check passes and they become dispatchable
         // by the scheduler.
         landedLeaves.add(leaf.leafCapabilityId);
+        return;
+      }
+
+      // Step Q4-E: integration rework via blame. Before running
+      // the architect's decompose path (which is an LLM call),
+      // check if the failure message references a symbol from
+      // one of this leaf's dependencies. If yes: fresh_approach
+      // the DEP instead of the failing leaf, re-queue both, and
+      // skip the architect call entirely.
+      const blameRounds =
+        decomposeRoundsByLeaf.get(leaf.leafCapabilityId) ?? 0;
+      const blame =
+        blameRounds < MAX_BLAME_ROUNDS
+          ? tryBlameDep(leaf, result, depGraph, rpg)
+          : null;
+      if (blame) {
+        decomposeRoundsByLeaf.set(
+          leaf.leafCapabilityId,
+          blameRounds + 1,
+        );
+        decomposeDecisions.push({
+          originLeafId: leaf.leafCapabilityId,
+          decision: {
+            kind: "fresh_approach",
+            reason: `dep-blame: failing leaf's failure message references ${JSON.stringify(blame.symbolName)} which is owned by leaf ${blame.culpritLeafId}; rework that dep instead`,
+            approachHint: `Your previous body produced this failure for the integration leaf ${JSON.stringify(leaf.name)} that depends on you: ${result.lastFailure?.failureMessage ?? result.fatal ?? "(no detail)"}\n\nFocus on getting your body's behavior to match the integration test's expectations.`,
+          },
+        });
+        // Drop the dep's prior body so it gets re-implemented;
+        // also remove from landedLeaves so the failing leaf's
+        // dep-gating blocks until the dep re-lands.
+        bodyByLeafId.delete(blame.culpritLeafId);
+        landedLeaves.delete(blame.culpritLeafId);
+        restoreOriginalTest(
+          blame.culpritLeafId,
+          testsByLeafId,
+          originalTestsByLeafId,
+        );
+        // Re-queue the dep with a fresh_approach hint pointing
+        // at the integration failure. The failing leaf goes
+        // BACK on the queue too — dep-gating will hold it until
+        // the dep lands.
+        const depCap = rpg.nodes[blame.culpritLeafId];
+        if (depCap && isCapability(depCap) && depCap.mappedToId) {
+          const depHostFile = rpg.nodes[depCap.mappedToId];
+          if (depHostFile && isFile(depHostFile)) {
+            const depEntry = depHostFile.interfacePlan?.entries.find(
+              (e) => e.leafCapabilityId === blame.culpritLeafId,
+            );
+            if (depEntry) {
+              queue.unshift({
+                leaf: depEntry,
+                hostFile: depHostFile,
+                approachHint: `An integration leaf (${JSON.stringify(leaf.name)}) is failing against your body. The integration test reports:\n${result.lastFailure?.failureMessage?.slice(0, 500) ?? result.fatal?.slice(0, 500) ?? "(no detail)"}\n\nReconsider your implementation; the prior body didn't satisfy the integration's contract.`,
+              });
+            }
+          }
+        }
+        queue.push({ leaf, hostFile });
         return;
       }
 
@@ -901,3 +971,75 @@ function collectOrderedLeaves(rpg: RPG): OrderedLeaf[] {
   }
   return out;
 }
+
+/** Step Q4-E — dep blame.
+ *
+ *  When an integration-style leaf fails and its failure message
+ *  contains a symbol name owned by one of its declared
+ *  dependencies, that dep is the likely culprit — its
+ *  implementation doesn't satisfy the integration's contract.
+ *  Returns the culprit leaf id + symbol name, or null when no
+ *  symbolic match can be made (the architect's decompose path
+ *  takes over for those).
+ *
+ *  Heuristic: scan each dep's symbol name against the failure
+ *  text. First match wins. Class-symbol matches (e.g.
+ *  "TodoError" appearing as `expected error TodoError but got
+ *  ...`) are common and unambiguous.
+ */
+function tryBlameDep(
+  failingLeaf: PlannedInterface,
+  result: LeafImplementResult,
+  depGraph: LeafDependencyGraph | undefined,
+  rpg: RPG,
+): { culpritLeafId: string; symbolName: string } | null {
+  if (!depGraph) return null;
+  const deps = depGraph.get(failingLeaf.leafCapabilityId);
+  if (!deps || deps.size === 0) return null;
+  const failureText =
+    result.lastFailure?.failureMessage ?? result.fatal ?? "";
+  if (failureText.length === 0) return null;
+  for (const depLeafId of deps) {
+    const depCap = rpg.nodes[depLeafId];
+    if (!depCap || !isCapability(depCap)) continue;
+    const hostFileId = depCap.mappedToId;
+    if (!hostFileId) continue;
+    const hostFile = rpg.nodes[hostFileId];
+    if (!hostFile || !isFile(hostFile)) continue;
+    const entry = hostFile.interfacePlan?.entries.find(
+      (e) => e.leafCapabilityId === depLeafId,
+    );
+    if (!entry) continue;
+    // Word-boundary match — avoid false positives where a short
+    // symbol name appears as a substring (e.g. "id" inside
+    // "valid"). The symbol must appear as a whole identifier in
+    // the failure text.
+    const re = new RegExp(`\\b${escapeRe(entry.name)}\\b`);
+    if (re.test(failureText)) {
+      return { culpritLeafId: depLeafId, symbolName: entry.name };
+    }
+    // Also try the owning class name for method leaves —
+    // failures often surface "TodoError" rather than the
+    // constructor's parameter list.
+    if (entry.kind === "method" && entry.ownerClassName) {
+      const reClass = new RegExp(`\\b${escapeRe(entry.ownerClassName)}\\b`);
+      if (reClass.test(failureText)) {
+        return {
+          culpritLeafId: depLeafId,
+          symbolName: entry.ownerClassName,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Cap on dep-blame rounds per leaf. Counts against the same
+ *  budget as architect-recovery rounds — when blame keeps
+ *  pointing at the same dep without resolving, we eventually
+ *  fall through to runDecomposeRecovery instead of looping. */
+const MAX_BLAME_ROUNDS = 2;
