@@ -633,3 +633,128 @@ describe("runLeafDevLoop — npm tools", () => {
     },
   );
 });
+
+// Step S5: rewrite_test gives the model agency over the test
+// contract when the existing one is unwinnable. Bounded by a
+// budget so the model can't trivially game its way to passing.
+describe("runLeafDevLoop — rewrite_test (S5)", () => {
+  it(
+    "replaces the leaf's test source via rewrite_test",
+    { timeout: 60_000 },
+    async () => {
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const tests = new Map([
+        [
+          "cap:add",
+          `import { describe, it, expect } from "vitest";\nimport { add } from "../../src/add.js";\ndescribe("add", () => { it("strict", () => { expect(add(2,3)).toBe(5); }); });\n`,
+        ],
+      ]);
+      const NEW_TEST = `import { describe, it, expect } from "vitest";\nimport { add } from "../../src/add.js";\ndescribe("add (smoke)", () => { it("exists", () => { expect(typeof add).toBe("function"); }); });\n`;
+      const { client } = scriptedClient([
+        // Edit body so it produces SOMETHING; the rewrite_test
+        // shifts the test to a smoke check.
+        {
+          name: "edit_file",
+          args: {
+            path: "src/add.ts",
+            old_str: 'throw new Error("add: not implemented");',
+            new_str: "return 0;",
+          },
+        },
+        { name: "rewrite_test", args: { new_source: NEW_TEST } },
+        { name: "Terminate", args: {} },
+      ]);
+      const r = await runLeafDevLoop(client, {
+        leaf: f.interfacePlan!.entries[0]!,
+        hostFile: f,
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: tests,
+        workDir,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      // The map now holds the rewritten test.
+      expect(tests.get("cap:add")).toContain('describe("add (smoke)"');
+      // Trail records the rewrite.
+      const rewrite = r.trail.find((t) => t.tool === "rewrite_test");
+      expect(rewrite).toBeDefined();
+      expect(rewrite!.ok).toBe(true);
+    },
+  );
+
+  it(
+    "rejects rewrite_test once the budget is exhausted",
+    async () => {
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const tests = new Map([
+        ["cap:add", `import { describe, it } from "vitest";\ndescribe("x", () => { it("ok", () => {}); });\n`],
+      ]);
+      const ANY_TEST = `import { describe, it } from "vitest";\ndescribe("y", () => { it("ok", () => {}); });\n`;
+      const { client } = scriptedClient([
+        { name: "rewrite_test", args: { new_source: ANY_TEST } },
+        { name: "rewrite_test", args: { new_source: ANY_TEST } },
+        { name: "rewrite_test", args: { new_source: ANY_TEST } },
+        // Budget = 3 (default). Fourth must fail.
+        { name: "rewrite_test", args: { new_source: ANY_TEST } },
+        { name: "Terminate", args: {} },
+      ]);
+      const r = await runLeafDevLoop(client, {
+        leaf: f.interfacePlan!.entries[0]!,
+        hostFile: f,
+        rpg,
+        bodyByLeafId: new Map([["cap:add", "return 0;"]]),
+        testsByLeafId: tests,
+        workDir,
+      });
+      const rewrites = r.trail.filter((t) => t.tool === "rewrite_test");
+      expect(rewrites).toHaveLength(4);
+      const last = rewrites[3]!;
+      expect(last.ok).toBe(false);
+      expect(last.error).toMatch(/budget exhausted/);
+    },
+  );
+
+  it(
+    "rejects rewrite_test when new_source doesn't parse as TypeScript",
+    async () => {
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const tests = new Map([
+        ["cap:add", `import { describe, it } from "vitest";\ndescribe("x", () => { it("ok", () => {}); });\n`],
+      ]);
+      const { client } = scriptedClient([
+        {
+          name: "rewrite_test",
+          args: { new_source: "this is not typescript {{{ broken" },
+        },
+        { name: "Terminate", args: {} },
+      ]);
+      const r = await runLeafDevLoop(client, {
+        leaf: f.interfacePlan!.entries[0]!,
+        hostFile: f,
+        rpg,
+        bodyByLeafId: new Map([["cap:add", "return 0;"]]),
+        testsByLeafId: tests,
+        workDir,
+      });
+      const rewrite = r.trail.find((t) => t.tool === "rewrite_test");
+      expect(rewrite).toBeDefined();
+      expect(rewrite!.ok).toBe(false);
+      expect(rewrite!.error).toMatch(/parse/i);
+    },
+  );
+});

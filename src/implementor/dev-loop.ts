@@ -33,6 +33,7 @@ import {
   extractFunctionBody,
   extractMethodBody,
   extractTopLevelImports,
+  checkTypescriptSyntax,
   type EditResult,
 } from "./edit-tools.js";
 import {
@@ -80,6 +81,13 @@ export interface DevLoopInput {
    *  it. */
   failureMessage?: string;
   maxIterations?: number;
+  /** Step S5: per-loop budget for rewrite_test calls. The
+   *  test contract is mutable but bounded — without a cap, the
+   *  model could trivially game its way to "passing" by
+   *  rewriting the test until it matches its (broken) body.
+   *  Default 3. The body still has to satisfy whatever rewrite
+   *  the model authors. */
+  maxRewriteTests?: number;
   /** Wall-clock cap forwarded to runTestTool. */
   testTimeoutMs?: number;
   temperature?: number;
@@ -134,6 +142,10 @@ export async function runLeafDevLoop(
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
   };
   const trail: DevLoopTrailEntry[] = [];
+  // Step S5: rewrite_test budget. Tracks count locally; the
+  // applyTool dispatch enforces the cap.
+  const maxRewriteTests = input.maxRewriteTests ?? 3;
+  const rewriteTestCounter = { count: 0, max: maxRewriteTests };
 
   for (let i = 0; i < maxIterations; i++) {
     let response: LLMResponse;
@@ -271,7 +283,7 @@ export async function runLeafDevLoop(
     // Apply the tool. Each branch returns { result: object, ok:
     // bool, summary?: string }, then we both push the result back
     // to the model and record on the trail.
-    const applied = await applyTool(toolName, args, input);
+    const applied = await applyTool(toolName, args, input, rewriteTestCounter);
     trail.push({
       iteration: i + 1,
       tool: toolName,
@@ -313,10 +325,16 @@ interface AppliedTool {
   summary?: string;
 }
 
+interface RewriteTestCounter {
+  count: number;
+  max: number;
+}
+
 async function applyTool(
   toolName: string,
   args: Record<string, unknown>,
   input: DevLoopInput,
+  rewriteTestCounter: RewriteTestCounter,
 ): Promise<AppliedTool> {
   switch (toolName) {
     case "list_files": {
@@ -447,6 +465,54 @@ async function applyTool(
         summary: r.ok ? "test passed" : "test failed",
       };
     }
+    case "rewrite_test": {
+      // Step S5: the model can rewrite the active leaf's test
+      // when the existing test contract is unwinnable (jsdom-
+      // only browser code, async WASM init, etc.). Bounded by a
+      // budget so the model can't trivially game its way to
+      // passing.
+      if (rewriteTestCounter.count >= rewriteTestCounter.max) {
+        return {
+          ok: false,
+          toolResult: {
+            error: `rewrite_test budget exhausted (${rewriteTestCounter.max} rewrites used). Either make the body satisfy the current test, or call Terminate / skip_with_smoke_test.`,
+          },
+          error: "rewrite_test budget exhausted",
+        };
+      }
+      const newSource = args["new_source"];
+      if (typeof newSource !== "string" || newSource.length === 0) {
+        return {
+          ok: false,
+          toolResult: { error: "rewrite_test: new_source must be a non-empty string" },
+          error: "arg validation failed",
+        };
+      }
+      const parse = checkTypescriptSyntax(newSource);
+      if (!parse.ok) {
+        return {
+          ok: false,
+          toolResult: {
+            error: `rewrite_test: new_source does not parse as TypeScript. ${parse.error}`,
+          },
+          error: "rewrite_test: parse failure",
+        };
+      }
+      // Commit: replace the leaf's test in testsByLeafId.
+      // bodyByLeafId is unchanged — the model still has to
+      // satisfy whatever the new test asserts.
+      input.testsByLeafId.set(input.leaf.leafCapabilityId, newSource);
+      rewriteTestCounter.count++;
+      return {
+        ok: true,
+        toolResult: {
+          ok: true,
+          rewrites_used: rewriteTestCounter.count,
+          rewrites_remaining: rewriteTestCounter.max - rewriteTestCounter.count,
+        },
+        summary: `rewrite_test (${rewriteTestCounter.count}/${rewriteTestCounter.max})`,
+      };
+    }
     case "edit_function_in_file":
     case "edit_whole_class_in_file":
     case "edit_method_of_class_in_file":
@@ -463,7 +529,7 @@ async function applyTool(
       return {
         ok: false,
         toolResult: {
-          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, edit_file, typecheck, run_test, edit_function_in_file, edit_whole_class_in_file, edit_method_of_class_in_file, edit_imports_and_assignments_in_file, add_dependency, remove_dependency, set_script, npm_run, Terminate.`,
+          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, edit_file, rewrite_test, typecheck, run_test, edit_function_in_file, edit_whole_class_in_file, edit_method_of_class_in_file, edit_imports_and_assignments_in_file, add_dependency, remove_dependency, set_script, npm_run, Terminate.`,
         },
         error: `unknown tool: ${toolName}`,
       };
@@ -828,6 +894,7 @@ Tools:
                                   String replacement on the active file. old_str must match exactly once. Use the file's CURRENT content (re-read after each edit). You can ONLY edit the active leaf's file; other files are read-only.
   typecheck                       Run tsc --noEmit on the project. Returns diagnostics scoped to the active file. Useful after a non-trivial edit before running tests.
   run_test                        Run the active leaf's test. Returns ok=true or the failing assertion.
+  rewrite_test(new_source)        Replace the leaf's test source. Use when the existing test contract is unwinnable (e.g. browser-only code that needs jsdom, async WASM init, environment-dependent classes) — write a smoke test or restructure the assertions. Bounded by a small budget; the body still has to satisfy whatever the rewrite asserts.
   edit_function_in_file(function_name, new_source)
                                   AST-aware: replace a top-level function. Stricter than edit_file but reliable for whole-function rewrites.
   edit_method_of_class_in_file(class_name, method_name, new_source)
@@ -945,6 +1012,24 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
       name: "run_test",
       description: "Run the active leaf's test. Returns ok or the failing assertion.",
       parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "rewrite_test",
+      description:
+        "Replace the active leaf's test source. Use when the existing test contract is unwinnable (browser-only code needing jsdom, async WASM init, env-dependent classes) — author a smoke test or restructure the assertions. Bounded by a small budget. The body still has to satisfy whatever the rewrite asserts.",
+      parameters: {
+        type: "object",
+        properties: {
+          new_source: {
+            type: "string",
+            description: "Full TypeScript source for the replacement test file.",
+          },
+        },
+        required: ["new_source"],
+      },
     },
   },
   {
