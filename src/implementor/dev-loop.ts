@@ -750,16 +750,26 @@ function tailTruncateLines(lines: string[], cap: number): string[] {
 
 // ── System prompt + user prompt + tool defs ──────────────────────────
 
-const SYSTEM_PROMPT = `You are a software engineer implementing a feature in a TypeScript project, using test-driven development. You have tools to explore the project, edit any file, type-check, and run tests.
+const SYSTEM_PROMPT = `You are a software engineer implementing a feature in a TypeScript project. You have tools to explore the project, edit any file, type-check, and run tests.
 
-Workflow (TDD):
-  1. Read the task description carefully.
-  2. Write a test (or several) that capture the contract — meaningful behavior, not just a smoke check. Place the test next to the source file or under a tests/ folder, per the project's existing convention.
-  3. Run the tests. They should fail (the implementation isn't there yet).
-  4. Implement the body until tests pass.
-  5. Use typecheck to catch type errors before running tests.
-  6. Iterate — read what you don't know before changing it. When a test fails, decide whether the implementation is wrong or your test contract was off.
-  7. Call Terminate when the tests you wrote pass and you're confident the feature is correctly implemented.
+Each task arrives with a testability classification — unit or integration:
+
+  UNIT TASKS (most pure-logic functions): use TDD.
+    1. Read the task description carefully.
+    2. Write a test (or several) that capture the contract — meaningful behavior, not just a smoke check. Place the test next to the source file or under a tests/ folder, per the project's existing convention.
+    3. Run the tests. They should fail (the implementation isn't there yet).
+    4. Implement the body until tests pass.
+    5. Use typecheck to catch type errors before running tests.
+    6. Iterate — read what you don't know before changing it.
+    7. Call Terminate when your tests pass.
+
+  INTEGRATION TASKS (framework wiring, lifecycle, server bootstrap, DOM hooks): implement directly — no unit test.
+    1. Read the task description; understand what framework primitive this wires up.
+    2. Read the relevant siblings (find_definition / read_file) to understand the surface you're plugging into.
+    3. Implement the body. Use typecheck to catch errors.
+    4. Call Terminate. Project-level integration tests will exercise this in a later phase.
+
+  When the testability hint isn't set, use your judgment. Default to TDD; only skip tests when the task is genuinely a thin framework wrapper.
 
 Tools:
   list_files                      List every file in the project. Use first to see what exists.
@@ -797,9 +807,23 @@ function buildUserPrompt(input: DevLoopInput): string {
   lines.push("Description:");
   lines.push(input.leaf.description.trim() || "(no description provided)");
   lines.push("");
-  lines.push(
-    "Approach: write tests that capture this behavior, then implement. Iterate until your tests pass.",
-  );
+  // V4: surface the architect's testability hint when set so the
+  // model knows whether to write a unit test or implement
+  // directly.
+  const testability = input.leaf.testability;
+  if (testability === "integration") {
+    lines.push(
+      "Testability: INTEGRATION. The architect classified this task as a framework adapter / lifecycle / wiring concern that is only meaningful in context of the wider system (route registration, middleware, server bootstrap, DOM hooks, etc.). Do NOT write a unit test. Implement the body directly; project-level integration tests will exercise it end-to-end. When done, call Terminate.",
+    );
+  } else if (testability === "unit") {
+    lines.push(
+      "Testability: UNIT. Write tests first that capture this behavior, then implement, then iterate until your tests pass.",
+    );
+  } else {
+    lines.push(
+      "Approach: if this is pure logic (validation, computation, transformation), write unit tests first then implement (TDD). If this is a thin framework wrapper or wiring code that's only meaningful in the wider system, implement directly without a unit test — integration tests will cover it later.",
+    );
+  }
   lines.push("");
   if (input.failureMessage) {
     lines.push("# Previous failure");

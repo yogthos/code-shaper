@@ -110,6 +110,7 @@ interface ParsedInterface {
   description: string;
   exported: boolean;
   isStatic: boolean;
+  testability?: "unit" | "integration";
 }
 
 interface ParsedClass {
@@ -816,6 +817,21 @@ function validateInterface(
       error: `interfaces[${index}].isStatic: required boolean`,
     };
   }
+  // V4: testability — optional but the prompt asks the architect
+  // to set it. Accept "unit" / "integration" / undefined. Reject
+  // any other string so we don't silently lose hints.
+  const testabilityRaw = raw["testability"];
+  let testability: "unit" | "integration" | undefined;
+  if (testabilityRaw === undefined || testabilityRaw === null) {
+    testability = undefined;
+  } else if (testabilityRaw === "unit" || testabilityRaw === "integration") {
+    testability = testabilityRaw;
+  } else {
+    return {
+      ok: false,
+      error: `interfaces[${index}].testability: must be "unit" or "integration" (got ${JSON.stringify(testabilityRaw)})`,
+    };
+  }
   return {
     ok: true,
     value: {
@@ -828,6 +844,7 @@ function validateInterface(
       description: description.trim(),
       exported,
       isStatic,
+      ...(testability !== undefined ? { testability } : {}),
     },
   };
 }
@@ -1080,6 +1097,7 @@ function applyInterfacePlan(
       description: e.description,
       exported: e.exported,
       isStatic: e.isStatic,
+      ...(e.testability !== undefined ? { testability: e.testability } : {}),
     });
   }
   // Attach plans to file nodes.

@@ -54,6 +54,13 @@ Your output for each leaf capability:
   - Decide whether the leaf becomes a standalone function or a method of a shared class. Cluster interdependent leaves under a class; keep independent ones as standalone functions.
   - Specify the function/method signature: parameter names + types, return type, whether async.
   - Write a one-paragraph description that's specific enough to drive tests.
+  - Classify the testability of the task — set testability to one of:
+
+      "unit" — pure logic the implementor can test in isolation (validation rules, computations, parsing, transformations, state-update functions, business-rule checks). The implementor writes unit tests + body together using TDD.
+
+      "integration" — framework-adapter / lifecycle / wiring code whose behavior is only meaningful as part of the wider system. Examples: registering routes on an HTTP framework, mounting middleware, hooking into a DOM/Preact lifecycle, configuring a database connection pool, server bootstrap, app entry points. The implementor writes the body directly; project-level integration tests exercise it end-to-end.
+
+      Be deliberate. A function called registerErrorMiddleware(app) that just calls app.use(...) is "integration". A function called mapErrorToStatusCode(error) that returns a number is "unit". When in doubt, prefer "unit" — most logic IS unit-testable. Mark "integration" only when the function's behavior cannot be verified without running the framework.
 
 Also produce, for each file:
   - A list of containers declared in that file. The default container kind is "class"; the schema also supports "interface", "protocol" (think Clojure protocol / Haskell type-class / Rust trait abstractions), "record"/"struct" (data-bearing types), and "module" (namespacing for FP-leaning languages). Pick the kind that fits the language and design — when in doubt for TypeScript, "class" is correct. A container can extend another container IN THE SAME FILE; the extension models inheritance, implementation, or protocol-extension depending on the kind.
@@ -123,6 +130,8 @@ export function buildInterfaceUserPrompt(input: InterfacePromptInput): string {
             description: "string",
             exported: "boolean",
             isStatic: "boolean (only meaningful for methods)",
+            testability:
+              "'unit' | 'integration' (REQUIRED — see system prompt for guidance)",
           },
         ],
         classes: [

@@ -170,6 +170,23 @@ export interface PlannedInterface {
   description: string;
   exported: boolean;
   isStatic: boolean;
+  /** V4: how this should be tested.
+   *
+   *    "unit": pure logic the implementor can unit-test in isolation
+   *      (validation, computation, transformation, parsing, etc.).
+   *      The implementor's TDD loop writes tests + body together.
+   *
+   *    "integration": framework adapter / wrapper / lifecycle code
+   *      whose behavior is only meaningful in context of the wider
+   *      system (route registration, middleware wiring, server
+   *      bootstrap, DOM hooks). The implementor writes the body
+   *      directly; phase 7b's project-level integration tests
+   *      exercise it end-to-end.
+   *
+   *  Default behavior when unset: implementor decides via heuristic
+   *  (the system prompt gives guidance). The architect SHOULD set
+   *  this explicitly when the call shape is unambiguous. */
+  testability?: "unit" | "integration";
 }
 
 export interface PlannedClass {
