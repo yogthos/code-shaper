@@ -437,6 +437,33 @@ function buildBody(
   return body;
 }
 
+/** Re-throw an upstream error with a provider/model prefix so
+ *  upstream failures are attributable. We construct a NEW Error
+ *  rather than mutating `e.message` because some Error subclasses
+ *  (notably certain Node 26+ native errors and DOMException-style
+ *  objects) define `message` as a getter only — mutation throws
+ *  "Cannot set property message of which has only a getter" and
+ *  takes down the orchestrator. */
+function wrapWithProviderContext(e: unknown, config: LLMConfig): Error {
+  if (!(e instanceof Error)) {
+    return new Error(
+      `[${config.providerHint ?? "openai"}/${config.model}] ${String(e)}`,
+    );
+  }
+  if (e.message.includes(config.model)) {
+    // Already prefixed (likely a re-throw from a nested layer).
+    return e;
+  }
+  const wrapped = new Error(
+    `[${config.providerHint ?? "openai"}/${config.model}] ${e.message}`,
+  );
+  // Preserve the original error's name and stack so debugging
+  // tools can still attribute the failure.
+  wrapped.name = e.name;
+  if (e.stack) wrapped.stack = e.stack;
+  return wrapped;
+}
+
 function buildHeaders(apiKey: string | undefined): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -505,10 +532,7 @@ export function createOpenAIProvider(config: LLMConfig): LLMClient {
         // Re-throw with provider context so failures upstream are
         // attributable to a specific provider rather than a bare
         // AbortError or fetch error.
-        if (e instanceof Error && !e.message.includes(config.model)) {
-          e.message = `[${config.providerHint ?? "openai"}/${config.model}] ${e.message}`;
-        }
-        throw e;
+        throw wrapWithProviderContext(e, config);
       }
     },
 
@@ -530,10 +554,7 @@ export function createOpenAIProvider(config: LLMConfig): LLMClient {
           config.model,
         );
       } catch (e) {
-        if (e instanceof Error && !e.message.includes(config.model)) {
-          e.message = `[${config.providerHint ?? "openai"}/${config.model}] ${e.message}`;
-        }
-        throw e;
+        throw wrapWithProviderContext(e, config);
       }
     },
 

@@ -179,6 +179,37 @@ describe("openai-provider retry on AbortError", () => {
     },
   );
 
+  // Some Node 26+ native errors define `message` as a getter
+  // only. Mutating it throws "Cannot set property message of
+  // which has only a getter" — which previously took down the
+  // orchestrator (interface phase 5).
+  it(
+    "wraps errors with read-only message getters via a NEW Error rather than mutating",
+    { timeout: 20_000 },
+    async () => {
+      // Construct an Error subclass whose `message` is a getter
+      // with no setter — same shape as the offending native
+      // errors.
+      class GetterOnlyError extends Error {
+        constructor(private readonly _msg: string) {
+          super();
+        }
+        override get message(): string {
+          return this._msg;
+        }
+      }
+      globalThis.fetch = (async () => {
+        throw new GetterOnlyError("upstream failure");
+      }) as typeof globalThis.fetch;
+      const client = createOpenAIProvider(baseConfig);
+      // The provider should re-throw with provider context but
+      // without mutating the original error.
+      await expect(
+        client.chat([{ role: "user", content: "ping" }]),
+      ).rejects.toThrow(/test-model.*upstream failure/);
+    },
+  );
+
   it(
     "gives up after MAX_RETRIES timeouts and surfaces a meaningful error",
     { timeout: 10_000 },

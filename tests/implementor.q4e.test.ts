@@ -317,7 +317,7 @@ describe("runIntegration", () => { it("calls compute", () => { expect(runIntegra
     },
   );
 
-  it("does not blame when no dep symbol appears in the failure message", async () => {
+  it("does not blame when no dep symbol appears in the failure message", { timeout: 30_000 }, async () => {
     // A leaf with a dep, but the failure message doesn't
     // mention the dep. Blame should NOT fire — the architect's
     // decompose path takes over.

@@ -207,9 +207,16 @@ export async function buildImplementations(
     return { ok: true, leafResults: [], decomposeDecisions: [] };
   }
 
-  const workDir = await createHarnessDir();
+  // Each worker gets its OWN workDir to avoid the
+  // ENOTEMPTY/replaceTestDir race that fires when multiple
+  // workers' runTests calls hit the same harness directory
+  // concurrently. With maxConcurrentLeaves=N we end up with N
+  // workDirs total — node_modules is linked into each, but the
+  // setup happens once per worker (not once per leaf), so the
+  // overhead stays small.
+  const sharedWorkDirForFinalRun = await createHarnessDir();
   await linkHostNodeModules(
-    workDir,
+    sharedWorkDirForFinalRun,
     resolveNodeModulesSource(input.outDir, input.hostRepo),
   );
 
@@ -347,7 +354,10 @@ export async function buildImplementations(
       }
     }
 
-    async function processOneEntry(entry: QueueEntry): Promise<void> {
+    async function processOneEntry(
+      entry: QueueEntry,
+      workDir: string,
+    ): Promise<void> {
       const { leaf, hostFile, approachHint } = entry;
 
       if (input.onLeafProgress) {
@@ -643,17 +653,39 @@ export async function buildImplementations(
     // other worker is in-flight (whose completion might add new
     // entries via decompose recovery).
     async function worker(): Promise<void> {
-      while (true) {
-        const entry = pickNextEntry();
-        if (entry) {
-          lockedFiles.add(entry.hostFile.path);
-          try {
-            await processOneEntry(entry);
-          } finally {
-            lockedFiles.delete(entry.hostFile.path);
+      // Per-worker workDir: created on first use, reused across
+      // every leaf this worker processes. Cleaned up at the end.
+      // This sidesteps the cross-worker race that hits when
+      // multiple `runTests` calls hit the same harness directory
+      // concurrently (replaceTestDir wipes + rewrites
+      // tests/leaves; concurrent calls race on rmdir/mkdir).
+      let workerWorkDir: string | null = null;
+      try {
+        while (true) {
+          const entry = pickNextEntry();
+          if (entry) {
+            // CRITICAL: add the lock BEFORE any await. JS is
+            // single-threaded between awaits, so popping from
+            // the queue + adding to lockedFiles is atomic. If we
+            // yield (e.g. for createHarnessDir) before locking,
+            // another worker's pickNextEntry could see the file
+            // unlocked and pick a sibling leaf, racing on the
+            // host file.
+            lockedFiles.add(entry.hostFile.path);
+            try {
+              if (workerWorkDir === null) {
+                workerWorkDir = await createHarnessDir();
+                await linkHostNodeModules(
+                  workerWorkDir,
+                  resolveNodeModulesSource(input.outDir, input.hostRepo),
+                );
+              }
+              await processOneEntry(entry, workerWorkDir);
+            } finally {
+              lockedFiles.delete(entry.hostFile.path);
+            }
+            continue;
           }
-          continue;
-        }
         // No entry available. Either:
         //   (a) queue is empty AND no other worker is running →
         //       we're done.
@@ -669,26 +701,41 @@ export async function buildImplementations(
         //       unlanded dep that will never land. Detect this
         //       and surface the entries with a synthesized
         //       "deps never landed" failure instead of spinning.
-        if (queue.length === 0 && lockedFiles.size === 0) return;
-        if (queue.length > 0 && lockedFiles.size === 0 && depGraph) {
-          // No one is making progress. Identify orphaned entries
-          // (deps reference leaves that never appeared in the
-          // initial plan, or whose source leaf failed) and force
-          // them through with a one-shot dispatch; the leaf will
-          // either succeed against partial context or fail
-          // cleanly.
-          const stuck = queue.shift()!;
-          lockedFiles.add(stuck.hostFile.path);
-          try {
-            await processOneEntry(stuck);
-            // If this leaf landed it might unblock siblings;
-            // recurse into the loop normally.
-          } finally {
-            lockedFiles.delete(stuck.hostFile.path);
+          if (queue.length === 0 && lockedFiles.size === 0) return;
+          if (queue.length > 0 && lockedFiles.size === 0 && depGraph) {
+            // No one is making progress. Identify orphaned
+            // entries (deps reference leaves that never appeared
+            // in the initial plan, or whose source leaf failed)
+            // and force them through with a one-shot dispatch;
+            // the leaf will either succeed against partial
+            // context or fail cleanly.
+            const stuck = queue.shift()!;
+            // Lock first (synchronous) — see the comment above.
+            lockedFiles.add(stuck.hostFile.path);
+            try {
+              if (workerWorkDir === null) {
+                workerWorkDir = await createHarnessDir();
+                await linkHostNodeModules(
+                  workerWorkDir,
+                  resolveNodeModulesSource(input.outDir, input.hostRepo),
+                );
+              }
+              await processOneEntry(stuck, workerWorkDir);
+              // If this leaf landed it might unblock siblings;
+              // recurse into the loop normally.
+            } finally {
+              lockedFiles.delete(stuck.hostFile.path);
+            }
+            continue;
           }
-          continue;
+          await new Promise((r) => setTimeout(r, 50));
         }
-        await new Promise((r) => setTimeout(r, 50));
+      } finally {
+        // Per-worker cleanup. preserveHarness keeps the dir for
+        // post-mortem inspection; otherwise wipe.
+        if (workerWorkDir !== null && !input.preserveHarness) {
+          await rm(workerWorkDir, { recursive: true, force: true });
+        }
       }
     }
 
@@ -714,7 +761,7 @@ export async function buildImplementations(
     const finalTestRun = await runTests(rpg, {
       bodyByLeafId,
       testsByLeafId,
-      workDir,
+      workDir: sharedWorkDirForFinalRun,
       timeoutMs: input.finalRunTimeoutMs ?? 300_000,
     });
 
@@ -732,11 +779,11 @@ export async function buildImplementations(
       leafResults,
       decomposeDecisions,
       finalTestRun,
-      workDir,
+      workDir: sharedWorkDirForFinalRun,
     };
   } finally {
     if (!input.preserveHarness) {
-      await rm(workDir, { recursive: true, force: true });
+      await rm(sharedWorkDirForFinalRun, { recursive: true, force: true });
     }
   }
 }
