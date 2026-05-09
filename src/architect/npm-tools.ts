@@ -179,7 +179,7 @@ function validateScriptNameForRun(
  * version, this is a no-op (no install re-run). If present at a
  * different version, the version is updated and install re-runs.
  */
-export async function addDependency(
+async function addDependencyUnsafe(
   input: NpmOpInput & {
     name: string;
     version: string;
@@ -227,7 +227,7 @@ export async function addDependency(
  * Remove a dependency from both runtime and dev buckets. Returns
  * ok even when the package wasn't present (idempotent).
  */
-export async function removeDependency(
+async function removeDependencyUnsafe(
   input: NpmOpInput & { name: string },
 ): Promise<NpmOpResult> {
   const nameCheck = validateNpmName(input.name);
@@ -266,7 +266,7 @@ export async function removeDependency(
  * lint or build script. No npm install re-run since scripts
  * don't affect node_modules.
  */
-export async function setScript(
+async function setScriptUnsafe(
   input: NpmOpInput & { name: string; command: string },
 ): Promise<NpmOpResult> {
   const nameCheck = validateScriptName(input.name);
@@ -327,7 +327,7 @@ export async function setScript(
  * surfaces the exit code. Useful when the model wants to verify
  * its setup worked (npm run build, npm run test, etc.).
  */
-export async function npmRun(
+async function npmRunUnsafe(
   input: NpmOpInput & { script: string; timeoutMs?: number },
 ): Promise<NpmOpResult & { exitCode: number | null }> {
   const nameCheck = validateScriptNameForRun(input.script);
@@ -552,4 +552,41 @@ async function runNpmCommand(opts: NpmCommandOpts): Promise<NpmCommandResult> {
 function tailTruncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return "...[truncated head]\n" + s.slice(s.length - max);
+}
+
+// ── S3: serialize all package.json mutations through the infra
+//   mutex. Multiple workers running add_dependency / set_script
+//   concurrently would lose updates (load → modify → write
+//   pattern, with the second write clobbering the first).
+//   npmRun also serializes — it loads package.json to check the
+//   script list, and a concurrent set_script would race.
+
+import { withInfraLock } from "./infra-mutex.js";
+
+export async function addDependency(
+  input: NpmOpInput & {
+    name: string;
+    version: string;
+    which: "runtime" | "dev";
+  },
+): Promise<NpmOpResult> {
+  return withInfraLock(() => addDependencyUnsafe(input));
+}
+
+export async function removeDependency(
+  input: NpmOpInput & { name: string },
+): Promise<NpmOpResult> {
+  return withInfraLock(() => removeDependencyUnsafe(input));
+}
+
+export async function setScript(
+  input: NpmOpInput & { name: string; command: string },
+): Promise<NpmOpResult> {
+  return withInfraLock(() => setScriptUnsafe(input));
+}
+
+export async function npmRun(
+  input: NpmOpInput & { script: string; timeoutMs?: number },
+): Promise<NpmOpResult & { exitCode: number | null }> {
+  return withInfraLock(() => npmRunUnsafe(input));
 }
