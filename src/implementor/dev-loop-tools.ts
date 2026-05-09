@@ -37,6 +37,7 @@ import {
   extractMethodBody,
 } from "./edit-tools.js";
 import { runTests, leafToTestFilename } from "./test-harness.js";
+import { isInfraPath, withInfraLock } from "../architect/infra-mutex.js";
 
 // ── listFilesTool ────────────────────────────────────────────────────
 
@@ -295,19 +296,24 @@ export interface EditFileInput {
   bodyByLeafId: Map<string, string>;
   testsByLeafId: Map<string, string>;
   /** Path of the file the active leaf belongs to. The model can
-   *  ONLY edit this file — other files are read-only via
-   *  readFileTool. Same scoping discipline as the §D.2 tools. */
+   *  edit either this file OR an infra file (package.json,
+   *  tsconfig.json, vitest.config.*, .env). Other files are
+   *  read-only via readFileTool. */
   activeFilePath: string;
   /** Capability id of the leaf currently being implemented. After
-   *  a successful edit we extract its body via tree-sitter and
-   *  write it back to bodyByLeafId so subsequent renders + tests
-   *  see the new code. */
+   *  a successful active-file edit we extract its body via
+   *  tree-sitter and write it back to bodyByLeafId so subsequent
+   *  renders + tests see the new code. */
   activeLeafId: string;
-  /** Path the agent supplied in the tool call. Must equal
-   *  activeFilePath for the edit to be accepted. */
+  /** Path the agent supplied in the tool call. */
   path: string;
   old_str: string;
   new_str: string;
+  /** Step S4: project root directory. When the model edits an
+   *  infra file (vitest.config.ts, tsconfig.json, etc.) the
+   *  edit goes to disk at `outDir/<path>` under the infra
+   *  mutex. Without outDir, infra edits are rejected. */
+  outDir?: string;
 }
 
 export interface EditFileResult {
@@ -315,12 +321,17 @@ export interface EditFileResult {
   /** Set on success — full rendered source after the replacement. */
   newContent?: string;
   /** Set on success — the body extracted for the active leaf and
-   *  written into bodyByLeafId. */
+   *  written into bodyByLeafId. Only set for active-file edits;
+   *  not set for infra edits. */
   extractedBody?: string;
   error?: string;
+  /** Set on success — what kind of edit happened. "active" =
+   *  the leaf's host file (renderer-driven); "infra" = a
+   *  project config file (disk-driven, mutex-serialized). */
+  kind?: "active" | "infra";
 }
 
-export function editFileTool(input: EditFileInput): EditFileResult {
+export async function editFileTool(input: EditFileInput): Promise<EditFileResult> {
   // Path validation: same path-traversal rules as readFileTool.
   if (
     input.path.length === 0 ||
@@ -331,6 +342,22 @@ export function editFileTool(input: EditFileInput): EditFileResult {
       ok: false,
       error: `path must be a repo-relative path (no leading "/" or ".." segments). Got ${JSON.stringify(input.path)}`,
     };
+  }
+  // Step S4: infra-path branch. Edits to project config files
+  // (package.json, tsconfig.json, vitest.config.*, .env) bypass
+  // the RPG and go straight to disk under outDir, serialized
+  // through the infra mutex (S3) so concurrent workers don't
+  // race on the same file. The model can edit the test
+  // environment as needed without violating the active-file
+  // scoping for source code.
+  if (isInfraPath(input.path)) {
+    if (!input.outDir) {
+      return {
+        ok: false,
+        error: `infra-path edits require outDir. The harness was started without one — ${JSON.stringify(input.path)} cannot be edited from this leaf.`,
+      };
+    }
+    return await editInfraFile(input);
   }
   // Path-existence check fires FIRST so the model gets a "not in
   // project" error (with a helpful suggestion list) rather than a
@@ -422,6 +449,85 @@ export function editFileTool(input: EditFileInput): EditFileResult {
   // next render + test run sees the model's edit.
   input.bodyByLeafId.set(input.activeLeafId, extractedBody);
   return { ok: true, newContent, extractedBody };
+}
+
+/** Step S4: edit an infra file (package.json, tsconfig.json,
+ *  vitest.config.*, .env) on disk under outDir. Serialized via
+ *  the infra mutex (S3) so concurrent workers don't race. The
+ *  edit is a string-replace on the file's CURRENT disk contents
+ *  — no RPG involvement, no body extraction.
+ *
+ *  JSON files (package.json, tsconfig.json) get a JSON.parse
+ *  validation post-edit so a busted edit doesn't quietly leave
+ *  the project unbuildable. TS files get the standard
+ *  tree-sitter parse check. */
+async function editInfraFile(input: EditFileInput): Promise<EditFileResult> {
+  if (typeof input.old_str !== "string" || typeof input.new_str !== "string") {
+    return { ok: false, error: "old_str and new_str must both be strings" };
+  }
+  if (input.old_str === input.new_str) {
+    return {
+      ok: false,
+      error: "old_str and new_str are identical — edit would be a no-op. They must differ.",
+    };
+  }
+  return await withInfraLock(async () => {
+    const fullPath = nodePath.join(input.outDir!, input.path);
+    let currentSource: string;
+    try {
+      currentSource = nodeFs.readFileSync(fullPath, "utf-8");
+    } catch (e) {
+      return {
+        ok: false,
+        error: `infra file read failed: ${e instanceof Error ? e.message : String(e)} (path ${JSON.stringify(input.path)})`,
+      };
+    }
+    const matchCount = countOccurrences(currentSource, input.old_str);
+    if (matchCount === 0) {
+      return {
+        ok: false,
+        error: `old_str not found in ${JSON.stringify(input.path)}. Re-read the file first — it may have been modified by another tool call.`,
+      };
+    }
+    if (matchCount > 1) {
+      return {
+        ok: false,
+        error: `old_str matches ${matchCount} places in ${JSON.stringify(input.path)} — ambiguous. Add more context to disambiguate.`,
+      };
+    }
+    const newContent =
+      currentSource.slice(0, currentSource.indexOf(input.old_str)) +
+      input.new_str +
+      currentSource.slice(currentSource.indexOf(input.old_str) + input.old_str.length);
+    // Validation: JSON files must still parse as JSON. TS/JS
+    // files get the tree-sitter parse check. .env is plain text
+    // so no validation.
+    if (input.path.endsWith(".json")) {
+      try {
+        JSON.parse(newContent);
+      } catch (e) {
+        return {
+          ok: false,
+          error: `resulting ${input.path} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
+        };
+      }
+    } else if (
+      input.path.endsWith(".ts") ||
+      input.path.endsWith(".mts") ||
+      input.path.endsWith(".js") ||
+      input.path.endsWith(".mjs")
+    ) {
+      const syntax = checkTypescriptSyntax(newContent);
+      if (!syntax.ok) {
+        return {
+          ok: false,
+          error: `resulting ${input.path}: ${syntax.error}`,
+        };
+      }
+    }
+    nodeFs.writeFileSync(fullPath, newContent, "utf-8");
+    return { ok: true, newContent, kind: "infra" };
+  });
 }
 
 function countOccurrences(haystack: string, needle: string): number {

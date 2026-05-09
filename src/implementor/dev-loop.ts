@@ -367,7 +367,7 @@ async function applyTool(
           error: "path, old_str, new_str must all be strings",
         };
       }
-      const r = editFileTool({
+      const r = await editFileTool({
         rpg: input.rpg,
         bodyByLeafId: input.bodyByLeafId,
         testsByLeafId: input.testsByLeafId,
@@ -376,18 +376,25 @@ async function applyTool(
         path: p,
         old_str: oldStr,
         new_str: newStr,
+        ...(input.outDir !== undefined ? { outDir: input.outDir } : {}),
       });
-      if (r.ok && r.newContent !== undefined) {
+      if (r.ok && r.newContent !== undefined && r.kind !== "infra") {
         // Mirror the model's imports back into FileNode.rawImports
-        // so subsequent renders preserve them. See
-        // syncImportsFromSource for the rationale.
+        // so subsequent renders preserve them. Infra-file edits
+        // (package.json, tsconfig.json, etc.) bypass this — they
+        // don't affect the renderer's import emission for src
+        // files.
         syncImportsFromSource(input, r.newContent);
       }
       return {
         ok: r.ok,
         toolResult: r.ok ? { ok: true } : { error: r.error },
         ...(r.error ? { error: r.error } : {}),
-        ...(r.ok ? { summary: `edit_file ${p} applied` } : {}),
+        ...(r.ok
+          ? {
+              summary: `edit_file ${p} applied${r.kind === "infra" ? " (infra)" : ""}`,
+            }
+          : {}),
       };
     }
     case "typecheck": {
@@ -912,11 +919,11 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
     function: {
       name: "edit_file",
       description:
-        "Replace a single occurrence of old_str with new_str in the active file. old_str must match the file's CURRENT content exactly once.",
+        'Replace a single occurrence of old_str with new_str. Allowed paths: (1) the active leaf\'s host file (source code), (2) project infra files: package.json, tsconfig.json, vitest.config.{ts,mts,js}, .env. Use infra edits to fix test environment issues — e.g. set environment: "jsdom" in vitest.config.ts, add path aliases to tsconfig.json. old_str must match the file\'s CURRENT content exactly once.',
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Repo-relative path of the active leaf's file." },
+          path: { type: "string", description: "Repo-relative path of the active leaf's file OR an infra file." },
           old_str: { type: "string", description: "Existing snippet to replace. Must match exactly once." },
           new_str: { type: "string", description: "Replacement snippet." },
         },

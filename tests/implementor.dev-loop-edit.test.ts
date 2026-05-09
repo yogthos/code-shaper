@@ -85,7 +85,7 @@ const ADD_PLAN: FileNode["interfacePlan"] = {
 };
 
 describe("editFileTool — happy paths", () => {
-  it("string-replaces inside the active leaf's host file and writes the new body to bodyByLeafId", () => {
+  it("string-replaces inside the active leaf's host file and writes the new body to bodyByLeafId", async () => {
     const f = mkFile({
       id: "file:add",
       path: "src/add.ts",
@@ -93,7 +93,7 @@ describe("editFileTool — happy paths", () => {
     });
     const rpg = rpgWithFiles([f]);
     const bodies = new Map<string, string>();
-    const r = editFileTool({
+    const r = await editFileTool({
       rpg,
       bodyByLeafId: bodies,
       testsByLeafId: new Map(),
@@ -109,7 +109,7 @@ describe("editFileTool — happy paths", () => {
     expect(bodies.get("cap:add")).toContain("return a + b");
   });
 
-  it("supports multi-line old_str / new_str", () => {
+  it("supports multi-line old_str / new_str", async () => {
     const f = mkFile({
       id: "file:add",
       path: "src/add.ts",
@@ -117,7 +117,7 @@ describe("editFileTool — happy paths", () => {
     });
     const rpg = rpgWithFiles([f]);
     const bodies = new Map<string, string>();
-    const r = editFileTool({
+    const r = await editFileTool({
       rpg,
       bodyByLeafId: bodies,
       testsByLeafId: new Map(),
@@ -134,14 +134,14 @@ describe("editFileTool — happy paths", () => {
 });
 
 describe("editFileTool — rejections", () => {
-  it("rejects when old_str does not appear in the file", () => {
+  it("rejects when old_str does not appear in the file", async () => {
     const f = mkFile({
       id: "file:add",
       path: "src/add.ts",
       interfacePlan: ADD_PLAN,
     });
     const rpg = rpgWithFiles([f]);
-    const r = editFileTool({
+    const r = await editFileTool({
       rpg,
       bodyByLeafId: new Map(),
       testsByLeafId: new Map(),
@@ -155,14 +155,14 @@ describe("editFileTool — rejections", () => {
     expect(r.error).toMatch(/not found|no match/i);
   });
 
-  it("rejects when old_str matches more than once (ambiguous)", () => {
+  it("rejects when old_str matches more than once (ambiguous)", async () => {
     const f = mkFile({
       id: "file:dup",
       path: "src/dup.ts",
       content: "export function a() {}\nexport function b() {}\n// repeat\n// repeat\n",
     });
     const rpg = rpgWithFiles([f]);
-    const r = editFileTool({
+    const r = await editFileTool({
       rpg,
       bodyByLeafId: new Map(),
       testsByLeafId: new Map(),
@@ -179,14 +179,14 @@ describe("editFileTool — rejections", () => {
     expect(r.error).toMatch(/more context|disambiguate/i);
   });
 
-  it("rejects when old_str equals new_str (no-op)", () => {
+  it("rejects when old_str equals new_str (no-op)", async () => {
     const f = mkFile({
       id: "file:add",
       path: "src/add.ts",
       interfacePlan: ADD_PLAN,
     });
     const rpg = rpgWithFiles([f]);
-    const r = editFileTool({
+    const r = await editFileTool({
       rpg,
       bodyByLeafId: new Map(),
       testsByLeafId: new Map(),
@@ -200,7 +200,7 @@ describe("editFileTool — rejections", () => {
     expect(r.error).toMatch(/identical|no-op|differ/i);
   });
 
-  it("rejects edits to files other than the active leaf's host file", () => {
+  it("rejects edits to files other than the active leaf's host file", async () => {
     const a = mkFile({
       id: "file:a",
       path: "src/a.ts",
@@ -208,7 +208,7 @@ describe("editFileTool — rejections", () => {
     });
     const b = mkFile({ id: "file:b", path: "src/b.ts", content: "export const x = 1;\n" });
     const rpg = rpgWithFiles([a, b]);
-    const r = editFileTool({
+    const r = await editFileTool({
       rpg,
       bodyByLeafId: new Map(),
       testsByLeafId: new Map(),
@@ -222,14 +222,14 @@ describe("editFileTool — rejections", () => {
     expect(r.error).toMatch(/active leaf|out of scope|src\/a\.ts/);
   });
 
-  it("rejects when the resulting source doesn't parse as TypeScript", () => {
+  it("rejects when the resulting source doesn't parse as TypeScript", async () => {
     const f = mkFile({
       id: "file:add",
       path: "src/add.ts",
       interfacePlan: ADD_PLAN,
     });
     const rpg = rpgWithFiles([f]);
-    const r = editFileTool({
+    const r = await editFileTool({
       rpg,
       bodyByLeafId: new Map(),
       testsByLeafId: new Map(),
@@ -245,7 +245,7 @@ describe("editFileTool — rejections", () => {
     expect(r.error).toMatch(/parse error/i);
   });
 
-  it("rejects when the new content no longer contains the active leaf's body extractable", () => {
+  it("rejects when the new content no longer contains the active leaf's body extractable", async () => {
     // Replacing the whole function declaration breaks the
     // body-extractor invariant — `extractFunctionBody("add")`
     // returns null when the function is renamed/removed.
@@ -255,7 +255,7 @@ describe("editFileTool — rejections", () => {
       interfacePlan: ADD_PLAN,
     });
     const rpg = rpgWithFiles([f]);
-    const r = editFileTool({
+    const r = await editFileTool({
       rpg,
       bodyByLeafId: new Map(),
       testsByLeafId: new Map(),
@@ -269,14 +269,14 @@ describe("editFileTool — rejections", () => {
     expect(r.error).toMatch(/leaf|extract|named/i);
   });
 
-  it("rejects unknown path with a helpful message", () => {
+  it("rejects unknown path with a helpful message", async () => {
     const f = mkFile({
       id: "file:add",
       path: "src/add.ts",
       interfacePlan: ADD_PLAN,
     });
     const rpg = rpgWithFiles([f]);
-    const r = editFileTool({
+    const r = await editFileTool({
       rpg,
       bodyByLeafId: new Map(),
       testsByLeafId: new Map(),
@@ -288,5 +288,154 @@ describe("editFileTool — rejections", () => {
     });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/not in the project|no such file/i);
+  });
+});
+
+// Step S4: edit_file accepts infra paths (package.json,
+// tsconfig.json, vitest.config.ts, .env) regardless of the
+// active leaf — these are project-wide config the model needs
+// to own to fix env-shaped failures. Edits go to disk under
+// outDir, serialized via the infra mutex.
+describe("editFileTool — infra paths (S4)", () => {
+  it("edits package.json on disk under outDir", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = (await import("node:path")).default;
+    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "s4-"));
+    try {
+      await fs.writeFile(
+        path.join(outDir, "package.json"),
+        JSON.stringify(
+          { name: "test", version: "0.1.0", scripts: { test: "vitest run" } },
+          null,
+          2,
+        ),
+      );
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const r = await editFileTool({
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        activeFilePath: "src/add.ts", // editing infra is allowed even though active is src/add.ts
+        activeLeafId: "cap:add",
+        path: "package.json",
+        old_str: '"version": "0.1.0"',
+        new_str: '"version": "0.2.0"',
+        outDir,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      expect(r.kind).toBe("infra");
+      const updated = JSON.parse(
+        await fs.readFile(path.join(outDir, "package.json"), "utf-8"),
+      );
+      expect(updated.version).toBe("0.2.0");
+    } finally {
+      await fs.rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("edits vitest.config.ts on disk and validates TS syntax", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = (await import("node:path")).default;
+    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "s4-"));
+    try {
+      await fs.writeFile(
+        path.join(outDir, "vitest.config.ts"),
+        'import { defineConfig } from "vitest/config";\nexport default defineConfig({});\n',
+      );
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const r = await editFileTool({
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        activeFilePath: "src/add.ts",
+        activeLeafId: "cap:add",
+        path: "vitest.config.ts",
+        old_str: "defineConfig({})",
+        new_str: 'defineConfig({ test: { environment: "jsdom" } })',
+        outDir,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      const after = await fs.readFile(
+        path.join(outDir, "vitest.config.ts"),
+        "utf-8",
+      );
+      expect(after).toContain("jsdom");
+    } finally {
+      await fs.rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an infra edit that produces invalid JSON", async () => {
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const path = (await import("node:path")).default;
+    const outDir = await fs.mkdtemp(path.join(os.tmpdir(), "s4-"));
+    try {
+      await fs.writeFile(
+        path.join(outDir, "package.json"),
+        '{ "name": "test", "version": "0.1.0" }',
+      );
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const r = await editFileTool({
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        activeFilePath: "src/add.ts",
+        activeLeafId: "cap:add",
+        path: "package.json",
+        old_str: '"version": "0.1.0"',
+        new_str: '"version": 0.1.0,', // trailing comma → invalid JSON
+        outDir,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/JSON/i);
+      // Disk content unchanged.
+      const after = await fs.readFile(
+        path.join(outDir, "package.json"),
+        "utf-8",
+      );
+      expect(after).toContain('"version": "0.1.0"');
+    } finally {
+      await fs.rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects infra edits when outDir is not configured", async () => {
+    const f = mkFile({
+      id: "file:add",
+      path: "src/add.ts",
+      interfacePlan: ADD_PLAN,
+    });
+    const rpg = rpgWithFiles([f]);
+    const r = await editFileTool({
+      rpg,
+      bodyByLeafId: new Map(),
+      testsByLeafId: new Map(),
+      activeFilePath: "src/add.ts",
+      activeLeafId: "cap:add",
+      path: "package.json",
+      old_str: "x",
+      new_str: "y",
+      // outDir intentionally omitted.
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/outDir/i);
   });
 });
