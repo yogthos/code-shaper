@@ -346,6 +346,35 @@ describe("designInterfaces (mocked)", () => {
     const payloads = rpg.dataFlow.map((e) => e.payload).sort();
     expect(payloads).toEqual(["Entry[]", "untouched"]);
   });
+
+  // Phase 5 used to crash the whole orchestrator when GLM threw
+  // a stall abort. Now we catch the chat exception and retry on
+  // the SAME interface call (the parse-error retry loop covers
+  // it). After all retries exhausted, designInterfaces returns
+  // ok=false with a clear error rather than throwing.
+  it("returns ok=false with a clear error when the LLM throws on every retry (e.g. stall abort)", async () => {
+    const { rpg } = await pipelineThroughPhase4();
+    let calls = 0;
+    const client: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        calls++;
+        // Simulate the openai-provider's stall-abort error name
+        // and message.
+        const e = new Error("[glm/glm-5.1] This operation was aborted");
+        e.name = "AbortError";
+        throw e;
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    const result = await designInterfaces(client, rpg, { description: "x" });
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/LLM call failed|aborted/i);
+    // Each retry budget burns at least a couple of calls; the
+    // orchestrator gracefully gives up rather than crashing.
+    expect(calls).toBeGreaterThan(0);
+  });
 });
 
 describe("parseInterfaceResponse — validation", () => {

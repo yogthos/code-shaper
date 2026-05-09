@@ -15,7 +15,14 @@ import type {
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
-const DEFAULT_STALL_TIMEOUT_MS = 60_000;
+// GLM (and other large hosted models) regularly pause between
+// tokens for 60-120s on hard prompts. The previous 60s stall
+// budget was too aggressive — a single quiet stretch would
+// trigger an abort + retry, and retries on long prompts are
+// expensive. 180s gives a comfortable margin without letting a
+// truly stuck connection hang forever (the totalTimeoutMs is
+// still the hard cap).
+const DEFAULT_STALL_TIMEOUT_MS = 180_000;
 const MAX_RETRIES = 3;
 const INITIAL_RETRY_DELAY_MS = 1000;
 

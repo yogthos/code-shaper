@@ -310,12 +310,25 @@ async function runOneInterfaceCall(
         content: `Your previous response failed validation: ${lastError}\nReturn corrected JSON now.`,
       });
     }
-    const response = await callWithStallDetection(client, messages, {
-      responseFormat: { type: "json_object" },
-      ...(input.temperature !== undefined
-        ? { temperature: input.temperature }
-        : {}),
-    });
+    let response;
+    try {
+      response = await callWithStallDetection(client, messages, {
+        responseFormat: { type: "json_object" },
+        ...(input.temperature !== undefined
+          ? { temperature: input.temperature }
+          : {}),
+      });
+    } catch (e) {
+      // The LLM or its retry budget gave up. Treat as a parse-
+      // shaped failure so the outer attempt loop can retry from
+      // scratch (the assistant message hasn't been added to the
+      // conversation yet, so the next iteration starts clean).
+      // Without this catch a transient stall takes down phase 5
+      // entirely.
+      lastError = `LLM call failed: ${e instanceof Error ? e.message : String(e)}`;
+      lastResponse = null;
+      continue;
+    }
     const parsed = parseInterfaceResponse(
       response.content,
       scopeLeaves,
