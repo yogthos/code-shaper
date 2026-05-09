@@ -173,7 +173,7 @@ describe("buildImplementations — maxConcurrentLeaves", () => {
             const name = m?.[1] ?? "fn";
             return { content: ADD_TEST(name), finishReason: "stop" };
           }
-          if (sys.includes("Implementor agent") && opts?.tools) {
+          if (opts?.tools && opts?.tools) {
             // Dev loop: figure out the active leaf from the user
             // prompt header "Implement function `<name>`".
             const userPrompt = messages[1]!.content;
@@ -271,7 +271,7 @@ describe("buildImplementations — maxConcurrentLeaves", () => {
               finishReason: "stop",
             };
           }
-          if (sys.includes("Implementor agent") && opts?.tools) {
+          if (opts?.tools && opts?.tools) {
             const userPrompt = messages[1]!.content;
             const nameMatch = /Implement function `(\w+)`/.exec(userPrompt);
             const name = nameMatch?.[1] ?? "fn";

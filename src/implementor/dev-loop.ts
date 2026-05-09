@@ -258,7 +258,7 @@ export async function runLeafDevLoop(
         trail,
         iterations: i + 1,
         ...(body === undefined
-          ? { error: "agent terminated without producing a body for the active leaf" }
+          ? { error: "terminated without producing an implementation for the task" }
           : {}),
       };
     }
@@ -538,12 +538,17 @@ async function applyTool(
       };
     }
     case "run_test": {
+      if (!input.outDir) {
+        return {
+          ok: false,
+          toolResult: {
+            error: "run_test requires outDir. The harness was started without one.",
+          },
+          error: "run_test: outDir not configured",
+        };
+      }
       const r = await runTestTool({
-        rpg: input.rpg,
-        bodyByLeafId: input.bodyByLeafId,
-        testsByLeafId: input.testsByLeafId,
-        activeLeafId: input.leaf.leafCapabilityId,
-        workDir: input.workDir,
+        outDir: input.outDir,
         ...(input.testTimeoutMs !== undefined ? { timeoutMs: input.testTimeoutMs } : {}),
       });
       return {
@@ -552,7 +557,7 @@ async function applyTool(
           ok: r.ok,
           ...(r.output ? { output: tailTruncate(r.output, TOOL_RESULT_OUTPUT_CAP) } : {}),
         },
-        summary: r.ok ? "test passed" : "test failed",
+        summary: r.ok ? "all tests passed" : "tests failed",
       };
     }
     case "add_dependency":
@@ -745,32 +750,39 @@ function tailTruncateLines(lines: string[], cap: number): string[] {
 
 // ── System prompt + user prompt + tool defs ──────────────────────────
 
-const SYSTEM_PROMPT = `You are an Implementor agent working on a TypeScript project. You have tools to explore the project, edit one specific file, type-check, and run tests. Your goal: make the active leaf's test pass.
+const SYSTEM_PROMPT = `You are a software engineer implementing a feature in a TypeScript project, using test-driven development. You have tools to explore the project, edit any file, type-check, and run tests.
 
-Work the way a developer would: read what you don't know before changing it. When a test fails, look at the error, decide whether the body is wrong or whether you're missing context (an import, a type, a sibling helper), and act accordingly.
+Workflow (TDD):
+  1. Read the task description carefully.
+  2. Write a test (or several) that capture the contract — meaningful behavior, not just a smoke check. Place the test next to the source file or under a tests/ folder, per the project's existing convention.
+  3. Run the tests. They should fail (the implementation isn't there yet).
+  4. Implement the body until tests pass.
+  5. Use typecheck to catch type errors before running tests.
+  6. Iterate — read what you don't know before changing it. When a test fails, decide whether the implementation is wrong or your test contract was off.
+  7. Call Terminate when the tests you wrote pass and you're confident the feature is correctly implemented.
 
 Tools:
-  list_files                      List every file in the project. No args. Use first to see what exists.
-  read_file(path)                 Read one file's current source. Use to inspect siblings before importing or referencing them.
-  list_symbols_in_file(path)      Top-level exports (function/class/const/type/interface) of a file with their kinds + line numbers. Cheaper than read_file when you only want the surface.
+  list_files                      List every file in the project. Use first to see what exists.
+  read_file(path)                 Read one file's current source. Use to inspect siblings before importing them.
+  list_symbols_in_file(path)      Top-level exports (function/class/const/type/interface) with kinds + line numbers. Cheaper than read_file when you only want the surface.
   find_definition(name)           AST-exact: where is a function/class/const with this name declared? Returns matches across all .ts files.
   find_callers(name)              AST-exact: which files reference this name as an identifier? Skips comments and string contents. Excludes the definition site.
-  find_imports_of(module_path)    AST-exact: which files import from this module path? Useful before refactoring a module's exports.
+  find_imports_of(module_path)    AST-exact: which files import from this module path?
   edit_file(path, old_str, new_str)
-                                  String replacement. Works on ANY file in the project (source, tests, package.json, vitest.config.ts, tsconfig.json, etc.). old_str must match the file's CURRENT content exactly once. Use read_file to refresh your view after edits.
-  typecheck                       Run tsc --noEmit on the project. Returns diagnostics scoped to the active file. Useful after a non-trivial edit before running tests.
-  run_test                        Run the active leaf's test. Returns ok=true or the failing assertion.
+                                  String replacement on ANY file in the project (source, tests, package.json, vitest.config.ts, tsconfig.json, etc.). old_str must match the file's CURRENT content exactly once. Re-read after each edit.
+  typecheck                       Run tsc --noEmit. Returns diagnostics. Run after non-trivial edits before running tests.
+  run_test                        Run the project's tests (vitest run). Returns pass/fail + assertion output.
   add_dependency(name, version, which)
-                                  Install a runtime ("which":"runtime") or dev ("which":"dev") dependency. Use when run_test fails with "Cannot find module X". If a chosen binding doesn't compile (gyp / node-gyp errors), use remove_dependency + add_dependency to swap.
-  remove_dependency(name)         Strip a package from package.json + re-install.
-  npm_run(script)                 Run an existing npm script. Returns exit code + stdout/stderr. Use to verify a remediation worked before terminating.
-  Terminate(reason)               End the session. Call when you believe the active leaf is done. The orchestrator will run the test once more to verify.
+                                  Install a runtime ("which":"runtime") or dev ("which":"dev") dependency. Use when imports fail with "Cannot find module X".
+  remove_dependency(name)         Strip a package + re-install. Useful before swapping bindings (e.g. broken native deps).
+  npm_run(script)                 Run an existing npm script. Returns exit code + stdout/stderr.
+  Terminate(reason)               End the session. Call when the tests you wrote pass and the feature is correctly implemented.
 
 Pick exactly ONE tool per turn.`;
 
 function buildUserPrompt(input: DevLoopInput): string {
   const lines: string[] = [];
-  lines.push(`# Active leaf`);
+  lines.push(`# Task`);
   lines.push("");
   if (input.leaf.kind === "method" && input.leaf.ownerClassName) {
     lines.push(
@@ -785,15 +797,10 @@ function buildUserPrompt(input: DevLoopInput): string {
   lines.push("Description:");
   lines.push(input.leaf.description.trim() || "(no description provided)");
   lines.push("");
-  const testSrc = input.testsByLeafId.get(input.leaf.leafCapabilityId);
-  if (testSrc) {
-    lines.push("# Test that must pass");
-    lines.push("");
-    lines.push("```typescript");
-    lines.push(testSrc);
-    lines.push("```");
-    lines.push("");
-  }
+  lines.push(
+    "Approach: write tests that capture this behavior, then implement. Iterate until your tests pass.",
+  );
+  lines.push("");
   if (input.failureMessage) {
     lines.push("# Previous failure");
     lines.push("");
@@ -908,7 +915,7 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Repo-relative path of the active leaf's file OR an infra file." },
+          path: { type: "string", description: "Repo-relative path of any file in the project." },
           old_str: { type: "string", description: "Existing snippet to replace. Must match exactly once." },
           new_str: { type: "string", description: "Replacement snippet." },
         },
@@ -920,7 +927,7 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
     type: "function",
     function: {
       name: "typecheck",
-      description: "Run tsc --noEmit. Returns diagnostics scoped to the active file.",
+      description: "Run tsc --noEmit on the project. Returns diagnostics for type errors.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -928,7 +935,7 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
     type: "function",
     function: {
       name: "run_test",
-      description: "Run the active leaf's test. Returns ok or the failing assertion.",
+      description: "Run the project's tests (vitest run). Returns pass/fail + assertion output.",
       parameters: { type: "object", properties: {} },
     },
   },

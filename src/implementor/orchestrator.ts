@@ -749,12 +749,20 @@ export async function buildImplementations(
       });
     }
 
-    const finalTestRun = await runTests(rpg, {
-      bodyByLeafId,
-      testsByLeafId,
-      workDir: sharedWorkDirForFinalRun,
-      timeoutMs: input.finalRunTimeoutMs ?? 300_000,
-    });
+    // V3: when useDevLoop is on, skip the harness's
+    // testsByLeafId-based final run — the dev loop's TDD model
+    // means tests live on disk in outDir under whatever paths
+    // the model chose. The future phase 7b (V4) will run a
+    // project-level vitest there. For now, take the per-leaf
+    // results as authoritative.
+    const finalTestRun = input.useDevLoop
+      ? undefined
+      : await runTests(rpg, {
+          bodyByLeafId,
+          testsByLeafId,
+          workDir: sharedWorkDirForFinalRun,
+          timeoutMs: input.finalRunTimeoutMs ?? 300_000,
+        });
 
     if (input.outDir) {
       await materializeRPG(rpg, input.outDir);
@@ -764,12 +772,13 @@ export async function buildImplementations(
       // Every leaf must have produced a passing implementation. A
       // leaf may appear in `leafResults` multiple times (once per
       // attempt round); we look at the LAST result for each.
-      lastResultByLeafIsOk(leafResults) && finalTestRun.ok;
+      lastResultByLeafIsOk(leafResults) &&
+      (finalTestRun ? finalTestRun.ok : true);
     return {
       ok,
       leafResults,
       decomposeDecisions,
-      finalTestRun,
+      ...(finalTestRun ? { finalTestRun } : {}),
       workDir: sharedWorkDirForFinalRun,
     };
   } finally {

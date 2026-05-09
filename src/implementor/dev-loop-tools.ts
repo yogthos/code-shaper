@@ -36,7 +36,6 @@ import {
   extractFunctionBody,
   extractMethodBody,
 } from "./edit-tools.js";
-import { runTests, leafToTestFilename } from "./test-harness.js";
 import { isInfraPath } from "../architect/infra-mutex.js";
 import { withFileLock } from "../architect/file-lock.js";
 
@@ -706,72 +705,86 @@ function lineReferencesPath(line: string, repoRelative: string): boolean {
 
 // ── runTestTool ──────────────────────────────────────────────────────
 //
-// Thin wrapper over the existing `runTests` harness that runs ONE
-// leaf's test against the current bodyByLeafId / testsByLeafId
-// state. Lets the dev-loop agent verify a code change before
-// terminating, the same way a developer would type `vitest run
-// some.test.ts` mid-edit.
+// V3: spawns `vitest run` directly in outDir. The dev loop's TDD
+// model means the model writes its OWN tests (via edit_file) into
+// outDir; we just run them. No more bodyByLeafId / testsByLeafId
+// staging — disk is canonical.
+//
+// Concurrent run_test calls across workers serialize via the
+// per-file lock keyed on outDir + ".vitest-run" so vitest's
+// .vite cache state stays consistent.
 
 export interface RunTestInput {
-  rpg: RPG;
-  bodyByLeafId: Map<string, string>;
-  testsByLeafId: Map<string, string>;
-  /** Capability id of the leaf currently being implemented. The
-   *  test source for THIS leaf is what gets run. */
-  activeLeafId: string;
-  /** Optional reusable harness work directory. When omitted the
-   *  underlying runTests creates+disposes its own. */
-  workDir?: string;
-  /** Wall-clock cap. Default 120s — same as `runTests` default. */
+  /** Project directory to run tests in. Required. */
+  outDir: string;
+  /** Wall-clock cap on the vitest run. Default 120s. */
   timeoutMs?: number;
 }
 
 export interface RunTestResult {
-  /** True iff every assertion in the leaf's test passed. */
+  /** True iff vitest exited 0 (every test passed). */
   ok: boolean;
-  /** Tail-truncated assertion output / failure message. Empty
-   *  on full pass. */
+  /** Tail-truncated stdout+stderr from vitest. */
   output: string;
-  /** When the harness itself crashed (vitest spawn error, tsc
-   *  parse fail in another file, etc.) — the agent should
-   *  generally `read_file` the harness's outDir to investigate. */
-  fatal?: string;
 }
 
 const RUN_TEST_OUTPUT_TAIL_CAP = 4000;
+const RUN_TEST_DEFAULT_TIMEOUT_MS = 120_000;
 
 export async function runTestTool(input: RunTestInput): Promise<RunTestResult> {
-  // Guard: the active leaf must have a test source. Without one,
-  // there's nothing to run. Better to return a clean error than
-  // to feed the model an empty pass.
-  if (!input.testsByLeafId.has(input.activeLeafId)) {
-    return {
-      ok: false,
-      output: `no test source for leaf ${JSON.stringify(input.activeLeafId)} — write the test before invoking run_test`,
-    };
-  }
-  const result = await runTests(input.rpg, {
-    bodyByLeafId: input.bodyByLeafId,
-    testsByLeafId: input.testsByLeafId,
-    leafIds: [input.activeLeafId],
-    ...(input.workDir !== undefined ? { workDir: input.workDir } : {}),
-    ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+  const lockKey = nodePath.join(input.outDir, ".vitest-run");
+  return await withFileLock(lockKey, async () => {
+    const timeoutMs = input.timeoutMs ?? RUN_TEST_DEFAULT_TIMEOUT_MS;
+    return new Promise<RunTestResult>((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      // Resolve vitest from the harness's installed copy — same
+      // pattern typecheckTool uses for tsc. Avoids npx download.
+      let vitestBin: string;
+      try {
+        const req = createRequire(import.meta.url);
+        vitestBin = req.resolve("vitest/vitest.mjs");
+      } catch {
+        // Fallback: vitest CLI in node_modules/.bin
+        vitestBin = nodePath.join(input.outDir, "node_modules", ".bin", "vitest");
+      }
+      const child = spawn(process.execPath, [vitestBin, "run"], {
+        cwd: input.outDir,
+        env: process.env,
+      });
+      child.stdout.on("data", (d) => (stdout += d.toString()));
+      child.stderr.on("data", (d) => (stderr += d.toString()));
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
+      child.on("error", (e) => {
+        clearTimeout(timer);
+        resolve({
+          ok: false,
+          output: `vitest spawn failed: ${e.message}`,
+        });
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (timedOut) {
+          resolve({
+            ok: false,
+            output: `vitest timed out after ${timeoutMs}ms\nstderr tail:\n${tailTruncate(stderr, 1000)}`,
+          });
+          return;
+        }
+        // Combine stdout+stderr; tests dump to stderr at vitest's
+        // default reporter for failures.
+        const combined = stdout + (stderr ? "\n" + stderr : "");
+        resolve({
+          ok: code === 0,
+          output: tailTruncate(combined.trim(), RUN_TEST_OUTPUT_TAIL_CAP),
+        });
+      });
+    });
   });
-  if (result.fatal) {
-    return { ok: false, output: tailTruncate(result.fatal, RUN_TEST_OUTPUT_TAIL_CAP), fatal: result.fatal };
-  }
-  const slug = leafToTestFilename(input.activeLeafId).replace(".test.ts", "");
-  const outcome = result.byLeaf.get(slug);
-  if (!outcome) {
-    return {
-      ok: false,
-      output: `harness produced no outcome for leaf ${JSON.stringify(input.activeLeafId)} (slug ${JSON.stringify(slug)}). Other outcomes: ${[...result.byLeaf.keys()].join(", ") || "(none)"}`,
-    };
-  }
-  return {
-    ok: outcome.ok,
-    output: outcome.ok ? "" : tailTruncate(outcome.failureMessage, RUN_TEST_OUTPUT_TAIL_CAP),
-  };
 }
 
 function tailTruncate(s: string, cap: number): string {

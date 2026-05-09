@@ -160,7 +160,7 @@ describe("Q4-D — adaptive bail on dev-loop exhaustion", () => {
               finishReason: "stop",
             };
           }
-          if (sys.includes("Implementor agent") && opts?.tools) {
+          if (opts?.tools && opts?.tools) {
             return {
               content: "",
               finishReason: "tool_calls",

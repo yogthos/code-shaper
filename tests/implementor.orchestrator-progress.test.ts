@@ -146,7 +146,7 @@ describe("buildImplementations — outDir propagation", () => {
               finishReason: "stop",
             };
           }
-          if (sys.includes("Implementor agent") && opts?.tools) {
+          if (opts?.tools && opts?.tools) {
             const toolMsgs = messages.filter((m) => m.role === "tool");
             if (toolMsgs.length === 0) {
               return {
@@ -235,7 +235,7 @@ describe("buildImplementations — onLeafProgress failureSummary", () => {
               finishReason: "stop",
             };
           }
-          if (sys.includes("Implementor agent") && opts?.tools) {
+          if (opts?.tools && opts?.tools) {
             // Always list_files. Never terminate.
             return {
               content: "",

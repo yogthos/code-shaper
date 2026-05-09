@@ -226,7 +226,11 @@ export async function implementLeaf(
   //    AUTHOR with parse-error feedback while the test contract is
   //    still mutable.
   let testSource = input.testsByLeafId.get(leafId) ?? "";
-  if (!testSource) {
+  // V3: when useDevLoop is on, the dev loop's TDD model means the
+  // model writes its OWN tests via edit_file. Skip the harness-
+  // level test author entirely. The §D.2 / streaming author
+  // paths still use it.
+  if (!testSource && !input.useDevLoop) {
     const maxTestAttempts = input.maxTestAuthorAttempts ?? 3;
     const renderedFile = renderTypeScriptFile({
       file: input.hostFile,
@@ -440,11 +444,21 @@ export async function implementLeaf(
       body = r.body;
       priorBodyEmpty = false;
       lastFatal = undefined;
-      // Reset the exhaustion counter on a successful dev-loop
-      // termination — different leaf state, different odds.
       devLoopExhaustedCount = 0;
-      // bodyByLeafId is already updated by the dev loop's edit
-      // tools; nothing more to do here.
+      // V3: the dev loop's TDD model means the model wrote its
+      // own tests AND ran them via run_test before calling
+      // Terminate. Trust the terminal state — return ok now
+      // without a duplicate post-loop verify. Phase 7b will
+      // run all project tests as the final correctness gate.
+      return {
+        leafId,
+        ok: true,
+        body,
+        testSource: input.testsByLeafId.get(leafId) ?? "",
+        attempts: i + 1,
+        ...(input.diagnosis ? {} : {}),
+        testRewrites,
+      };
     } else if (input.useEditTools) {
       // §D.2 tool-using author: the LLM picks an edit tool scoped
       // to this leaf's kind, emits structured args, the harness

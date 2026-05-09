@@ -123,7 +123,7 @@ describe("implementLeaf — useDevLoop", () => {
           }
           // Dev loop: tool calls. Drive a 2-step script:
           // edit_file → Terminate.
-          if (sys.includes("Implementor agent") && opts?.tools) {
+          if (opts?.tools && opts?.tools) {
             // Look at how many tool messages have already come
             // back to determine which step we're on. tool messages
             // = number of completed tool calls so far.
