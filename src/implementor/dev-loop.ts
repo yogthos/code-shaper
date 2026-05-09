@@ -513,6 +513,46 @@ async function applyTool(
         summary: `rewrite_test (${rewriteTestCounter.count}/${rewriteTestCounter.max})`,
       };
     }
+    case "skip_with_smoke_test": {
+      // Step S6: shorthand for rewrite_test that generates a
+      // trivial shape-check test for the active leaf. Use when
+      // the original test contract is genuinely unwinnable
+      // (browser-only code with no jsdom, async WASM init that
+      // can't be mocked cheaply, env-dependent classes).
+      // Consumes one slot of the rewrite_test budget — the
+      // model can't run away with skips.
+      if (rewriteTestCounter.count >= rewriteTestCounter.max) {
+        return {
+          ok: false,
+          toolResult: {
+            error: `skip_with_smoke_test: rewrite budget exhausted (${rewriteTestCounter.max} used). The leaf must satisfy its current test.`,
+          },
+          error: "skip budget exhausted",
+        };
+      }
+      const reason = args["reason"];
+      if (typeof reason !== "string" || reason.trim().length === 0) {
+        const msg = "skip_with_smoke_test: reason must be a non-empty string explaining why the leaf is genuinely untestable in isolation";
+        return {
+          ok: false,
+          toolResult: { error: msg },
+          error: msg,
+        };
+      }
+      const smokeSource = buildSmokeTest(input.leaf, input.hostFile, reason);
+      input.testsByLeafId.set(input.leaf.leafCapabilityId, smokeSource);
+      rewriteTestCounter.count++;
+      return {
+        ok: true,
+        toolResult: {
+          ok: true,
+          smoke_test_installed: true,
+          rewrites_used: rewriteTestCounter.count,
+          rewrites_remaining: rewriteTestCounter.max - rewriteTestCounter.count,
+        },
+        summary: `skip_with_smoke_test (${rewriteTestCounter.count}/${rewriteTestCounter.max}): ${reason.slice(0, 80)}`,
+      };
+    }
     case "edit_function_in_file":
     case "edit_whole_class_in_file":
     case "edit_method_of_class_in_file":
@@ -529,7 +569,7 @@ async function applyTool(
       return {
         ok: false,
         toolResult: {
-          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, edit_file, rewrite_test, typecheck, run_test, edit_function_in_file, edit_whole_class_in_file, edit_method_of_class_in_file, edit_imports_and_assignments_in_file, add_dependency, remove_dependency, set_script, npm_run, Terminate.`,
+          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, edit_file, rewrite_test, skip_with_smoke_test, typecheck, run_test, edit_function_in_file, edit_whole_class_in_file, edit_method_of_class_in_file, edit_imports_and_assignments_in_file, add_dependency, remove_dependency, set_script, npm_run, Terminate.`,
         },
         error: `unknown tool: ${toolName}`,
       };
@@ -863,6 +903,52 @@ function extractBodyForActiveLeaf(
  *  because removing an obsolete import is a legitimate edit;
  *  the model controls the import set as long as the dev loop
  *  is active. */
+/** Step S6: synthesize a trivial shape-check test for the
+ *  active leaf. The shape varies by leaf kind:
+ *    - function: `expect(typeof <name>).toBe("function")`
+ *    - method:   `expect(<Class>.prototype.<method>).toBeDefined()`
+ *  The test imports from the host file using the same
+ *  relative-import convention the test author uses. */
+function buildSmokeTest(
+  leaf: PlannedInterface,
+  hostFile: FileNode,
+  reason: string,
+): string {
+  // Test files live at tests/leaves/<slug>.test.ts. Their
+  // imports use ../../<src-relative path> with .js extension.
+  const relPath = `../../${stripExt(hostFile.path)}.js`;
+  const lines: string[] = [];
+  lines.push(`// Smoke test — leaf marked unwinnable for full unit test.`);
+  lines.push(`// Reason: ${reason.replace(/\n/g, " ").slice(0, 200)}`);
+  lines.push(`import { describe, it, expect } from "vitest";`);
+  if (leaf.kind === "function") {
+    lines.push(`import { ${leaf.name} } from ${JSON.stringify(relPath)};`);
+    lines.push(``);
+    lines.push(`describe(${JSON.stringify(leaf.name + " (smoke)")}, () => {`);
+    lines.push(`  it("is callable", () => {`);
+    lines.push(`    expect(typeof ${leaf.name}).toBe("function");`);
+    lines.push(`  });`);
+    lines.push(`});`);
+  } else {
+    // method: assert prototype carries the method.
+    const cls = leaf.ownerClassName ?? "AnonClass";
+    lines.push(`import { ${cls} } from ${JSON.stringify(relPath)};`);
+    lines.push(``);
+    lines.push(`describe(${JSON.stringify(`${cls}.${leaf.name} (smoke)`)}, () => {`);
+    lines.push(`  it("exists on the prototype", () => {`);
+    lines.push(`    expect(typeof (${cls}.prototype as Record<string, unknown>)[${JSON.stringify(leaf.name)}]).toBe("function");`);
+    lines.push(`  });`);
+    lines.push(`});`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+function stripExt(p: string): string {
+  const idx = p.lastIndexOf(".");
+  if (idx < 0) return p;
+  return p.slice(0, idx);
+}
+
 function syncImportsFromSource(input: DevLoopInput, newSource: string): void {
   input.hostFile.rawImports = extractTopLevelImports(newSource).map((i) => ({
     name: i.name,
@@ -895,6 +981,7 @@ Tools:
   typecheck                       Run tsc --noEmit on the project. Returns diagnostics scoped to the active file. Useful after a non-trivial edit before running tests.
   run_test                        Run the active leaf's test. Returns ok=true or the failing assertion.
   rewrite_test(new_source)        Replace the leaf's test source. Use when the existing test contract is unwinnable (e.g. browser-only code that needs jsdom, async WASM init, environment-dependent classes) — write a smoke test or restructure the assertions. Bounded by a small budget; the body still has to satisfy whatever the rewrite asserts.
+  skip_with_smoke_test(reason)    Replace the leaf's test with a harness-generated trivial shape check (e.g. expect(typeof fn).toBe("function")). For leaves that genuinely have no meaningful unit test (Preact hooks, WASM init, env-dependent singletons). Consumes ONE rewrite_test budget slot. Provide a clear reason string; that goes into the test as a comment for traceability.
   edit_function_in_file(function_name, new_source)
                                   AST-aware: replace a top-level function. Stricter than edit_file but reliable for whole-function rewrites.
   edit_method_of_class_in_file(class_name, method_name, new_source)
@@ -1029,6 +1116,24 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
           },
         },
         required: ["new_source"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "skip_with_smoke_test",
+      description:
+        'Replace the leaf\'s test with a harness-generated shape check (e.g. expect(typeof fn).toBe("function")). For leaves that genuinely have no meaningful unit test (Preact hooks, WASM init, env-dependent singletons). Consumes ONE rewrite_test budget slot. Provide a clear reason string explaining why the leaf is untestable in isolation — gets logged in the smoke test as a comment.',
+      parameters: {
+        type: "object",
+        properties: {
+          reason: {
+            type: "string",
+            description: "Why this leaf is genuinely untestable in isolation.",
+          },
+        },
+        required: ["reason"],
       },
     },
   },

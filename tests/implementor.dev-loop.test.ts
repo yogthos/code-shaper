@@ -724,6 +724,91 @@ describe("runLeafDevLoop — rewrite_test (S5)", () => {
     },
   );
 
+  // Step S6: skip_with_smoke_test generates a trivial shape
+  // check for the leaf when no meaningful unit test exists.
+  // Consumes one rewrite_test budget slot.
+  it(
+    "skip_with_smoke_test installs a generated shape-check test (S6)",
+    { timeout: 60_000 },
+    async () => {
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const tests = new Map([
+        [
+          "cap:add",
+          `import { describe, it, expect } from "vitest";\nimport { add } from "../../src/add.js";\ndescribe("add", () => { it("strict", () => { expect(add(2,3)).toBe(5); }); });\n`,
+        ],
+      ]);
+      const { client } = scriptedClient([
+        // Edit body to a wrong value first.
+        {
+          name: "edit_file",
+          args: {
+            path: "src/add.ts",
+            old_str: 'throw new Error("add: not implemented");',
+            new_str: "return 0;",
+          },
+        },
+        {
+          name: "skip_with_smoke_test",
+          args: {
+            reason:
+              "test is browser-only and needs jsdom; smoke check is the right granularity here",
+          },
+        },
+        { name: "Terminate", args: {} },
+      ]);
+      const r = await runLeafDevLoop(client, {
+        leaf: f.interfacePlan!.entries[0]!,
+        hostFile: f,
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: tests,
+        workDir,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      const newTest = tests.get("cap:add")!;
+      expect(newTest).toContain("(smoke)");
+      expect(newTest).toContain('expect(typeof add).toBe("function")');
+      expect(newTest).toContain("Reason: test is browser-only");
+      const skip = r.trail.find((t) => t.tool === "skip_with_smoke_test");
+      expect(skip).toBeDefined();
+      expect(skip!.ok).toBe(true);
+    },
+  );
+
+  it("skip_with_smoke_test rejects empty reason", async () => {
+    const f = mkFile({
+      id: "file:add",
+      path: "src/add.ts",
+      interfacePlan: ADD_PLAN,
+    });
+    const rpg = rpgWithFiles([f]);
+    const tests = new Map([
+      ["cap:add", `import { describe, it } from "vitest";\ndescribe("x", () => { it("ok", () => {}); });\n`],
+    ]);
+    const { client } = scriptedClient([
+      { name: "skip_with_smoke_test", args: { reason: "" } },
+      { name: "Terminate", args: {} },
+    ]);
+    const r = await runLeafDevLoop(client, {
+      leaf: f.interfacePlan!.entries[0]!,
+      hostFile: f,
+      rpg,
+      bodyByLeafId: new Map([["cap:add", "return 0;"]]),
+      testsByLeafId: tests,
+      workDir,
+    });
+    const skip = r.trail.find((t) => t.tool === "skip_with_smoke_test");
+    expect(skip).toBeDefined();
+    expect(skip!.ok).toBe(false);
+    expect(skip!.error).toMatch(/non-empty string|reason/);
+  });
+
   it(
     "rejects rewrite_test when new_source doesn't parse as TypeScript",
     async () => {
