@@ -33,6 +33,12 @@ import {
   runTestTool,
 } from "./dev-loop-tools.js";
 import {
+  listSymbolsInFile,
+  findDefinition,
+  findCallers,
+  findImportsOf,
+} from "./ast-queries.js";
+import {
   addDependency,
   removeDependency,
   npmRun,
@@ -339,6 +345,119 @@ async function applyTool(
         ...(r.ok ? { summary: `read ${p} (${(r.content ?? "").length} chars)` } : {}),
       };
     }
+    case "list_symbols_in_file": {
+      const p = args["path"];
+      if (typeof p !== "string") {
+        return {
+          ok: false,
+          toolResult: { error: "path must be a string" },
+          error: "path must be a string",
+        };
+      }
+      if (!input.outDir) {
+        return {
+          ok: false,
+          toolResult: { error: "list_symbols_in_file requires outDir" },
+          error: "outDir not configured",
+        };
+      }
+      const r = await listSymbolsInFile({ outDir: input.outDir, path: p });
+      return {
+        ok: r.ok,
+        toolResult: r.ok ? { symbols: r.symbols } : { error: r.error },
+        ...(r.error ? { error: r.error } : {}),
+        ...(r.ok
+          ? { summary: `${r.symbols!.length} symbols in ${p}` }
+          : {}),
+      };
+    }
+    case "find_definition": {
+      const name = args["name"];
+      if (typeof name !== "string") {
+        return {
+          ok: false,
+          toolResult: { error: "name must be a string" },
+          error: "name must be a string",
+        };
+      }
+      if (!input.outDir) {
+        return {
+          ok: false,
+          toolResult: { error: "find_definition requires outDir" },
+          error: "outDir not configured",
+        };
+      }
+      const r = await findDefinition({ outDir: input.outDir, name });
+      return {
+        ok: r.ok,
+        toolResult: r.ok ? { matches: r.matches } : { error: r.error },
+        ...(r.error ? { error: r.error } : {}),
+        ...(r.ok
+          ? {
+              summary: `find_definition ${name} → ${r.matches!.length} match(es)`,
+            }
+          : {}),
+      };
+    }
+    case "find_callers": {
+      const name = args["name"];
+      if (typeof name !== "string") {
+        return {
+          ok: false,
+          toolResult: { error: "name must be a string" },
+          error: "name must be a string",
+        };
+      }
+      if (!input.outDir) {
+        return {
+          ok: false,
+          toolResult: { error: "find_callers requires outDir" },
+          error: "outDir not configured",
+        };
+      }
+      const r = await findCallers({ outDir: input.outDir, name });
+      return {
+        ok: r.ok,
+        toolResult: r.ok ? { matches: r.matches } : { error: r.error },
+        ...(r.error ? { error: r.error } : {}),
+        ...(r.ok
+          ? {
+              summary: `find_callers ${name} → ${r.matches!.length} caller(s)`,
+            }
+          : {}),
+      };
+    }
+    case "find_imports_of": {
+      const modulePath = args["module_path"];
+      if (typeof modulePath !== "string") {
+        return {
+          ok: false,
+          toolResult: { error: "module_path must be a string" },
+          error: "module_path must be a string",
+        };
+      }
+      if (!input.outDir) {
+        return {
+          ok: false,
+          toolResult: { error: "find_imports_of requires outDir" },
+          error: "outDir not configured",
+        };
+      }
+      const r = await findImportsOf({
+        outDir: input.outDir,
+        modulePath,
+      });
+      return {
+        ok: r.ok,
+        toolResult: r.ok ? { matches: r.matches } : { error: r.error },
+        ...(r.error ? { error: r.error } : {}),
+        ...(r.ok
+          ? {
+              summary: `find_imports_of ${modulePath} → ${r.matches!.length} importer(s)`,
+            }
+          : {}),
+      };
+    }
     case "edit_file": {
       const p = args["path"];
       const oldStr = args["old_str"];
@@ -445,7 +564,7 @@ async function applyTool(
       return {
         ok: false,
         toolResult: {
-          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, edit_file, typecheck, run_test, add_dependency, remove_dependency, npm_run, Terminate.`,
+          error: `unknown tool ${JSON.stringify(toolName)}. Valid: list_files, read_file, list_symbols_in_file, find_definition, find_callers, find_imports_of, edit_file, typecheck, run_test, add_dependency, remove_dependency, npm_run, Terminate.`,
         },
         error: `unknown tool: ${toolName}`,
       };
@@ -633,6 +752,10 @@ Work the way a developer would: read what you don't know before changing it. Whe
 Tools:
   list_files                      List every file in the project. No args. Use first to see what exists.
   read_file(path)                 Read one file's current source. Use to inspect siblings before importing or referencing them.
+  list_symbols_in_file(path)      Top-level exports (function/class/const/type/interface) of a file with their kinds + line numbers. Cheaper than read_file when you only want the surface.
+  find_definition(name)           AST-exact: where is a function/class/const with this name declared? Returns matches across all .ts files.
+  find_callers(name)              AST-exact: which files reference this name as an identifier? Skips comments and string contents. Excludes the definition site.
+  find_imports_of(module_path)    AST-exact: which files import from this module path? Useful before refactoring a module's exports.
   edit_file(path, old_str, new_str)
                                   String replacement. Works on ANY file in the project (source, tests, package.json, vitest.config.ts, tsconfig.json, etc.). old_str must match the file's CURRENT content exactly once. Use read_file to refresh your view after edits.
   typecheck                       Run tsc --noEmit on the project. Returns diagnostics scoped to the active file. Useful after a non-trivial edit before running tests.
@@ -716,9 +839,72 @@ const TOOL_DEFS: NonNullable<ChatOptions["tools"]> = [
   {
     type: "function",
     function: {
+      name: "list_symbols_in_file",
+      description:
+        "Return top-level exports of a file: function/class/method/const/type/interface declarations with their kinds + line numbers. Cheaper than read_file when you only need the surface.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Repo-relative path." },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_definition",
+      description:
+        "AST-exact lookup: which file + line declares the function/class/const/type/interface with this name? Returns all matches across the project.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Symbol name." },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_callers",
+      description:
+        "AST-exact lookup: which files reference this symbol as an identifier? Skips comments and string contents (no false positives). Excludes the symbol's own declaration site.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Symbol name to find references for." },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_imports_of",
+      description:
+        "AST-exact lookup: which files have an import statement from this module path? Useful before refactoring a module's exports.",
+      parameters: {
+        type: "object",
+        properties: {
+          module_path: {
+            type: "string",
+            description: "Module specifier as it appears in import (e.g. \"./errors.js\").",
+          },
+        },
+        required: ["module_path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "edit_file",
       description:
-        'Replace a single occurrence of old_str with new_str. Allowed paths: (1) the active leaf\'s host file (source code), (2) project infra files: package.json, tsconfig.json, vitest.config.{ts,mts,js}, .env. Use infra edits to fix test environment issues — e.g. set environment: "jsdom" in vitest.config.ts, add path aliases to tsconfig.json. old_str must match the file\'s CURRENT content exactly once.',
+        "String replacement. Works on ANY file in the project — source, tests, package.json, vitest.config.ts, tsconfig.json, etc. old_str must match the file's CURRENT content exactly once. Use read_file to refresh your view after edits.",
       parameters: {
         type: "object",
         properties: {
