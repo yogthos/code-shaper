@@ -280,6 +280,298 @@ describe("runLeafDevLoop — read tools", () => {
   );
 });
 
+describe("runLeafDevLoop — parallel tool calls (V7)", () => {
+  it(
+    "applies all tool calls in a multi-call turn and emits one tool message per call_id",
+    { timeout: 60_000 },
+    async () => {
+      const errors = mkFile({
+        id: "file:errors",
+        path: "src/errors.ts",
+        content:
+          "export class TodoValidationError extends Error {\n  constructor(msg: string) { super(msg); this.name = 'TodoValidationError'; }\n}\n",
+      });
+      const validation = mkFile({
+        id: "file:validation",
+        path: "src/validation.ts",
+        interfacePlan: {
+          entries: [
+            {
+              leafCapabilityId: "cap:validate",
+              kind: "function",
+              name: "validateText",
+              ownerClassName: null,
+              description: "Throw TodoValidationError on empty text.",
+              signature: {
+                params: [{ name: "text", type: "string" }],
+                returnType: "void",
+                isAsync: false,
+              },
+              exported: true,
+              isStatic: false,
+            },
+          ],
+          classes: [],
+        },
+      });
+      const rpg = rpgWithFiles([errors, validation]);
+
+      // Turn 1 emits two reads + a list in parallel; turn 2 edits;
+      // turn 3 terminates.
+      let turn = 0;
+      const recorded: { messages: ChatMessage[] }[] = [];
+      const client: LLMClient = {
+        async chat(messages): Promise<LLMResponse> {
+          recorded.push({ messages: [...messages] });
+          turn++;
+          if (turn === 1) {
+            return {
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: "c_a",
+                  type: "function",
+                  function: {
+                    name: "read_file",
+                    arguments: JSON.stringify({ path: "src/errors.ts" }),
+                  },
+                },
+                {
+                  id: "c_b",
+                  type: "function",
+                  function: {
+                    name: "read_file",
+                    arguments: JSON.stringify({ path: "src/validation.ts" }),
+                  },
+                },
+                {
+                  id: "c_c",
+                  type: "function",
+                  function: { name: "list_files", arguments: "{}" },
+                },
+              ],
+            };
+          }
+          if (turn === 2) {
+            return {
+              content: "",
+              finishReason: "tool_calls",
+              toolCalls: [
+                {
+                  id: "c_d",
+                  type: "function",
+                  function: {
+                    name: "edit_file",
+                    arguments: JSON.stringify({
+                      path: "src/validation.ts",
+                      old_str:
+                        'export function validateText(text: string): void {\n  throw new Error("validateText: not implemented");\n}',
+                      new_str:
+                        'import { TodoValidationError } from "./errors.js";\n\nexport function validateText(text: string): void {\n  if (text.length === 0) throw new TodoValidationError("text cannot be empty");\n}',
+                    }),
+                  },
+                },
+              ],
+            };
+          }
+          return {
+            content: "",
+            finishReason: "tool_calls",
+            toolCalls: [
+              {
+                id: "c_e",
+                type: "function",
+                function: {
+                  name: "Terminate",
+                  arguments: JSON.stringify({ reason: "done" }),
+                },
+              },
+            ],
+          };
+        },
+        async listModels() {
+          return ["mock"];
+        },
+      };
+
+      const r = await runLeafDevLoop(client, {
+        leaf: validation.interfacePlan!.entries[0]!,
+        hostFile: validation,
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        workDir,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      // Three iterations total, even though turn 1 ran THREE
+      // tools — the whole batch is one iteration.
+      expect(r.iterations).toBe(3);
+      // Trail records one entry per applied tool (5 total: 3 in
+      // turn 1 + 1 edit + 1 Terminate).
+      expect(r.trail.length).toBe(5);
+      expect(r.trail.filter((t) => t.iteration === 1).length).toBe(3);
+      expect(r.trail.filter((t) => t.iteration === 2).length).toBe(1);
+      expect(r.trail.filter((t) => t.iteration === 3).length).toBe(1);
+
+      // Protocol invariant: in turn 2's messages, the assistant
+      // message from turn 1 must carry all 3 tool_calls and be
+      // followed by exactly 3 tool messages with matching ids.
+      const turn2Messages = recorded[1]!.messages;
+      const lastAssistant = [...turn2Messages]
+        .reverse()
+        .find((m) => m.role === "assistant");
+      expect(lastAssistant).toBeDefined();
+      // Find the trailing tool messages that match the assistant's
+      // tool_calls.
+      const trailingTools = turn2Messages.filter((m) => m.role === "tool");
+      expect(trailingTools.length).toBe(3);
+      const ids = trailingTools.map((m) => m.tool_call_id).sort();
+      expect(ids).toEqual(["c_a", "c_b", "c_c"]);
+    },
+  );
+
+  it(
+    "skips tool calls emitted after a successful Terminate in the same turn",
+    { timeout: 60_000 },
+    async () => {
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      // Pre-set userEditedSource so the V5 Terminate guard
+      // accepts immediately on the first turn.
+      f.userEditedSource =
+        'export function add(a: number, b: number): number {\n  return a + b;\n}\n';
+      const rpg = rpgWithFiles([f]);
+
+      const client: LLMClient = {
+        async chat(): Promise<LLMResponse> {
+          return {
+            content: "",
+            finishReason: "tool_calls",
+            toolCalls: [
+              {
+                id: "t1",
+                type: "function",
+                function: {
+                  name: "Terminate",
+                  arguments: JSON.stringify({ reason: "done" }),
+                },
+              },
+              {
+                id: "t2",
+                type: "function",
+                function: { name: "list_files", arguments: "{}" },
+              },
+            ],
+          };
+        },
+        async listModels() {
+          return ["mock"];
+        },
+      };
+      const r = await runLeafDevLoop(client, {
+        leaf: f.interfacePlan!.entries[0]!,
+        hostFile: f,
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        workDir,
+      });
+      expect(r.ok).toBe(true);
+      expect(r.iterations).toBe(1);
+      // Trail: Terminate (ok), then list_files (skipped).
+      expect(r.trail.length).toBe(2);
+      expect(r.trail[0]!.tool).toBe("Terminate");
+      expect(r.trail[0]!.ok).toBe(true);
+      expect(r.trail[1]!.tool).toBe("list_files");
+      expect(r.trail[1]!.ok).toBe(false);
+      expect(r.trail[1]!.error).toMatch(/skipped/i);
+    },
+  );
+});
+
+describe("runLeafDevLoop — Terminate guard (V5)", () => {
+  it(
+    "rejects Terminate when no edit_file has produced a body, then accepts after a real edit",
+    { timeout: 60_000 },
+    async () => {
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      const rpg = rpgWithFiles([f]);
+      const { client } = scriptedClient([
+        // Premature Terminate — no edits have been applied. The
+        // guard should push back rather than fail the attempt.
+        { name: "Terminate", args: { reason: "already implemented" } },
+        // Now a real edit.
+        {
+          name: "edit_file",
+          args: {
+            path: "src/add.ts",
+            old_str: 'throw new Error("add: not implemented");',
+            new_str: "return a + b;",
+          },
+        },
+        // Followed by a successful Terminate.
+        { name: "Terminate", args: { reason: "done" } },
+      ]);
+      const r = await runLeafDevLoop(client, {
+        leaf: f.interfacePlan!.entries[0]!,
+        hostFile: f,
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        workDir,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      expect(r.body).toContain("return a + b");
+      // Trail must show the rejected Terminate before the
+      // accepted one.
+      const terminateEntries = r.trail.filter((t) => t.tool === "Terminate");
+      expect(terminateEntries.length).toBe(2);
+      expect(terminateEntries[0]!.ok).toBe(false);
+      expect(terminateEntries[0]!.error).toMatch(/no body produced/i);
+      expect(terminateEntries[1]!.ok).toBe(true);
+    },
+  );
+
+  it(
+    "accepts Terminate without an explicit edit_file when the symbol is already implemented in userEditedSource",
+    { timeout: 60_000 },
+    async () => {
+      // Simulate a prior leaf in the same file having written
+      // the implementation: hostFile.userEditedSource is set,
+      // but bodyByLeafId for THIS leaf is empty.
+      const f = mkFile({
+        id: "file:add",
+        path: "src/add.ts",
+        interfacePlan: ADD_PLAN,
+      });
+      f.userEditedSource =
+        'export function add(a: number, b: number): number {\n  return a + b;\n}\n';
+      const rpg = rpgWithFiles([f]);
+      const { client } = scriptedClient([
+        { name: "Terminate", args: { reason: "already implemented" } },
+      ]);
+      const r = await runLeafDevLoop(client, {
+        leaf: f.interfacePlan!.entries[0]!,
+        hostFile: f,
+        rpg,
+        bodyByLeafId: new Map(),
+        testsByLeafId: new Map(),
+        workDir,
+      });
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      expect(r.body).toContain("return a + b");
+    },
+  );
+});
+
 describe("runLeafDevLoop — recovery", () => {
   it(
     "retries after a string-replace ambiguity rejection",

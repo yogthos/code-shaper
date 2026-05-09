@@ -560,7 +560,7 @@ function findPlannedLeaf(file: FileNode, leafId: string): PlannedInterface | nul
   return null;
 }
 
-function extractBodyForLeaf(source: string, leaf: PlannedInterface): string | null {
+export function extractBodyForLeaf(source: string, leaf: PlannedInterface): string | null {
   if (leaf.kind === "method") {
     if (!leaf.ownerClassName) return null;
     return extractMethodBody(source, leaf.ownerClassName, leaf.name);

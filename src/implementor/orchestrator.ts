@@ -31,6 +31,10 @@ import {
   type DecomposeDecision,
 } from "./decompose.js";
 import { implementLeaf, type LeafImplementResult } from "./leaf.js";
+import {
+  buildProjectContext,
+  extractLessonFromTrail,
+} from "./project-context.js";
 // V2: phase 5b (test pre-authoring) and the test-import-based
 // dep graph are gone. The implementor does TDD itself inside
 // the dev loop. Imports for those modules removed.
@@ -267,6 +271,25 @@ export async function buildImplementations(
      *  architect keeps proposing fresh approaches that don't help. */
     const decomposeRoundsByLeaf = new Map<string, number>();
 
+    // Project context: a single digest synthesized once after the
+    // skeleton is materialized. Includes stack/scripts/deps from
+    // package.json, repo layout, and per-file planned exports. We
+    // also accumulate a `learnedFacts` array — each leaf attempt's
+    // trail is scanned for cross-cutting failures (npm install
+    // errors, etc.) and converted into one-line lessons that get
+    // injected into every subsequent leaf's prompt. Saves each
+    // leaf from re-discovering project shape and from repeating
+    // the same dep-install mistake.
+    const learnedFacts: string[] = [];
+    const learnedFactsSeen = new Set<string>();
+    function currentProjectContext(): string {
+      return buildProjectContext({
+        rpg,
+        ...(input.outDir !== undefined ? { outDir: input.outDir } : {}),
+        learnedFacts,
+      });
+    }
+
     // Snapshot of the planned leaves, used purely for progress
     // reporting. The queue can grow (decompose recovery prepends
     // sub-leaves) and shrink during iteration; we report relative
@@ -395,6 +418,7 @@ export async function buildImplementations(
         ...(input.outDir !== undefined
           ? { projectDir: input.outDir }
           : {}),
+        projectContext: currentProjectContext(),
         ...(input.enableEnvFix && input.outDir
           ? {
               enableEnvFix: true,
@@ -430,6 +454,20 @@ export async function buildImplementations(
         result = await leafCall;
       }
       leafResults.push(result);
+
+      // Harvest a one-line lesson from this leaf's dev-loop trail
+      // (cross-cutting failure patterns: npm install errors,
+      // unbuildable deps). Lessons get appended to learnedFacts
+      // and rendered in subsequent leaves' "Known constraints"
+      // section so workers don't repeat the same dep-install
+      // mistakes from scratch.
+      if (result.devLoopTrail && result.devLoopTrail.length > 0) {
+        const lesson = extractLessonFromTrail(result.devLoopTrail);
+        if (lesson && !learnedFactsSeen.has(lesson)) {
+          learnedFactsSeen.add(lesson);
+          learnedFacts.push(lesson);
+        }
+      }
 
       if (input.onLeafProgress) {
         const initialIdx = initialLeafIds.indexOf(leaf.leafCapabilityId);

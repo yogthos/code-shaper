@@ -175,6 +175,9 @@ export interface LeafImplementInput {
   useDevLoop?: boolean;
   /** Per-dev-loop iteration budget. Default 15. */
   devLoopMaxIterations?: number;
+  /** Optional project-context digest forwarded to the dev loop's
+   *  user prompt. Synthesized once by the orchestrator. */
+  projectContext?: string;
 }
 
 export interface LeafImplementResult {
@@ -208,6 +211,16 @@ export interface LeafImplementResult {
     attempt: number;
     category: FailureCategory;
     votes: FailureDiagnosisResult["votes"];
+  }>;
+  /** Aggregated dev-loop trail entries across attempts. Surfaced
+   *  so the orchestrator can scan for cross-cutting failure
+   *  patterns (npm install errors, etc.) and lift them into
+   *  shared learnedFacts for subsequent leaves. */
+  devLoopTrail?: Array<{
+    tool: string;
+    args?: Record<string, unknown>;
+    ok: boolean;
+    error?: string;
   }>;
 }
 
@@ -329,6 +342,8 @@ export async function implementLeaf(
   let envPatches = 0;
   let failuresSeen = 0;
   const diagnoses: NonNullable<LeafImplementResult["diagnoses"]> = [];
+  const aggregatedDevLoopTrail: NonNullable<LeafImplementResult["devLoopTrail"]> =
+    [];
   // Audit gap #5: per-leaf trail of prior diagnostic verdicts +
   // remediations. Threaded into each subsequent diagnostic call so
   // the judge sees what was already tried and can pick a different
@@ -394,6 +409,9 @@ export async function implementLeaf(
         testsByLeafId: input.testsByLeafId,
         workDir: input.workDir,
         ...(input.projectDir !== undefined ? { outDir: input.projectDir } : {}),
+        ...(input.projectContext !== undefined
+          ? { projectContext: input.projectContext }
+          : {}),
         ...(retryFeedback?.failureMessage !== undefined
           ? { failureMessage: retryFeedback.failureMessage }
           : {}),
@@ -413,6 +431,14 @@ export async function implementLeaf(
           ? { temperature: input.temperature }
           : {}),
       });
+      for (const t of r.trail) {
+        aggregatedDevLoopTrail.push({
+          tool: t.tool,
+          args: t.args,
+          ok: t.ok,
+          ...(t.error ? { error: t.error } : {}),
+        });
+      }
       if (!r.ok || !r.body) {
         // Treat as if the body was empty so the loop's standard
         // empty-body retry path kicks in. The trail's tail is
@@ -458,6 +484,9 @@ export async function implementLeaf(
         attempts: i + 1,
         ...(input.diagnosis ? {} : {}),
         testRewrites,
+        ...(aggregatedDevLoopTrail.length > 0
+          ? { devLoopTrail: aggregatedDevLoopTrail }
+          : {}),
       };
     } else if (input.useEditTools) {
       // §D.2 tool-using author: the LLM picks an edit tool scoped
@@ -892,6 +921,9 @@ export async function implementLeaf(
     ...(lastFatal ? { fatal: lastFatal } : {}),
     testRewrites,
     ...(diagnoses.length > 0 ? { diagnoses } : {}),
+    ...(aggregatedDevLoopTrail.length > 0
+      ? { devLoopTrail: aggregatedDevLoopTrail }
+      : {}),
   };
 }
 

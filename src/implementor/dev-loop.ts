@@ -31,6 +31,7 @@ import {
   editFileTool,
   typecheckTool,
   runTestTool,
+  extractBodyForLeaf,
 } from "./dev-loop-tools.js";
 import {
   listSymbolsInFile,
@@ -74,6 +75,11 @@ export interface DevLoopInput {
    *  set, the user prompt's "Previous failure" block surfaces
    *  it. */
   failureMessage?: string;
+  /** Optional pre-rendered project digest (stack, layout, planned
+   *  exports, learned constraints) prepended to the user prompt.
+   *  Saves each leaf from re-discovering project shape and
+   *  conventions via list_files / read_file round-trips. */
+  projectContext?: string;
   maxIterations?: number;
   /** Wall-clock cap forwarded to runTestTool. */
   testTimeoutMs?: number;
@@ -176,115 +182,161 @@ export async function runLeafDevLoop(
           : {}),
       };
     }
-    if (toolCalls.length > 1) {
-      // Multi-call turn — reject with one tool-error per call so
-      // the OpenAI protocol stays consistent.
-      messages.push({
-        role: "assistant",
-        content: response.content ?? "",
-        tool_calls: toolCalls,
-      });
-      for (const c of toolCalls) {
-        messages.push({
-          role: "tool",
-          tool_call_id: c.id,
-          content: JSON.stringify({
-            error:
-              "Emit exactly ONE tool call per turn. Pick one, see the result, then decide.",
-          }),
-        });
-      }
-      trail.push({
-        iteration: i + 1,
-        tool: "_invalid",
-        args: {},
-        ok: false,
-        error: "rejected: multi-tool-call turn",
-      });
-      continue;
-    }
-    const call = toolCalls[0]!;
-    const toolName = call.function.name;
-    let args: Record<string, unknown>;
-    try {
-      args = JSON.parse(call.function.arguments) as Record<string, unknown>;
-    } catch (e) {
-      const err = `arguments did not parse as JSON: ${e instanceof Error ? e.message : String(e)}`;
-      messages.push({
-        role: "assistant",
-        content: response.content ?? "",
-        tool_calls: toolCalls,
-      });
-      messages.push({
-        role: "tool",
-        tool_call_id: call.id,
-        content: JSON.stringify({ error: err }),
-      });
-      trail.push({
-        iteration: i + 1,
-        tool: "_invalid",
-        args: {},
-        ok: false,
-        error: `${toolName}: ${err}`,
-      });
-      continue;
-    }
-
-    if (toolName === "Terminate") {
-      messages.push({
-        role: "assistant",
-        content: response.content ?? "",
-        tool_calls: toolCalls,
-      });
-      messages.push({
-        role: "tool",
-        tool_call_id: call.id,
-        content: JSON.stringify({ ok: true }),
-      });
-      trail.push({
-        iteration: i + 1,
-        tool: "Terminate",
-        args,
-        ok: true,
-      });
-      const body = input.bodyByLeafId.get(input.leaf.leafCapabilityId);
-      return {
-        // Termination is "successful" iff the active leaf has a
-        // body the orchestrator can run a final test against.
-        // No body = the model terminated without making the
-        // edit; not a real success.
-        ok: body !== undefined,
-        ...(body !== undefined ? { body } : {}),
-        trail,
-        iterations: i + 1,
-        ...(body === undefined
-          ? { error: "terminated without producing an implementation for the task" }
-          : {}),
-      };
-    }
-
-    // Apply the tool. Each branch returns { result: object, ok:
-    // bool, summary?: string }, then we both push the result back
-    // to the model and record on the trail.
-    const applied = await applyTool(toolName, args, input);
-    trail.push({
-      iteration: i + 1,
-      tool: toolName,
-      args,
-      ok: applied.ok,
-      ...(applied.error ? { error: applied.error } : {}),
-      ...(applied.summary ? { summary: applied.summary } : {}),
-    });
+    // V7: process the model's tool calls per the canonical
+    // OpenAI/Anthropic agent protocol — N tool calls in a single
+    // assistant turn produce N tool messages in the next user
+    // turn, in matching order. The whole batch counts as ONE
+    // iteration; that's the parallelism win. Within the batch,
+    // calls run sequentially so file-edit ordering is preserved
+    // (the model's emission order IS the apply order).
     messages.push({
       role: "assistant",
       content: response.content ?? "",
       tool_calls: toolCalls,
     });
-    messages.push({
-      role: "tool",
-      tool_call_id: call.id,
-      content: JSON.stringify(applied.toolResult),
-    });
+
+    let terminatedBody: string | null = null;
+    for (const call of toolCalls) {
+      const toolName = call.function.name;
+      // If a prior Terminate in this same turn already accepted,
+      // emit cancellation tool results for the remaining calls.
+      // Every call_id MUST get a tool message or the protocol
+      // sequence breaks on the next turn.
+      if (terminatedBody !== null) {
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify({
+            error: "skipped: a prior Terminate in this same turn already ended the session",
+          }),
+        });
+        trail.push({
+          iteration: i + 1,
+          tool: toolName,
+          args: {},
+          ok: false,
+          error: "skipped: prior Terminate in same turn",
+        });
+        continue;
+      }
+
+      let args: Record<string, unknown>;
+      try {
+        args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+      } catch (e) {
+        const err = `arguments did not parse as JSON: ${e instanceof Error ? e.message : String(e)}`;
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify({ error: err }),
+        });
+        trail.push({
+          iteration: i + 1,
+          tool: "_invalid",
+          args: {},
+          ok: false,
+          error: `${toolName}: ${err}`,
+        });
+        continue;
+      }
+
+      if (toolName === "Terminate") {
+        let body = input.bodyByLeafId.get(input.leaf.leafCapabilityId);
+        // V5 guard: tolerate "already implemented" Terminate
+        // calls when the planned symbol IS in fact present in
+        // the file's current source.
+        if (
+          body === undefined &&
+          input.hostFile.userEditedSource !== undefined
+        ) {
+          const extracted = extractBodyForLeaf(
+            input.hostFile.userEditedSource,
+            input.leaf,
+          );
+          if (extracted !== null && !isDefaultStub(extracted, input.leaf.name)) {
+            input.bodyByLeafId.set(input.leaf.leafCapabilityId, extracted);
+            body = extracted;
+          }
+        }
+        if (body === undefined) {
+          const symbolPath =
+            input.leaf.kind === "method" && input.leaf.ownerClassName
+              ? `${input.leaf.ownerClassName}.${input.leaf.name}`
+              : input.leaf.name;
+          const pushback =
+            `Cannot Terminate: no implementation for ${JSON.stringify(symbolPath)} has been written in ${JSON.stringify(input.hostFile.path)}. ` +
+            `The placeholder body is still throw new Error("${input.leaf.name}: not implemented"). ` +
+            `Use edit_file to replace that placeholder with the real implementation, then call Terminate.`;
+          messages.push({
+            role: "tool",
+            tool_call_id: call.id,
+            content: JSON.stringify({ error: pushback }),
+          });
+          trail.push({
+            iteration: i + 1,
+            tool: "Terminate",
+            args,
+            ok: false,
+            error: "Terminate rejected: no body produced",
+          });
+          continue;
+        }
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify({ ok: true }),
+        });
+        trail.push({
+          iteration: i + 1,
+          tool: "Terminate",
+          args,
+          ok: true,
+        });
+        terminatedBody = body;
+        continue;
+      }
+
+      // Defensive: applyTool dispatches to async tool
+      // implementations (vitest spawn, npm install, tree-sitter
+      // parsers). A throw from any of those would skip the tool
+      // message for this call and break the protocol invariant
+      // (every tool_call_id must be answered before the next
+      // assistant turn). Convert throws into ok=false tool
+      // results so the loop survives.
+      let applied: AppliedTool;
+      try {
+        applied = await applyTool(toolName, args, input);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        applied = {
+          ok: false,
+          toolResult: { error: `tool threw: ${msg}` },
+          error: `tool threw: ${msg}`,
+        };
+      }
+      trail.push({
+        iteration: i + 1,
+        tool: toolName,
+        args,
+        ok: applied.ok,
+        ...(applied.error ? { error: applied.error } : {}),
+        ...(applied.summary ? { summary: applied.summary } : {}),
+      });
+      messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify(applied.toolResult),
+      });
+    }
+
+    if (terminatedBody !== null) {
+      return {
+        ok: true,
+        body: terminatedBody,
+        trail,
+        iterations: i + 1,
+      };
+    }
   }
 
   // Budget exhausted without Terminate.
@@ -786,12 +838,28 @@ Tools:
                                   Install a runtime ("which":"runtime") or dev ("which":"dev") dependency. Use when imports fail with "Cannot find module X".
   remove_dependency(name)         Strip a package + re-install. Useful before swapping bindings (e.g. broken native deps).
   npm_run(script)                 Run an existing npm script. Returns exit code + stdout/stderr.
-  Terminate(reason)               End the session. Call when the tests you wrote pass and the feature is correctly implemented.
+  Terminate(reason)               End the session. Only valid AFTER you have called edit_file on the planned file to replace the placeholder body. Calling Terminate without a real edit will be rejected with an error pushback. "Already implemented" is not a valid reason — if you believe it is, run edit_file anyway (it can simply confirm the existing body).
 
-Pick exactly ONE tool per turn.`;
+You may emit multiple tool calls in a single turn when their work is independent — e.g. read three sibling files in one turn rather than one per turn, or apply two unrelated string-replace edits at once. The harness applies them in the order you emit them and returns one tool result per call. Batching is strictly cheaper: the whole batch counts as one iteration against your turn budget. Only sequence calls across turns when a later call genuinely depends on the result of an earlier one (e.g. read_file → edit_file based on what you read).`;
+
+function isDefaultStub(body: string, name: string): boolean {
+  // The renderer writes `throw new Error("<name>: not implemented");`
+  // for each entry. Tolerate stripped semicolons/whitespace and
+  // single vs. double quotes.
+  const trimmed = body.trim().replace(/;+\s*$/, "");
+  const quoted = `${name}: not implemented`;
+  return (
+    trimmed === `throw new Error("${quoted}")` ||
+    trimmed === `throw new Error('${quoted}')`
+  );
+}
 
 function buildUserPrompt(input: DevLoopInput): string {
   const lines: string[] = [];
+  if (input.projectContext && input.projectContext.trim().length > 0) {
+    lines.push(input.projectContext.trimEnd());
+    lines.push("");
+  }
   lines.push(`# Task`);
   lines.push("");
   if (input.leaf.kind === "method" && input.leaf.ownerClassName) {

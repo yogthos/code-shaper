@@ -185,6 +185,129 @@ describe("proposeStack — happy path (skipNpmInstall)", () => {
   });
 });
 
+describe("proposeStack — install validation loop", () => {
+  // Stub npm binary that exits non-zero on the first call and 0
+  // on subsequent calls. Tracks invocation count via a counter
+  // file on disk so the test can verify install-failure retry.
+  async function makeFailThenSucceedNpm(opts: {
+    failStderr: string;
+  }): Promise<{ stub: string; counterFile: string }> {
+    const dir = await mkdtemp(path.join(tmpdir(), "fail-then-ok-"));
+    const counterFile = path.join(dir, "count");
+    await writeFile(counterFile, "0", "utf-8");
+    const stub = path.join(dir, "stub-npm");
+    const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const counterFile = ${JSON.stringify(counterFile)};
+const n = Number(fs.readFileSync(counterFile, "utf-8")) || 0;
+fs.writeFileSync(counterFile, String(n + 1));
+if (n === 0) {
+  process.stderr.write(${JSON.stringify(opts.failStderr)});
+  process.exit(1);
+} else {
+  process.stdout.write("added 5 packages\\n");
+  process.exit(0);
+}
+`;
+    await writeFile(stub, script, "utf-8");
+    await chmod(stub, 0o755);
+    return { stub, counterFile };
+  }
+
+  it("retries the proposal with install-error feedback when npm install fails, then succeeds", async () => {
+    const { stub, counterFile } = await makeFailThenSucceedNpm({
+      failStderr:
+        "npm error gyp ERR! build error\nnpm error gyp ERR! cwd /tmp/foo/node_modules/better-sqlite3\nnpm error gyp ERR! not ok\n",
+    });
+
+    // First proposal picks "better-sqlite3"; second swaps to
+    // "sql.js" (in response to install error feedback).
+    const PKG_BAD = {
+      ...VALID_PKG,
+      dependencies: { "better-sqlite3": "^11.0.0" },
+    };
+    const PKG_GOOD = {
+      ...VALID_PKG,
+      dependencies: { "sql.js": "^1.11.0" },
+    };
+    const observedMessages: string[] = [];
+    let i = 0;
+    const client: LLMClient = {
+      async chat(messages): Promise<LLMResponse> {
+        observedMessages.push(messages[messages.length - 1]!.content);
+        const responses = [JSON.stringify(PKG_BAD), JSON.stringify(PKG_GOOD)];
+        return { content: responses[i++] ?? "", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+    const r = await proposeStack(client, {
+      description: "x",
+      outDir,
+      maxAttempts: 3,
+      npmBinary: stub,
+      npmInstallTimeoutMs: 5_000,
+    });
+    expect(r.ok, r.error).toBe(true);
+    expect(r.installRan).toBe(true);
+    expect(r.installOk).toBe(true);
+    expect(r.attempts).toBe(2);
+    // Counter file confirms npm was invoked twice (one fail, one
+    // success).
+    const callCount = Number(
+      (await readFile(counterFile, "utf-8")).trim(),
+    );
+    expect(callCount).toBe(2);
+    // The retry prompt must surface the install stderr to the model.
+    expect(observedMessages[1]).toContain("npm install");
+    expect(observedMessages[1]).toContain("gyp ERR");
+    expect(observedMessages[1]).toMatch(/swap|alternative|broken/i);
+    // On-disk package.json must be the GOOD one (the second
+    // proposal's deps), not the broken first attempt.
+    const onDisk = JSON.parse(
+      await readFile(path.join(outDir, "package.json"), "utf-8"),
+    );
+    expect(onDisk.dependencies).toHaveProperty("sql.js");
+    expect(onDisk.dependencies).not.toHaveProperty("better-sqlite3");
+  });
+
+  it("returns ok=false with the install error when every attempt fails install", async () => {
+    // Stub that always exits non-zero.
+    const dir = await mkdtemp(path.join(tmpdir(), "always-fail-"));
+    const stub = path.join(dir, "stub-npm");
+    await writeFile(
+      stub,
+      `#!/usr/bin/env node\nprocess.stderr.write("install fail");\nprocess.exit(1);\n`,
+      "utf-8",
+    );
+    await chmod(stub, 0o755);
+
+    const PKG = {
+      ...VALID_PKG,
+      dependencies: { "broken-pkg": "^1.0.0" },
+    };
+    const client = mockClient([
+      JSON.stringify(PKG),
+      JSON.stringify(PKG),
+      JSON.stringify(PKG),
+    ]);
+    const r = await proposeStack(client, {
+      description: "x",
+      outDir,
+      maxAttempts: 2,
+      npmBinary: stub,
+      npmInstallTimeoutMs: 5_000,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.installRan).toBe(true);
+    expect(r.installOk).toBe(false);
+    expect(r.attempts).toBe(2);
+    expect(r.packageJson).toBeDefined();
+    expect(r.error).toContain("install fail");
+  });
+});
+
 describe("proposeStack — extend mode", () => {
   it("loads existing package.json and surfaces it in the prompt", async () => {
     const existing = {

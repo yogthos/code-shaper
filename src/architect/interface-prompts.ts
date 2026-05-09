@@ -121,7 +121,7 @@ export function buildInterfaceUserPrompt(input: InterfacePromptInput): string {
                   name: "string (camelCase)",
                   type: "string (TypeScript type)",
                   optional: "boolean (default false)",
-                  defaultValue: "string | undefined",
+                  defaultValue: "string | null (omit or pass null when no default; never the JSON literal undefined)",
                 },
               ],
               returnType: "string (TypeScript type, e.g. void or Promise<X>)",

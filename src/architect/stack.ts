@@ -75,10 +75,12 @@ export async function proposeStack(
   client: LLMClient,
   input: StackInput,
 ): Promise<StackResult> {
-  const maxAttempts = input.maxAttempts ?? 2;
+  const maxAttempts = input.maxAttempts ?? 3;
   let lastError: string | null = null;
   let lastResponse: string | null = null;
+  let lastErrorKind: "parse" | "install" | null = null;
   let pkg: PackageJson | null = null;
+  let lastInstall: Awaited<ReturnType<typeof runNpmInstall>> | null = null;
   let attempts = 0;
 
   let existingPackageJson: string | undefined;
@@ -106,6 +108,13 @@ export async function proposeStack(
     ...(existingPackageJson ? { existingPackageJson } : {}),
   });
 
+  // Validation loop: each attempt produces a candidate
+  // package.json AND verifies it actually installs. Both parse
+  // failures and `npm install` failures feed back into the next
+  // attempt's prompt so the model can swap broken deps for ones
+  // that work in this environment. We don't ship a project to
+  // downstream phases until install succeeds — partial state is
+  // worse than no state.
   for (let i = 0; i < maxAttempts; i++) {
     attempts = i + 1;
     const messages: Array<{
@@ -117,10 +126,11 @@ export async function proposeStack(
     ];
     if (lastError !== null && lastResponse !== null) {
       messages.push({ role: "assistant", content: lastResponse });
-      messages.push({
-        role: "user",
-        content: `Your previous response failed validation: ${lastError}\nReturn corrected JSON now.`,
-      });
+      const feedback =
+        lastErrorKind === "install"
+          ? `Your previous proposal produced valid JSON but \`npm install\` FAILED on this host:\n\n${lastError}\n\nThe likely culprit is a dependency that doesn't build/resolve in this environment (native modules with broken bindings against the current Node version, packages with missing prebuilt binaries, version pins that don't exist on the registry, etc.). Identify the bad dep from the stderr above and SWAP it for a pure-JS or otherwise-compatible alternative. Return a corrected package.json now.`
+          : `Your previous response failed validation: ${lastError}\nReturn corrected JSON now.`;
+      messages.push({ role: "user", content: feedback });
     }
     const response = await client.chat(messages, {
       responseFormat: { type: "json_object" },
@@ -128,15 +138,60 @@ export async function proposeStack(
         ? { temperature: input.temperature }
         : {}),
     });
-    const parsed = parsePackageJson(response.content);
-    if (parsed.ok) {
-      pkg = parsed.value;
-      break;
-    }
-    lastError = parsed.error;
     lastResponse = response.content;
+    const parsed = parsePackageJson(response.content);
+    if (!parsed.ok) {
+      lastError = parsed.error;
+      lastErrorKind = "parse";
+      continue;
+    }
+    pkg = parsed.value;
+
+    // Materialize and install. Both ops happen INSIDE the loop so
+    // an install failure can re-prompt the model.
+    await mkdir(input.outDir, { recursive: true });
+    await writeFile(
+      path.join(input.outDir, "package.json"),
+      JSON.stringify(pkg, null, 2) + "\n",
+      "utf-8",
+    );
+
+    if (input.skipNpmInstall) {
+      // Test mode: no install attempted; treat as success.
+      return {
+        ok: true,
+        packageJson: pkg,
+        installRan: false,
+        installOk: false,
+        attempts,
+      };
+    }
+
+    const install = await runNpmInstall({
+      cwd: input.outDir,
+      binary: input.npmBinary ?? "npm",
+      timeoutMs: input.npmInstallTimeoutMs ?? DEFAULT_NPM_INSTALL_TIMEOUT_MS,
+    });
+    lastInstall = install;
+    if (install.ok) {
+      return {
+        ok: true,
+        packageJson: pkg,
+        installRan: true,
+        installOk: true,
+        installStdout: install.stdout,
+        installStderr: install.stderr,
+        attempts,
+      };
+    }
+    // Install failed. Feed the stderr tail back to the model so
+    // it picks a working alternative on the next attempt. npm
+    // puts the actionable diagnostic at the END of stderr.
+    lastError = `npm install exited with code ${install.exitCode ?? "null"}; stderr:\n${tailTruncate(install.stderr, 4000)}`;
+    lastErrorKind = "install";
   }
 
+  // All attempts exhausted.
   if (!pkg) {
     return {
       ok: false,
@@ -146,44 +201,15 @@ export async function proposeStack(
       error: lastError ?? "no package.json produced",
     };
   }
-
-  // Materialize.
-  await mkdir(input.outDir, { recursive: true });
-  await writeFile(
-    path.join(input.outDir, "package.json"),
-    JSON.stringify(pkg, null, 2) + "\n",
-    "utf-8",
-  );
-
-  if (input.skipNpmInstall) {
-    return {
-      ok: true,
-      packageJson: pkg,
-      installRan: false,
-      installOk: false,
-      attempts,
-    };
-  }
-
-  // npm install.
-  const install = await runNpmInstall({
-    cwd: input.outDir,
-    binary: input.npmBinary ?? "npm",
-    timeoutMs: input.npmInstallTimeoutMs ?? DEFAULT_NPM_INSTALL_TIMEOUT_MS,
-  });
   return {
-    ok: install.ok,
+    ok: false,
     packageJson: pkg,
-    installRan: true,
-    installOk: install.ok,
-    installStdout: install.stdout,
-    installStderr: install.stderr,
+    installRan: lastInstall !== null,
+    installOk: false,
+    ...(lastInstall?.stdout ? { installStdout: lastInstall.stdout } : {}),
+    ...(lastInstall?.stderr ? { installStderr: lastInstall.stderr } : {}),
     attempts,
-    ...(install.ok
-      ? {}
-      : {
-          error: `npm install exited with code ${install.exitCode ?? "null"}; stderr:\n${tailTruncate(install.stderr, 4000)}`,
-        }),
+    error: lastError ?? "npm install failed",
   };
 }
 

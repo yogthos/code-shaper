@@ -515,9 +515,14 @@ export function parseInterfaceResponse(
 ): ParseOk | ParseErr {
   const text = stripFences(raw).trim();
   if (!text) return { ok: false, error: "empty response body" };
+  // GLM occasionally emits the literal `undefined` (not valid
+  // JSON) for optional fields. Substitute `null` so the parser
+  // can keep going — the downstream entry validators treat null
+  // and missing equivalently.
+  const sanitized = text.replace(/:\s*undefined\b/g, ": null");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(sanitized);
   } catch (e) {
     return { ok: false, error: `JSON parse error: ${(e as Error).message}` };
   }

@@ -116,65 +116,6 @@ async function writeResult(
   await writeFile(resultPath, JSON.stringify(result, null, 2), "utf-8");
 }
 
-/**
- * Audit gap #1: prepend a "Stack health" preamble to the project
- * description when the phase 0 install failed. Without this,
- * downstream architect phases (proposal / structure / interfaces /
- * refactor) plan files importing a dep that's already known to be
- * uninstallable on this host (e.g., a native module that doesn't
- * compile against the current node V8 — better-sqlite3 + node 26
- * is the canonical case). The model never sees the failure and
- * keeps building on a broken stack.
- *
- * The preamble carries:
- *   - which deps the model picked
- *   - that npm install failed
- *   - the actionable tail of the install error
- *   - guidance to plan around the broken dep (suggest alternatives
- *     when picking imports / file structure)
- */
-function augmentDescriptionWithStackHealth(
-  description: string,
-  stack: { ok: boolean; packageJson?: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> }; error?: string },
-): string {
-  // Happy path: install succeeded. Pass description through.
-  if (stack.ok) return description;
-  // Install failed but package.json is valid (proposeStack
-  // populates packageJson only after JSON validation). Surface
-  // the install error so downstream phases avoid the broken dep.
-  const deps = Object.keys(stack.packageJson?.dependencies ?? {});
-  const devDeps = Object.keys(stack.packageJson?.devDependencies ?? {});
-  const errTail =
-    stack.error && stack.error.length > 2000
-      ? "...[head truncated]\n" + stack.error.slice(stack.error.length - 2000)
-      : stack.error ?? "(no detail)";
-  const lines: string[] = [];
-  lines.push("[STACK HEALTH WARNING from phase 0]");
-  lines.push("");
-  lines.push(
-    "The package.json was materialized but `npm install` FAILED. Some declared dependencies are not actually available on this host. Plan downstream so importable modules are limited to ones that survived install — if a chosen dep is unbuildable here, propose an alternative (a different SQLite binding, a different HTTP framework, etc.) when the structure / interface / body author phases reference it.",
-  );
-  lines.push("");
-  if (deps.length > 0) {
-    lines.push(`Declared runtime dependencies: ${deps.join(", ")}`);
-  }
-  if (devDeps.length > 0) {
-    lines.push(`Declared dev dependencies: ${devDeps.join(", ")}`);
-  }
-  lines.push("");
-  lines.push("Install error tail (npm puts the actionable diagnostic LAST):");
-  lines.push("```");
-  lines.push(errTail);
-  lines.push("```");
-  lines.push("");
-  lines.push("[end stack health warning]");
-  lines.push("");
-  lines.push("Original task description follows:");
-  lines.push("");
-  lines.push(description);
-  return lines.join("\n");
-}
-
 async function run(args: ParsedArgs): Promise<number> {
   const { log } = startedAt();
   const config = await loadConfig();
@@ -272,18 +213,18 @@ async function run(args: ParsedArgs): Promise<number> {
     mode: mode === "greenfield" ? "greenfield" : "extend",
     maxAttempts: 2,
   });
-  // Review fix #13: distinguish "package.json invalid / model
-  // couldn't propose a stack" (fatal — abort) from "package.json
-  // valid but npm install failed" (warn + continue — the install
-  // failure may be a transient network/registry issue and the
-  // model already picked a valid stack; the user can retry install
-  // manually after the run). We detect "invalid package.json" by
-  // packageJson being undefined (proposeStack only sets it after
-  // validation passes).
-  if (!stack.ok && !stack.packageJson) {
+  // Stack phase now retries with install-error feedback until
+  // npm install actually succeeds (or attempts exhaust). We
+  // refuse to proceed with a half-installed project: planning
+  // around broken deps just pushes the failure into every leaf
+  // that imports them.
+  if (!stack.ok) {
+    const summary = stack.packageJson
+      ? `stack phase failed: npm install never succeeded after ${stack.attempts} attempt(s)`
+      : "stack phase failed (invalid package.json)";
     await writeResult(args.resultPath, {
       ok: false,
-      summary: "stack phase failed (invalid package.json)",
+      summary,
       materializedTo: outDir,
       leafResults: [],
       integrationOk: null,
@@ -291,27 +232,13 @@ async function run(args: ParsedArgs): Promise<number> {
     });
     return 1;
   }
-  if (!stack.ok && stack.packageJson) {
-    log(
-      `  warning: package.json materialized but npm install failed: ${stack.error ?? "(no detail)"}`,
-    );
-  }
   log(
     `  ${Object.keys(stack.packageJson?.dependencies ?? {}).length} deps + ${
       Object.keys(stack.packageJson?.devDependencies ?? {}).length
-    } devDeps; npm install ${stack.installOk ? "ok" : "skipped/failed"}`,
+    } devDeps; npm install ok (attempts: ${stack.attempts})`,
   );
 
-  // Audit gap #1: thread the stack-install outcome into the
-  // description that downstream phases see. Without this, the
-  // proposal/structure/interfaces phases plan files importing a
-  // dep that's known to be uninstallable (e.g., better-sqlite3 vs
-  // current node V8). The model never sees the failure and keeps
-  // building on a broken stack.
-  const taskWithStackHealth = augmentDescriptionWithStackHealth(
-    args.task,
-    stack,
-  );
+  const taskWithStackHealth = args.task;
 
   // Phase 1: proposal
   log("phase=proposal");
