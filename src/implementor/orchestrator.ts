@@ -31,19 +31,9 @@ import {
   type DecomposeDecision,
 } from "./decompose.js";
 import { implementLeaf, type LeafImplementResult } from "./leaf.js";
-import {
-  authorAllLeafTests,
-  type TestAuthorProgressEvent,
-} from "./test-author.js";
-import {
-  buildLeafDependencyGraph,
-  type LeafDependencyGraph,
-} from "./dep-graph.js";
-
-// Re-export so callers of buildImplementations can type their
-// onTestAuthorProgress handler without depending on test-author
-// directly.
-export type { TestAuthorProgressEvent } from "./test-author.js";
+// V2: phase 5b (test pre-authoring) and the test-import-based
+// dep graph are gone. The implementor does TDD itself inside
+// the dev loop. Imports for those modules removed.
 import {
   createHarnessDir,
   linkHostNodeModules,
@@ -121,10 +111,8 @@ export interface BuildInput {
    *  their components and burn the dev-loop budget against stubs.
    *  Default false for backward compat; production drivers opt
    *  in. */
-  preAuthorTestsAndGateOnDeps?: boolean;
   /** Optional progress callback for phase 5b. Same shape as
    *  onLeafProgress for phase 6. */
-  onTestAuthorProgress?: (event: TestAuthorProgressEvent) => void;
   /** Step Q4-D: per-leaf wall-clock cap. When implementLeaf
    *  exceeds this many ms (a stuck leaf burning the dev-loop
    *  budget × all its retries × the test runs), the orchestrator
@@ -251,28 +239,13 @@ export async function buildImplementations(
       await ensureDefaultTsconfig(input.outDir);
     }
 
-    // Step Q4-A/B — Phase 5b: pre-author every leaf's test in
-    // parallel, then build a dep graph from the test imports. The
-    // dep graph gates the scheduler in pickNextEntry below.
-    let depGraph: LeafDependencyGraph | undefined;
-    if (input.preAuthorTestsAndGateOnDeps) {
-      const authorRes = await authorAllLeafTests(client, rpg, {
-        bodyByLeafId,
-        testsByLeafId,
-        ...(input.onTestAuthorProgress
-          ? { onProgress: input.onTestAuthorProgress }
-          : {}),
-        ...(input.temperature !== undefined
-          ? { temperature: input.temperature }
-          : {}),
-      });
-      // Even if some leaves' tests failed to author, continue —
-      // their failures will surface naturally in phase 6 (the leaf
-      // can't run without a test, and the implementLeaf path
-      // still tries to author it inline as a fallback).
-      void authorRes;
-      depGraph = buildLeafDependencyGraph(rpg, testsByLeafId);
-    }
+    // V2: phase 5b (test pre-authoring) is gone. The implementor
+    // now does TDD inside its dev loop — writes tests as part of
+    // implementing each task. No dep-graph from test imports
+    // either (tests don't exist at scheduling time). The
+    // scheduler falls back to the topological order from
+    // collectOrderedLeaves (cross-file extends + interfacePlan
+    // dataflow), which is enough for the common case.
 
     // Work queue. Decompose-recovery prepends sub-leaves AND re-queues
     // the original leaf so it implements after its children. Each
@@ -322,15 +295,11 @@ export async function buildImplementations(
      *  having all landed (Q4-C). */
     const landedLeaves = new Set<string>();
 
-    /** Returns true iff every dep of `leafId` has landed (or the
-     *  dep graph is unset, i.e., dep-gating is disabled). */
-    function depsSatisfied(leafId: string): boolean {
-      if (!depGraph) return true;
-      const deps = depGraph.get(leafId);
-      if (!deps || deps.size === 0) return true;
-      for (const d of deps) {
-        if (!landedLeaves.has(d)) return false;
-      }
+    /** V2: dep-gating gone with phase 5b. The topological order
+     *  from collectOrderedLeaves (cross-file extends +
+     *  interfacePlan dataflow) is what schedules. landedLeaves
+     *  remains useful for blame logic. */
+    function depsSatisfied(_leafId: string): boolean {
       return true;
     }
 
@@ -536,9 +505,14 @@ export async function buildImplementations(
       // skip the architect call entirely.
       const blameRounds =
         decomposeRoundsByLeaf.get(leaf.leafCapabilityId) ?? 0;
+      // V2: tryBlameDep takes undefined depGraph and short-
+      // circuits to null. Blame logic is preserved as a no-op
+      // placeholder; it'll be revived in V4 when phase 7b's
+      // project-level integration tests need to point at
+      // upstream culprits.
       const blame =
         blameRounds < MAX_BLAME_ROUNDS
-          ? tryBlameDep(leaf, result, depGraph, rpg)
+          ? tryBlameDep(leaf, result, undefined, rpg)
           : null;
       if (blame) {
         decomposeRoundsByLeaf.set(
@@ -719,7 +693,7 @@ export async function buildImplementations(
         //       and surface the entries with a synthesized
         //       "deps never landed" failure instead of spinning.
           if (queue.length === 0 && lockedFiles.size === 0) return;
-          if (queue.length > 0 && lockedFiles.size === 0 && depGraph) {
+          if (queue.length > 0 && lockedFiles.size === 0) {
             // No one is making progress. Identify orphaned
             // entries (deps reference leaves that never appeared
             // in the initial plan, or whose source leaf failed)
@@ -1054,7 +1028,7 @@ function collectOrderedLeaves(rpg: RPG): OrderedLeaf[] {
 function tryBlameDep(
   failingLeaf: PlannedInterface,
   result: LeafImplementResult,
-  depGraph: LeafDependencyGraph | undefined,
+  depGraph: Map<string, Set<string>> | undefined,
   rpg: RPG,
 ): { culpritLeafId: string; symbolName: string } | null {
   if (!depGraph) return null;
