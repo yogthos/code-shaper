@@ -1131,7 +1131,13 @@ async function ensureDefaultTsconfig(outDir: string): Promise<void> {
       resolveJsonModule: true,
       forceConsistentCasingInFileNames: true,
     },
-    include: ["src/**/*.ts", "tests/**/*.ts"],
+    // Layout-agnostic include: the architect may organize
+    // sources into non-canonical folders (e.g. `business-logic/`,
+    // `http-api/`, `test-suite/`). Hard-coding `src/`+`tests/`
+    // would silently exclude everything. The exclude list keeps
+    // node_modules + build artifacts out.
+    include: ["**/*.ts", "**/*.tsx"],
+    exclude: ["node_modules", "dist", "build"],
   };
   await fs.writeFile(
     tsconfigPath,

@@ -181,6 +181,26 @@ describe("findImportsOf", () => {
     expect(importers).toEqual(["src/use1.ts", "src/use2.ts"]);
   });
 
+  // Architect may organize files into non-canonical folders
+  // (business-logic/, http-api/, test-suite/, etc.). The query
+  // tools must still find them.
+  it("walks non-canonical folder layouts (no src/ prefix required)", async () => {
+    await mkdir(path.join(outDir, "business-logic"), { recursive: true });
+    await mkdir(path.join(outDir, "http-api"), { recursive: true });
+    await writeFile(
+      path.join(outDir, "business-logic", "logic.ts"),
+      `export function process() {}\n`,
+    );
+    await writeFile(
+      path.join(outDir, "http-api", "routes.ts"),
+      `import { process } from "../business-logic/logic.js";\nprocess();\n`,
+    );
+    const r = await findCallers({ outDir, name: "process" });
+    expect(r.ok).toBe(true);
+    const callers = r.matches!.map((m) => m.file).sort();
+    expect(callers).toEqual(["http-api/routes.ts"]);
+  });
+
   it("matches the import specifier verbatim (relative paths must match)", async () => {
     await writeFile(
       path.join(outDir, "src", "a.ts"),

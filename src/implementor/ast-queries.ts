@@ -64,19 +64,24 @@ function getParser(): { parse: (s: string) => TreeSitterTree } {
 
 // ── File enumeration ───────────────────────────────────────────────
 
-const SOURCE_DIRS = ["src", "tests"];
+/** Directories the model would never want surfaced: vendor code,
+ *  build artifacts, hidden config (we don't index those for AST
+ *  queries — too noisy and irrelevant to the dev loop's goals). */
+const EXCLUDE_DIRS = new Set(["node_modules", "dist", "build", ".git"]);
 
 async function enumerateSourceFiles(outDir: string): Promise<string[]> {
+  // Walk the WHOLE outDir (not just src/+tests/). The architect's
+  // file-structure phase may produce non-canonical folder names
+  // like `business-logic/`, `http-api/`, `test-suite/` — hard-
+  // coding `src/` would silently miss them. Exclude vendor and
+  // build dirs to keep the result focused on the project's own
+  // sources.
   const out: string[] = [];
-  for (const dir of SOURCE_DIRS) {
-    const full = path.join(outDir, dir);
-    try {
-      await walkDir(full, out);
-    } catch {
-      // Directory doesn't exist; skip.
-    }
+  try {
+    await walkDir(outDir, out);
+  } catch {
+    // outDir doesn't exist; return empty.
   }
-  // Return repo-relative paths sorted for deterministic output.
   return out
     .map((abs) => path.relative(outDir, abs).split(path.sep).join("/"))
     .sort();
@@ -85,7 +90,7 @@ async function enumerateSourceFiles(outDir: string): Promise<string[]> {
 async function walkDir(dir: string, acc: string[]): Promise<void> {
   const entries = await readdir(dir, { withFileTypes: true });
   for (const e of entries) {
-    if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+    if (EXCLUDE_DIRS.has(e.name) || e.name.startsWith(".")) continue;
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {
       await walkDir(full, acc);
