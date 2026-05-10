@@ -141,6 +141,15 @@ export interface IntegrationBlameInput {
      *  / "method: Bar.baz". */
     interface: string;
   }>;
+  /** Recoveries previously attempted on THIS branch — feeds into a
+   *  "previously tried, didn't help" block so the model pivots
+   *  instead of looping on the same culprit + decision. */
+  priorRecoveries?: Array<{
+    round: number;
+    culpritLeafId: string;
+    decision: "fresh_approach" | "decompose";
+    reason: string;
+  }>;
 }
 
 export function buildIntegrationBlameUserPrompt(
@@ -163,6 +172,21 @@ export function buildIntegrationBlameUserPrompt(
   lines.push(input.failureMessage);
   lines.push("```");
   lines.push("");
+
+  if (input.priorRecoveries && input.priorRecoveries.length > 0) {
+    lines.push("# Previously attempted on this branch — DID NOT FIX THE FAILURE");
+    lines.push("");
+    lines.push(
+      "These recoveries were applied in earlier rounds; the integration test still fails (with the message above) AFTER they ran. Picking the same culprit + same decision again is unlikely to work — pivot to a different leaf, or escalate the decision (e.g. fresh_approach → decompose).",
+    );
+    lines.push("");
+    for (const r of input.priorRecoveries) {
+      lines.push(
+        `- round ${r.round}: ${r.decision} on ${r.culpritLeafId}  — reason: ${r.reason.slice(0, 200).replace(/\s+/g, " ")}`,
+      );
+    }
+    lines.push("");
+  }
 
   if (input.localizationHint && input.localizationHint.length > 0) {
     lines.push("# Localization hint (§D.1 ranked candidates)");
@@ -208,7 +232,7 @@ export function buildIntegrationBlameUserPrompt(
         // Required only when decision === decompose:
         subLeaves: [
           {
-            name: "camelCase",
+            name: "string (camelCase identifier — e.g. fetchTodos, validateInput; NOT the literal word 'camelCase')",
             description: "string",
             signature: {
               params: [{ name: "string", type: "string" }],

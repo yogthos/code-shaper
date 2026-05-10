@@ -12,12 +12,13 @@
  * frameworks.
  */
 
-import { rm } from "node:fs/promises";
+import { rm, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { loadConfig, missingForPath } from "../src/config.js";
 import { createClient } from "../src/llm/factory.js";
 import { emptyRPG, isCapability, isFile, materializeRPG } from "../src/rpg/index.js";
+import type { RPG } from "../src/rpg/types.js";
 import {
   designInterfaces,
   encodeFileStructure,
@@ -31,6 +32,11 @@ import {
   renderPlannedFiles,
   runIntegrationTests,
 } from "../src/implementor/index.js";
+import {
+  createHarnessDir,
+  linkHostNodeModules,
+  resolveNodeModulesSource,
+} from "../src/implementor/test-harness.js";
 
 const DESCRIPTION = `Build a working TodoMVC web application that I can open in a browser, type into, and use end-to-end. TypeScript end to end.
 
@@ -80,6 +86,19 @@ DON'T:
 I want a project where \`git clone … && npm install && npm test && npm start\` produces a working app I can interact with.
 `;
 
+/** Snapshot persisted at the phase-6 → phase-7 boundary so phase 7
+ *  can be re-run in isolation. The RPG is mutated through phases
+ *  0-6 (proposal adds capabilities, structure adds folders/files,
+ *  interfaces fills interfacePlan, implementor sets
+ *  userEditedSource); persisting it here lets us iterate on the
+ *  integration phase without burning ~80 minutes on architect +
+ *  implementor every time. */
+interface ResumeSnapshot {
+  rpg: RPG;
+  bodies: Array<[string, string]>;
+  tests: Array<[string, string]>;
+}
+
 async function main(): Promise<number> {
   const startedAt = Date.now();
   const log = (msg: string): void => {
@@ -110,9 +129,30 @@ async function main(): Promise<number> {
   // 2. Pipeline. demo/todomvc-harness/ is the harness side of the
   //    baseline-vs-harness comparison; demo/todomvc-baseline/
   //    holds the one-shot baseline output from bin/baseline-todomvc.ts.
-  const rpg = emptyRPG();
+  //
+  // Inspect outDir and pick up where the previous run left off.
+  // The harness writes a state snapshot once architect + per-leaf
+  // implementation are complete and the project is in a buildable
+  // state; if that snapshot is present, skip ahead and resume
+  // from the integration step. Otherwise wipe outDir and start
+  // fresh. The phase boundaries are an internal organizing
+  // convention; from the user's perspective there's just one
+  // command and it does the right thing.
   const outDir = path.resolve("demo/todomvc-harness");
-  await rm(outDir, { recursive: true, force: true });
+  const snapshotPath = path.join(outDir, ".harness-state.json");
+  let rpg = emptyRPG();
+  let resumedSnapshot: ResumeSnapshot | null = null;
+  try {
+    const raw = await readFile(snapshotPath, "utf-8");
+    resumedSnapshot = JSON.parse(raw) as ResumeSnapshot;
+    rpg = resumedSnapshot.rpg;
+    log(
+      `resuming from prior run: ${Object.keys(rpg.nodes).length} graph nodes, ${resumedSnapshot.bodies.length} implementations on disk`,
+    );
+  } catch {
+    // No snapshot (or unreadable) → fresh run.
+    await rm(outDir, { recursive: true, force: true });
+  }
 
   /** Render plan-bearing files + materialize the RPG to outDir.
    *  Called after each architect phase so demo/ tracks the current
@@ -121,6 +161,18 @@ async function main(): Promise<number> {
     renderPlannedFiles(rpg);
     await materializeRPG(rpg, outDir);
   };
+
+  if (resumedSnapshot) {
+    // Skip phases 0-6 entirely — jump to integration.
+    return runPhase7AndSummarize({
+      client,
+      rpg,
+      outDir,
+      log,
+      resumedBodies: new Map(resumedSnapshot.bodies),
+      resumedTests: new Map(resumedSnapshot.tests),
+    });
+  }
 
   // Phase 0 — stack & dependencies (TS-specific addition).
   log("phase 0 — stack");
@@ -292,46 +344,159 @@ async function main(): Promise<number> {
     return 7;
   }
 
-  // 4. Phase 7b — branch integration
-  if (build.workDir) {
-    const branches = discoverBranches(rpg);
-    log(`phase 7b — integration (${branches.length} branches)`);
-    if (branches.length > 0) {
-      const bodyByLeafId = new Map<string, string>();
-      const testsByLeafId = new Map<string, string>();
-      for (const lr of build.leafResults) {
-        if (lr.ok) {
-          bodyByLeafId.set(lr.leafId, lr.body);
-          testsByLeafId.set(lr.leafId, lr.testSource);
-        }
-      }
-      const integration = await runIntegrationTests(client, rpg, {
-        bodyByLeafId,
-        testsByLeafId,
-        workDir: build.workDir,
-        // Matches §5.3 of the RPG paper: "each function allows up to 8
-        // debugging iterations." Was 3.
-        maxAttemptsPerLeaf: 8,
-        // §D.1 graph-guided localization runs before each blame
-        // attribution; the ranked hits seed the blame prompt as
-        // extra context. Default budget = 20 (§5.3).
-        useLocalization: true,
-      });
-      log(
-        `  rounds=${integration.rounds}; recoveries=${integration.recoveries.length}; ok=${integration.ok}`,
-      );
-      if (!integration.ok) {
-        console.error(
-          `[fatal] integration failed: ${integration.error ?? integration.failingBranchIds.join(", ")}`,
-        );
-        await rm(build.workDir, { recursive: true, force: true });
-        return 8;
-      }
-    }
-    await rm(build.workDir, { recursive: true, force: true });
+  // 4. Phase 7b — branch integration. Persist a snapshot first so
+  //    phase 7 can be re-run in isolation via RESUME_FROM_PHASE7=1.
+  if (!build.workDir) {
+    return summarize(rpg, outDir, log);
   }
+  const bodyByLeafId = new Map<string, string>();
+  const testsByLeafId = new Map<string, string>();
+  for (const lr of build.leafResults) {
+    if (lr.ok) {
+      bodyByLeafId.set(lr.leafId, lr.body);
+      testsByLeafId.set(lr.leafId, lr.testSource);
+    }
+  }
+  await writeSnapshot(snapshotPath, rpg, bodyByLeafId, testsByLeafId);
 
-  // 5. Summary
+  return runPhase7AndSummarize({
+    client,
+    rpg,
+    outDir,
+    log,
+    resumedBodies: bodyByLeafId,
+    resumedTests: testsByLeafId,
+    workDir: build.workDir,
+  });
+}
+
+async function writeSnapshot(
+  snapshotPath: string,
+  rpg: RPG,
+  bodies: Map<string, string>,
+  tests: Map<string, string>,
+): Promise<void> {
+  const payload: ResumeSnapshot = {
+    rpg,
+    bodies: [...bodies.entries()],
+    tests: [...tests.entries()],
+  };
+  await writeFile(snapshotPath, JSON.stringify(payload), "utf-8");
+}
+
+async function runPhase7AndSummarize(input: {
+  client: ReturnType<typeof createClient>;
+  rpg: RPG;
+  outDir: string;
+  log: (msg: string) => void;
+  resumedBodies: Map<string, string>;
+  resumedTests: Map<string, string>;
+  /** Provided when called inline from main(); on resume we mint a
+   *  fresh harness work dir below. */
+  workDir?: string;
+}): Promise<number> {
+  const { client, rpg, outDir, log, resumedBodies, resumedTests } = input;
+  const branches = discoverBranches(rpg);
+  log(`phase 7b — integration (${branches.length} branches)`);
+  if (branches.length === 0) {
+    return summarize(rpg, outDir, log);
+  }
+  // The harness work dir is normally created by buildImplementations
+  // and torn down at the end. On resume there's no live harness — we
+  // mint a fresh one and link node_modules from outDir (the project
+  // we just resumed). Without the symlink, vitest can't resolve
+  // itself when running integration tests.
+  let workDir = input.workDir;
+  let ownsWorkDir = false;
+  if (!workDir) {
+    workDir = await createHarnessDir();
+    const nodeModulesSource = resolveNodeModulesSource(outDir, undefined);
+    await linkHostNodeModules(workDir, nodeModulesSource);
+    ownsWorkDir = true;
+  }
+  let integrationOk = false;
+  try {
+    const integration = await runIntegrationTests(client, rpg, {
+      bodyByLeafId: resumedBodies,
+      testsByLeafId: resumedTests,
+      workDir,
+      projectDir: outDir,
+      maxAttemptsPerLeaf: 8,
+      useLocalization: true,
+      // Run recovery's per-leaf re-implementation through the full
+      // dev loop. The model gets the integration test source +
+      // failure as context and full project tools (edit_file,
+      // add_dependency, npm_run, run_test). That's the only way it
+      // can fix env-level issues like missing jsdom or a broken
+      // vitest config without us having to add phase-specific
+      // tweaks.
+      recoveryUseDevLoop: true,
+      maxIntegrationRounds: 4,
+      onProgress: (msg) => log(msg),
+    });
+    integrationOk = integration.ok;
+    log(
+      `  rounds=${integration.rounds}; recoveries=${integration.recoveries.length}; ok=${integration.ok}`,
+    );
+    // Persist the integration test sources + recovery trail to
+    // outDir so the run is debuggable after the workDir gets
+    // cleaned up. testsByBranchId is what the architect wrote
+    // (one vitest file per branch); recoveries is the per-round
+    // blame attribution + decision trail.
+    await persistIntegrationArtifacts(
+      outDir,
+      integration.testsByBranchId,
+      integration.recoveries,
+      integration.failingBranchIds,
+    );
+    if (!integration.ok) {
+      console.error(
+        `[fatal] integration failed: ${integration.error ?? integration.failingBranchIds.join(", ")}`,
+      );
+      console.error(
+        `         test sources + trail persisted under ${outDir} for inspection`,
+      );
+      return 8;
+    }
+  } finally {
+    // Clean up workDir only on success. On failure keep it
+    // around so the user can inspect the live test environment
+    // (vitest config, runner state, etc.).
+    if (workDir && integrationOk) {
+      await rm(workDir, { recursive: true, force: true });
+    } else if (workDir) {
+      console.error(`         live work dir preserved at ${workDir}`);
+    }
+    void ownsWorkDir;
+  }
+  return summarize(rpg, outDir, log);
+}
+
+async function persistIntegrationArtifacts(
+  outDir: string,
+  testsByBranchId: Map<string, string>,
+  recoveries: ReadonlyArray<unknown>,
+  failingBranchIds: readonly string[],
+): Promise<void> {
+  const { mkdir } = await import("node:fs/promises");
+  const integrationDir = path.join(outDir, "tests", "integration");
+  await mkdir(integrationDir, { recursive: true });
+  for (const [branchId, source] of testsByBranchId) {
+    const slug = branchId.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-|-$/g, "");
+    await writeFile(
+      path.join(integrationDir, `${slug}.test.ts`),
+      source,
+      "utf-8",
+    );
+  }
+  await writeFile(
+    path.join(outDir, ".integration-trail.json"),
+    JSON.stringify({ recoveries, failingBranchIds }, null, 2),
+    "utf-8",
+  );
+}
+
+function summarize(rpg: RPG, outDir: string, log: (msg: string) => void): number {
   let fileCount = 0;
   let leafCount = 0;
   for (const node of Object.values(rpg.nodes)) {

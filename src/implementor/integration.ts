@@ -87,6 +87,28 @@ export interface IntegrationInput {
    *  `maxIterations` defaults to 20 per RPG paper §5.3. */
   useLocalization?: boolean;
   localizationMaxIterations?: number;
+  /** Optional per-step progress callback. Fired at meaningful
+   *  inflection points (test author, round start/end, localization
+   *  start/done, blame start/done, recovery applied) so callers
+   *  can surface progress while the loop is otherwise silent.
+   *  Receives plain strings; no structure to keep the integration
+   *  contract small. */
+  onProgress?: (msg: string) => void;
+  /** Project directory on disk (the `outDir`). Passed through to
+   *  recovery's implementLeaf call as `projectDir`, which gives
+   *  the dev loop access to typecheck / npm tools / run_test on
+   *  the live project — not just the harness work tree. Without
+   *  this, the model can't fix env issues like a missing
+   *  `vitest.config.ts` jsdom environment or a missing dev dep. */
+  projectDir?: string;
+  /** Run recovery's implementLeaf via the canonical dev loop
+   *  (useDevLoop). Default false so existing tests with scripted
+   *  LLM fixtures keep matching the legacy author path. Production
+   *  drivers opt in: with the dev loop on, the model can edit any
+   *  project file (vitest.config.ts, package.json) and run npm
+   *  during recovery — much closer to how Claude Code diagnoses
+   *  and fixes test failures. */
+  recoveryUseDevLoop?: boolean;
 }
 
 export interface IntegrationResult {
@@ -162,9 +184,13 @@ export async function runIntegrationTests(
 
   const testsByBranchId = new Map<string, string>();
   const recoveries: IntegrationResult["recoveries"] = [];
+  const progress = (msg: string): void => input.onProgress?.(msg);
 
   // Author one integration test per branch.
-  for (const b of branches) {
+  progress(`authoring ${branches.length} branch test(s)…`);
+  for (let i = 0; i < branches.length; i++) {
+    const b = branches[i]!;
+    progress(`  [${i + 1}/${branches.length}] authoring test for ${b.branch.name}`);
     const source = await authorBranchTest(client, rpg, b, input.temperature);
     if (!source) {
       return {
@@ -178,6 +204,7 @@ export async function runIntegrationTests(
     }
     testsByBranchId.set(b.branch.id, source);
   }
+  progress(`tests authored — entering recovery loop`);
 
   let lastRun: TestRunResult | undefined;
   let rounds = 0;
@@ -194,6 +221,9 @@ export async function runIntegrationTests(
     const failingBranchIds = [...branchStatus.entries()]
       .filter(([, status]) => status === "failing")
       .map(([id]) => id);
+    progress(
+      `round ${rounds}/${maxRounds}: running ${failingBranchIds.length} branch test(s)`,
+    );
     lastRun = await runTests(rpg, {
       bodyByLeafId: input.bodyByLeafId,
       testsByLeafId: input.testsByLeafId,
@@ -220,6 +250,10 @@ export async function runIntegrationTests(
     const stillFailing = [...branchStatus.entries()]
       .filter(([, s]) => s === "failing")
       .map(([id]) => id);
+    const passedThisRound = failingBranchIds.length - stillFailing.length;
+    progress(
+      `  → ${passedThisRound} passed, ${stillFailing.length} still failing`,
+    );
     if (stillFailing.length === 0) {
       return {
         ok: true,
@@ -231,8 +265,14 @@ export async function runIntegrationTests(
       };
     }
 
-    // Recovery: pick the FIRST still-failing branch this round.
-    const targetBranchId = stillFailing[0]!;
+    // Recovery: round-robin across failing branches so we don't
+    // burn the entire budget on the first failing branch. The
+    // previous behavior picked stillFailing[0] every round, which
+    // meant 4 failing branches got attempted only by branch[0]
+    // for 4 rounds straight while the others got zero recovery
+    // attempts. Index by `round` modulo so rotation is
+    // deterministic regardless of how branchStatus iterates.
+    const targetBranchId = stillFailing[round % stillFailing.length]!;
     const branch = branches.find((b) => b.branch.id === targetBranchId);
     if (!branch) {
       return {
@@ -259,19 +299,7 @@ export async function runIntegrationTests(
       | Array<{ filePath: string; interface: string }>
       | undefined;
     if (input.useLocalization) {
-      // Review fix #9: default 8 iterations (vs the §5.3 paper-wide
-      // 20) when invoked from integration recovery. Recovery loops
-      // already have 20 rounds × N branches; running the localize
-      // agent at full 20-iteration budget per round means hundreds
-      // of localization LLM calls per failing branch. The blame
-      // model has full branch context regardless — localization
-      // is a hint, not a substitute, so a tighter budget is the
-      // right tradeoff.
-      // Review fix #8: localize() can throw (LLM client timeout,
-      // 5xx after retries exhausted). The comment claimed
-      // "non-fatal" but a thrown error would have crashed the
-      // whole integration round. Wrap in try/catch and fall
-      // through without the hint on any failure.
+      progress(`  localizing on ${branch.branch.name}…`);
       const localizationBudget = input.localizationMaxIterations ?? 8;
       try {
         const loc = await localize(client, {
@@ -295,6 +323,15 @@ export async function runIntegrationTests(
       }
     }
 
+    progress(`  blaming on ${branch.branch.name}…`);
+    const priorOnBranch = recoveries
+      .filter((r) => r.branchId === targetBranchId)
+      .map((r) => ({
+        round: r.round,
+        culpritLeafId: r.culpritLeafId,
+        decision: r.decision,
+        reason: r.reason,
+      }));
     const blame = await runBlameAttribution(client, rpg, {
       branch: branch.branch,
       leaves: branch.leaves.map((l) => ({
@@ -309,17 +346,23 @@ export async function runIntegrationTests(
       failureMessage,
       temperature: input.temperature,
       ...(localizationHint ? { localizationHint } : {}),
+      ...(priorOnBranch.length > 0 ? { priorRecoveries: priorOnBranch } : {}),
     });
     if (!blame.ok || !blame.decision) {
-      return {
-        ok: false,
-        testsByBranchId,
-        finalRun: lastRun,
-        recoveries,
-        failingBranchIds: stillFailing,
-        rounds,
-        error: blame.error ?? "blame attribution failed",
-      };
+      // Audit gap: don't abort the whole integration phase on a
+      // single blame parse failure. Record on the recovery trail
+      // and drop into the next round — the next blame call sees
+      // the same failing branch and gets another chance with
+      // fresh model output. Mirror the apply-failure path below.
+      recoveries.push({
+        round: rounds,
+        branchId: targetBranchId,
+        culpritLeafId: "(none — blame failed)",
+        decision: "fresh_approach",
+        reason: "blame attribution failed",
+        applyError: blame.error ?? "blame attribution failed",
+      });
+      continue;
     }
 
     recoveries.push({
@@ -329,6 +372,9 @@ export async function runIntegrationTests(
       decision: blame.decision.decision,
       reason: blame.decision.reason,
     });
+    progress(
+      `  decision: ${blame.decision.decision} on ${blame.decision.culpritLeafId}`,
+    );
 
     const culpritLeaf = branch.leaves.find(
       (l) => l.capability.id === blame.decision!.culpritLeafId,
@@ -357,6 +403,12 @@ export async function runIntegrationTests(
       testsByLeafId: input.testsByLeafId,
       workDir: input.workDir,
       maxAttempts: input.maxAttemptsPerLeaf,
+      branchTestSource,
+      branchFailureMessage: failureMessage,
+      ...(input.projectDir !== undefined
+        ? { projectDir: input.projectDir }
+        : {}),
+      ...(input.recoveryUseDevLoop ? { useDevLoop: true } : {}),
       ...(input.temperature !== undefined
         ? { temperature: input.temperature }
         : {}),
@@ -472,7 +524,20 @@ interface BlameInput {
   /** Optional localization hint passed verbatim to the prompt
    *  builder. Already-validated `{filePath, interface}` shape. */
   localizationHint?: Array<{ filePath: string; interface: string }>;
+  /** Prior recoveries on THIS branch — surfaced in the blame
+   *  prompt so the model doesn't keep picking the same culprit
+   *  with the same decision after the previous fix didn't help.
+   *  Empty for round 1; grows with each recovery on the same
+   *  branch. */
+  priorRecoveries?: Array<{
+    round: number;
+    culpritLeafId: NodeId;
+    decision: "fresh_approach" | "decompose";
+    reason: string;
+  }>;
 }
+
+const BLAME_MAX_ATTEMPTS = 3;
 
 async function runBlameAttribution(
   client: LLMClient,
@@ -488,21 +553,51 @@ async function runBlameAttribution(
     ...(input.localizationHint
       ? { localizationHint: input.localizationHint }
       : {}),
+    ...(input.priorRecoveries && input.priorRecoveries.length > 0
+      ? { priorRecoveries: input.priorRecoveries }
+      : {}),
   });
-  const response = await client.chat(
-    [
+  const knownLeafIds = new Set(input.leaves.map((l) => l.leafCapabilityId));
+  // Validation loop: blame is one of a handful of architect-style
+  // model-output phases that historically aborted on the first
+  // parse failure. The output is structured JSON with strict
+  // shape constraints (camelCase names, valid culpritLeafId,
+  // non-empty reason). When the model fumbles the schema we
+  // replay the prior response with the validator's error as
+  // feedback so it can correct itself, rather than burning the
+  // whole integration phase on a typo.
+  let lastError: string | null = null;
+  let lastResponse: string | null = null;
+  for (let i = 0; i < BLAME_MAX_ATTEMPTS; i++) {
+    const messages: Array<{
+      role: "system" | "user" | "assistant";
+      content: string;
+    }> = [
       { role: "system", content: INTEGRATION_BLAME_SYSTEM_PROMPT },
       { role: "user", content: userPrompt },
-    ],
-    {
+    ];
+    if (lastError !== null && lastResponse !== null) {
+      messages.push({ role: "assistant", content: lastResponse });
+      messages.push({
+        role: "user",
+        content: `Your previous response failed validation: ${lastError}\nReturn corrected JSON now. Fix the specific field the validator flagged; do not change unrelated fields.`,
+      });
+    }
+    const response = await client.chat(messages, {
       responseFormat: { type: "json_object" },
       ...(input.temperature !== undefined
         ? { temperature: input.temperature }
         : {}),
-    },
-  );
-  const knownLeafIds = new Set(input.leaves.map((l) => l.leafCapabilityId));
-  return parseBlameResponse(response.content, knownLeafIds);
+    });
+    lastResponse = response.content;
+    const parsed = parseBlameResponse(response.content, knownLeafIds);
+    if (parsed.ok) return parsed;
+    lastError = parsed.error ?? null;
+  }
+  return {
+    ok: false,
+    error: `blame attribution failed after ${BLAME_MAX_ATTEMPTS} attempts; last error: ${lastError ?? "unknown"}`,
+  };
 }
 
 function parseBlameResponse(
@@ -666,6 +761,50 @@ interface ApplyRecoveryInput {
   maxAttempts?: number;
   testTimeoutMs?: number;
   temperature?: number;
+  /** The integration test source + failure that triggered this
+   *  recovery. Threaded into the leaf's dev loop as
+   *  failureMessage so the model can see what the integration
+   *  expects and why it broke. Without this the leaf re-
+   *  implements blind, satisfies its own unit test, and the
+   *  integration still fails with the same error. */
+  branchTestSource?: string;
+  branchFailureMessage?: string;
+  /** Project directory passed through to implementLeaf so its
+   *  dev loop has access to typecheck / npm / run_test on the
+   *  real on-disk project. Without this the dev loop's env-fix
+   *  tools no-op. */
+  projectDir?: string;
+  /** Use the canonical dev loop for recovery's implementLeaf
+   *  call. Off by default for backward compat with scripted-LLM
+   *  tests that expect the legacy author path. */
+  useDevLoop?: boolean;
+}
+
+function buildIntegrationFailureContext(
+  input: ApplyRecoveryInput,
+): string | undefined {
+  const msg = input.branchFailureMessage;
+  const src = input.branchTestSource;
+  if (!msg && !src) return undefined;
+  const sections: string[] = [];
+  sections.push(
+    "You are being re-implemented because the BRANCH-LEVEL INTEGRATION TEST below failed. Your task is to fix whatever is wrong so this test passes — the fix may live in this leaf, or it may require an environment change (vitest config, missing dev dependency, etc.). Use your tools (edit_file, add_dependency, npm_run, run_test) to investigate and fix root cause; don't just rewrite this leaf's body if the issue is elsewhere.",
+  );
+  if (src) {
+    sections.push("");
+    sections.push("Branch integration test:");
+    sections.push("```ts");
+    sections.push(src.length > 4000 ? `${src.slice(0, 4000)}\n…[truncated]` : src);
+    sections.push("```");
+  }
+  if (msg) {
+    sections.push("");
+    sections.push("Failure output:");
+    sections.push("```");
+    sections.push(msg.length > 4000 ? `${msg.slice(0, 4000)}\n…[truncated]` : msg);
+    sections.push("```");
+  }
+  return sections.join("\n");
 }
 
 async function applyRecoveryToLeaf(
@@ -756,7 +895,14 @@ async function applyRecoveryToLeaf(
   }
 
   // fresh_approach — re-author body with the architect's hint.
+  // Use the canonical dev-loop with the integration failure
+  // surfaced as failureMessage so the model can act on the actual
+  // breakage (jsdom missing, async/sync mismatch, etc.) using its
+  // full toolset (edit_file, npm tools, run_test). Without these
+  // the legacy author path runs blind and the leaf passes its
+  // own unit test while the integration still fails identically.
   input.bodyByLeafId.delete(leafId);
+  const failureContext = buildIntegrationFailureContext(input);
   const r = await implementLeaf(client, {
     leaf: input.culpritLeaf.interface,
     hostFile,
@@ -766,6 +912,13 @@ async function applyRecoveryToLeaf(
     workDir: input.workDir,
     maxAttempts: input.maxAttempts,
     approachHint: input.decision.approachHint!,
+    ...(input.useDevLoop ? { useDevLoop: true } : {}),
+    ...(input.projectDir !== undefined
+      ? { projectDir: input.projectDir }
+      : {}),
+    ...(failureContext !== undefined
+      ? { failureMessage: failureContext }
+      : {}),
     ...(input.temperature !== undefined
       ? { temperature: input.temperature }
       : {}),

@@ -479,9 +479,23 @@ describe("Math Pair", () => {
         testsByLeafId,
         workDir,
         maxAttemptsPerLeaf: 1,
+        // Tighten so we don't burn 20 rounds × 3 blame retries on
+        // a test asserting validation behavior.
+        maxIntegrationRounds: 2,
       });
       expect(r.ok).toBe(false);
-      expect(r.error).toMatch(/culpritLeafId/);
+      // Per the integration loop's continue-on-blame-failure
+      // semantics: a single bad blame response no longer aborts
+      // the whole integration — the loop records the validation
+      // error on the recoveries trail and rolls into the next
+      // round. So the top-level error is "exhausted N rounds"
+      // and the validation detail lands in recoveries[*].applyError.
+      expect(r.error).toMatch(/exhausted/i);
+      const blameErrors = r.recoveries
+        .map((rec) => rec.applyError ?? "")
+        .filter((e) => e.length > 0);
+      expect(blameErrors.length).toBeGreaterThan(0);
+      expect(blameErrors.some((e) => /culpritLeafId/.test(e))).toBe(true);
     },
   );
 });
